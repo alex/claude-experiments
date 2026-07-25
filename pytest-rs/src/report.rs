@@ -1,6 +1,8 @@
 //! Terminal reporting.
 
-use std::io::Write;
+use std::io::{IsTerminal, Write};
+
+use pyo3::prelude::*;
 
 use crate::outcomes::Outcome;
 use crate::session::ConfigData;
@@ -91,25 +93,28 @@ pub struct Terminal {
     /// Current file prefix in serial mode.
     current_file: Option<String>,
     parallel: bool,
+    is_tty: bool,
 }
 
-pub fn terminal_width() -> usize {
+/// Terminal width, in the order `shutil.get_terminal_size` uses.
+pub fn terminal_width(py: Python<'_>) -> usize {
     if let Ok(cols) = std::env::var("COLUMNS") {
         if let Ok(n) = cols.parse::<usize>() {
             return n;
         }
     }
-    #[cfg(unix)]
-    {
-        // TIOCGWINSZ via an ioctl would need libc; fall back to a sane default.
-    }
-    80
+    py.import("shutil")
+        .and_then(|m| m.call_method0("get_terminal_size"))
+        .and_then(|size| size.getattr("columns"))
+        .and_then(|c| c.extract::<usize>())
+        .unwrap_or(80)
+        .clamp(40, 200)
 }
 
 impl Terminal {
-    pub fn new(cfg: &ConfigData, total: usize, parallel: bool, capture_disabled: bool) -> Self {
+    pub fn new(cfg: &ConfigData, total: usize, parallel: bool, capture_disabled: bool, width: usize) -> Self {
         let color_opt = cfg.str_opt("color");
-        let is_tty = unsafe { libc_isatty() };
+        let is_tty = std::io::stdout().is_terminal();
         let enabled = match color_opt.as_str() {
             "yes" | "always" => true,
             "no" | "never" => false,
@@ -126,7 +131,7 @@ impl Terminal {
             _ => ProgressStyle::Percent,
         };
         Terminal {
-            width: terminal_width(),
+            width,
             colors: Colors { enabled },
             verbosity: cfg.verbosity(),
             progress,
@@ -136,6 +141,7 @@ impl Terminal {
             out: std::io::stdout(),
             current_file: None,
             parallel,
+            is_tty,
         }
     }
 
@@ -158,6 +164,14 @@ impl Terminal {
 
     pub fn flush(&mut self) {
         let _ = self.out.flush();
+    }
+
+    /// Flush only when someone is watching.  Live progress matters on a
+    /// terminal; into a pipe it would be one syscall per test for nothing.
+    pub fn flush_progress(&mut self) {
+        if self.is_tty {
+            let _ = self.out.flush();
+        }
     }
 
     /// `====== title ======` centred to the terminal width.
@@ -242,19 +256,6 @@ impl Terminal {
             self.write("\n");
         }
     }
-}
-
-#[cfg(unix)]
-unsafe fn libc_isatty() -> bool {
-    extern "C" {
-        fn isatty(fd: i32) -> i32;
-    }
-    isatty(1) == 1
-}
-
-#[cfg(not(unix))]
-unsafe fn libc_isatty() -> bool {
-    false
 }
 
 /// Format a duration the way pytest does in the final line.

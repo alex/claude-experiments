@@ -76,11 +76,14 @@ The analysis is deliberately not purely name-based, because that over-serialises
 peephole pass over the disassembly tells them apart. Likewise, warning filters
 are only global before CPython 3.14 — from 3.14 `catch_warnings()` is
 context-scoped (always so on free-threaded builds), so `pytest.warns` stays
-parallel there. On cryptography's suite these two refinements take the serialised
-set from 228 tests to 15.
+parallel there. Those refinements, plus not serialising benchmarks that are
+disabled, take cryptography's serialised set from 228 tests to 15; see
+[docs/BENCHMARKS.md](docs/BENCHMARKS.md) for the breakdown.
 
-On a free-threaded (`--disable-gil`) interpreter this produces real parallelism.
-On a GIL build threads only overlap GIL-releasing native code and I/O, so
+On a free-threaded interpreter this produces real parallelism: cryptography's
+suite runs in 8.3 s against stock pytest's 27.3 s and xdist's 11.5 s on four
+cores. On a GIL build threads only overlap GIL-releasing native code and I/O —
+a help for suites like that one, a 20% loss for pure-Python suites — so
 `-n auto` resolves to one worker there; pass `-n N` explicitly to override.
 
 Output capturing is built the same way — a proxy over `sys.stdout`/`sys.stderr`

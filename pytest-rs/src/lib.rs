@@ -122,7 +122,6 @@ fn run_session(py: Python<'_>, raw_argv: Vec<String>) -> error::Result<i32> {
         ini: RwLock::new(ini.clone()),
         known_markers: known_markers.clone(),
         stash: Mutex::new(None),
-        header_lines: Mutex::new(Vec::new()),
     });
 
     apply_pythonpath(py, &cfg).map_err(error::Error::Py)?;
@@ -328,7 +327,7 @@ fn run_session(py: Python<'_>, raw_argv: Vec<String>) -> error::Result<i32> {
         capture_mode,
         tb_style: cfg.str_opt("tbstyle"),
         showlocals: cfg.flag("showlocals"),
-        term_width: report::terminal_width(),
+        term_width: report::terminal_width(py),
     });
 
     // --- header ------------------------------------------------------------------
@@ -338,7 +337,8 @@ fn run_session(py: Python<'_>, raw_argv: Vec<String>) -> error::Result<i32> {
         let _ = sys.getattr("stdout").and_then(|s| s.call_method0("flush"));
         let _ = sys.getattr("stderr").and_then(|s| s.call_method0("flush"));
     }
-    let mut term = Terminal::new(&cfg, session.items.len(), parallel, capture_mode == capture::Mode::No);
+    let width = report::terminal_width(py);
+    let mut term = Terminal::new(&cfg, session.items.len(), parallel, capture_mode == capture::Mode::No, width);
     if !cfg.flag("no_header") {
         term.section("test session starts", '=', true);
         let pyver: String = py
@@ -506,7 +506,7 @@ fn run_session(py: Python<'_>, raw_argv: Vec<String>) -> error::Result<i32> {
                 let mut out = Vec::new();
                 while let Ok(r) = rx.recv() {
                     sink.report(&r);
-                    sink.flush();
+                    sink.flush_progress();
                     out.push(r);
                 }
                 (sink, out)
@@ -646,10 +646,15 @@ fn run_session(py: Python<'_>, raw_argv: Vec<String>) -> error::Result<i32> {
     }
     term.flush();
 
-    if state.should_stop() && maxfail > 0 {
-        term.section(&format!("stopping after {maxfail} failures"), '!', true);
-    }
     let exit_msg = state.exit_message.lock().unwrap().clone();
+    if state.should_stop() && maxfail > 0 && exit_msg.is_none() {
+        term.section(
+            &format!("stopping after {maxfail} failure{}", if maxfail == 1 { "" } else { "s" }),
+            '!',
+            true,
+        );
+        term.flush();
+    }
     if let Some(msg) = exit_msg {
         term.section(&msg, '!', true);
         term.flush();

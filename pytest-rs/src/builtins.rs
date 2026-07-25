@@ -303,7 +303,12 @@ impl MonkeyPatch {
     }
 
     fn undo(&self, py: Python<'_>) -> PyResult<()> {
-        for (obj, name, old) in self.setattrs.lock().unwrap().drain(..).rev() {
+        // Take everything first: restoring an attribute runs Python, and no
+        // lock of ours should be held while that happens.
+        let attrs: Vec<_> = self.setattrs.lock().unwrap().drain(..).collect();
+        let items: Vec<_> = self.setitems.lock().unwrap().drain(..).collect();
+        let paths: Vec<_> = self.syspath.lock().unwrap().drain(..).collect();
+        for (obj, name, old) in attrs.into_iter().rev() {
             let b = obj.bind(py);
             match old {
                 Some(v) => b.setattr(name.as_str(), v.bind(py))?,
@@ -312,7 +317,7 @@ impl MonkeyPatch {
                 }
             }
         }
-        for (dic, key, old) in self.setitems.lock().unwrap().drain(..).rev() {
+        for (dic, key, old) in items.into_iter().rev() {
             let d = dic.bind(py);
             match old {
                 Some(v) => d.set_item(key.bind(py), v.bind(py))?,
@@ -323,7 +328,7 @@ impl MonkeyPatch {
         }
         let sys = py.import("sys")?;
         let path = sys.getattr("path")?;
-        for p in self.syspath.lock().unwrap().drain(..) {
+        for p in paths {
             let _ = path.call_method1("remove", (p.as_str(),));
         }
         if let Some(cwd) = self.cwd.lock().unwrap().take() {

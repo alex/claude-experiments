@@ -6,7 +6,8 @@ reference workload is [pyca/cryptography](https://github.com/pyca/cryptography);
 collected node ids and per-test outcomes.
 
 Current status on that suite: **4662 collected, identical node ids, identical
-per-test outcomes** (4015 passed / 647 skipped on CPython 3.11 + OpenSSL 3.0.13).
+per-test outcomes**, on both CPython 3.11 (4015 passed / 647 skipped) and
+free-threaded CPython 3.14 (4028 / 634), against OpenSSL 3.0.13.
 
 ## The `pytest` module
 

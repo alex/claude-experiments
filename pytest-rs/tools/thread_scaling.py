@@ -51,12 +51,14 @@ def bench(work, nthreads: int, per_thread: int) -> float:
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--cryptography", action="store_true")
-    ap.add_argument("--iterations", type=int, default=200_000)
+    # Defaults sized so a single thread takes a second or so; a workload that
+    # finishes in milliseconds measures scheduler noise, not scaling.
+    ap.add_argument("--iterations", type=int, default=0)
     ap.add_argument("--max-threads", type=int, default=8)
     args = ap.parse_args()
 
     work = make_crypto_work() if args.cryptography else cpu_work
-    per_thread = args.iterations // (10 if args.cryptography else 1)
+    per_thread = args.iterations or (20_000 if args.cryptography else 8_000_000)
 
     gil = getattr(sys, "_is_gil_enabled", lambda: True)()
     print(f"python {sys.version.split()[0]}  gil={'on' if gil else 'off'}")

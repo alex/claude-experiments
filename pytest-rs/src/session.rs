@@ -25,8 +25,6 @@ pub struct ConfigData {
     pub ini: RwLock<std::collections::BTreeMap<String, Value>>,
     pub known_markers: Arc<RwLock<KnownMarkers>>,
     pub stash: Mutex<Option<Py<PyDict>>>,
-    /// Extra lines contributed by `pytest_report_header` hooks.
-    pub header_lines: Mutex<Vec<String>>,
 }
 
 impl ConfigData {
@@ -222,11 +220,6 @@ pub struct Session {
     pub showlocals: bool,
     pub term_width: usize,
 }
-
-// The engine only ever hands out `Arc<Session>` and mutates through interior
-// mutability, so it is safe to share across worker threads.
-unsafe impl Send for Session {}
-unsafe impl Sync for Session {}
 
 /// `pytest.Config` — the object handed to `pytest_configure` and friends.
 #[pyclass(module = "pytest", name = "Config")]

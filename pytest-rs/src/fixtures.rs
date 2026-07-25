@@ -237,19 +237,19 @@ pub fn build_closure(
         in_progress.insert(name.to_string());
         for dep in &def.argnames {
             if dep == name {
-                // Overriding a same-named fixture from a wider scope: pull the
-                // overridden definition and its dependencies into the closure,
-                // since the override will ask for it at run time.
+                // Overriding a same-named fixture from a wider scope: the
+                // override will ask for the one below it at run time, so pull
+                // the whole chain of shadowed definitions into the closure,
+                // widest first.
                 let chain = reg.resolve_chain(name, nodeid);
-                if let Some(idx) = chain.iter().position(|d| d.uid == def.uid) {
-                    if let Some(parent) = idx.checked_sub(1).and_then(|i| chain.get(i)) {
-                        for pdep in &parent.argnames {
-                            if pdep != name {
-                                visit(reg, nodeid, pdep, seen, in_progress, order);
-                            }
+                let Some(idx) = chain.iter().position(|d| d.uid == def.uid) else { continue };
+                for ancestor in chain[..idx].iter() {
+                    for adep in &ancestor.argnames {
+                        if adep != name {
+                            visit(reg, nodeid, adep, seen, in_progress, order);
                         }
-                        order.push(parent.clone());
                     }
+                    order.push(ancestor.clone());
                 }
                 continue;
             }
