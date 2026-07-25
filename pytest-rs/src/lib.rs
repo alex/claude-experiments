@@ -354,6 +354,7 @@ fn run_session(py: Python<'_>, raw_argv: Vec<String>) -> error::Result<i32> {
         tb_style: cfg.str_opt("tbstyle"),
         showlocals: cfg.flag("showlocals"),
         term_width: report::terminal_width(py),
+        xfail_strict: cfg.ini_value("xfail_strict").as_bool(),
     });
 
     // --- header ------------------------------------------------------------------

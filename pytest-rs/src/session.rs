@@ -219,6 +219,7 @@ pub struct Session {
     pub tb_style: String,
     pub showlocals: bool,
     pub term_width: usize,
+    pub xfail_strict: bool,
 }
 
 /// `pytest.Config` — the object handed to `pytest_configure` and friends.

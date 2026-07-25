@@ -337,8 +337,7 @@ fn run_phases(py: Python<'_>, worker: &Arc<Worker>, item: &Arc<Item>, state: &Ru
         Ok(SkipDecision::Run) => {}
         Err(e) => return fail_report(py, rep, &e, When::Setup, &style, state, t_start),
     }
-    let xfail_strict = cfg.ini_value("xfail_strict").as_bool();
-    let xfail = match evaluate_xfail(py, &marks, scope, xfail_strict) {
+    let xfail = match evaluate_xfail(py, &marks, scope, worker.session.xfail_strict) {
         Ok(x) => x,
         Err(e) => return fail_report(py, rep, &e, When::Setup, &style, state, t_start),
     };
