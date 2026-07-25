@@ -9,6 +9,8 @@ use std::time::Instant;
 
 pub mod bench;
 pub mod builtins;
+pub mod cache;
+pub mod capture;
 pub mod collect;
 pub mod config;
 pub mod cov;
@@ -27,6 +29,7 @@ pub mod session;
 pub mod shuffle;
 pub mod threadsafety;
 pub mod traceback;
+pub mod warnings;
 
 use crate::config::{split_ini, IniType, Parser, Value, INI_SPECS};
 use crate::marks::KnownMarkers;
@@ -123,13 +126,19 @@ fn run_session(py: Python<'_>, raw_argv: Vec<String>) -> error::Result<i32> {
     });
 
     apply_pythonpath(py, &cfg).map_err(error::Error::Py)?;
+    warnings::install_session_filters(py, &cfg.ini_list("filterwarnings"), &cfg.get("pythonwarnings").str_list())
+        .map_err(error::Error::Py)?;
 
     // Coverage must be running before test modules are imported so that
     // module level statements are attributed correctly.
     let coverage = cov::Coverage::start(py, &cfg).map_err(error::Error::Py)?;
 
     // --- phase 2: conftest discovery and option registration ----------------
-    let mut collector = collect::Collector::new(cfg.clone());
+    let hostility = fixtures::HostilityContext {
+        context_aware_warnings: threadsafety::warnings_are_context_aware(py),
+        benchmarks_enabled: !bench::BenchOptions::from_config(&cfg).disabled,
+    };
+    let mut collector = collect::Collector::new(cfg.clone(), hostility);
     let targets = collector.resolve_targets(&args0);
     for t in &targets {
         let dir = if t.path.is_dir() {
@@ -252,12 +261,16 @@ fn run_session(py: Python<'_>, raw_argv: Vec<String>) -> error::Result<i32> {
         .str_list()
         .iter()
         .any(|p| p == "no:randomly" || p == "no:random_order");
-    let seed = shuffle::resolve_seed(&cfg.str_opt("randomly_seed"));
+    let disk_cache = cache::Cache::new(&cfg.rootdir, &cfg.ini_str("cache_dir"));
+    let seed = match cfg.str_opt("randomly_seed").as_str() {
+        "last" => disk_cache.last_seed().unwrap_or(0),
+        other => shuffle::resolve_seed(other),
+    };
     if randomly_enabled {
         if cfg.get("randomly_reorganize").as_bool() || matches!(cfg.get("randomly_reorganize"), Value::None) {
             shuffle::reorder(&mut items, seed);
         }
-        shuffle::save_seed(seed);
+        disk_cache.store_seed(seed);
     } else {
         collect::group_by_module(&mut items);
     }
@@ -289,6 +302,14 @@ fn run_session(py: Python<'_>, raw_argv: Vec<String>) -> error::Result<i32> {
     let workers = resolve_workers(py, &cfg);
     let parallel = workers > 1;
 
+    // `-s` is a shorthand for `--capture=no`.
+    let capture_mode = if cfg.flag("capture_no") {
+        capture::Mode::No
+    } else {
+        capture::Mode::parse(&cfg.str_opt("capture"))
+    };
+    capture::install(py, capture_mode).map_err(error::Error::Py)?;
+
     let bench_store = Arc::new(bench::BenchStore::default());
     let session = Arc::new(Session {
         cfg: cfg.clone(),
@@ -301,10 +322,20 @@ fn run_session(py: Python<'_>, raw_argv: Vec<String>) -> error::Result<i32> {
         start_time: std::time::SystemTime::now(),
         seed,
         bench_store: bench_store.clone(),
+        capture_mode,
+        tb_style: cfg.str_opt("tbstyle"),
+        showlocals: cfg.flag("showlocals"),
+        term_width: report::terminal_width(),
     });
 
     // --- header ------------------------------------------------------------------
-    let mut term = Terminal::new(&cfg, session.items.len(), parallel);
+    // Anything Python wrote while importing conftest and test modules should
+    // land before our header rather than after it.
+    if let Ok(sys) = py.import("sys") {
+        let _ = sys.getattr("stdout").and_then(|s| s.call_method0("flush"));
+        let _ = sys.getattr("stderr").and_then(|s| s.call_method0("flush"));
+    }
+    let mut term = Terminal::new(&cfg, session.items.len(), parallel, capture_mode == capture::Mode::No);
     if !cfg.flag("no_header") {
         term.section("test session starts", '=', true);
         let pyver: String = py
@@ -425,13 +456,25 @@ fn run_session(py: Python<'_>, raw_argv: Vec<String>) -> error::Result<i32> {
         exit_message: Mutex::new(None),
     });
     let session_cache = Arc::new(SessionCache::default());
-    let the_plan = plan(&session, parallel);
+    let recorded = disk_cache.durations();
+    let the_plan = plan(&session, parallel, &recorded);
     if cfg.verbosity() >= 1 {
         term.line(&format!(
-            "scheduling: {} parallel group(s), {} serialised test(s)",
+            "scheduling: {} parallel group(s), {} serialised test(s){}",
             the_plan.groups.len(),
-            the_plan.serial.len()
+            the_plan.serial.len(),
+            if recorded.is_empty() { "" } else { ", ordered by recorded durations" }
         ));
+    }
+    if cfg.verbosity() >= 2 && !the_plan.serial.is_empty() {
+        let mut by_reason: BTreeMap<String, usize> = BTreeMap::new();
+        for &i in &the_plan.serial {
+            let reason = session.items[i].hostile_reason.clone().unwrap_or_else(|| "unknown".into());
+            *by_reason.entry(reason).or_insert(0) += 1;
+        }
+        for (reason, n) in by_reason {
+            term.line(&format!("  serialised: {n:>4} test(s) — {reason}"));
+        }
     }
     if randomly_enabled && cfg.get("randomly_reset_seed").as_bool() {
         let _ = shuffle::reseed_python(py, seed);
@@ -439,32 +482,49 @@ fn run_session(py: Python<'_>, raw_argv: Vec<String>) -> error::Result<i32> {
 
     let (tx, rx) = mpsc::channel::<TestReport>();
     let mut reports: Vec<TestReport> = Vec::with_capacity(session.items.len());
+    let mut timings = runner::PhaseTimings { parallel: 0.0, serial: 0.0 };
     let run_start = Instant::now();
+    // The terminal moves into the receiving thread so progress is written as
+    // results land rather than being buffered until the run ends.  Reporting
+    // needs no interpreter state, so this happens with the GIL released.
+    let mut term_holder = Some(term);
     {
         let session2 = session.clone();
         let cache2 = session_cache.clone();
         let state2 = state.clone();
         py.detach(|| {
-            let collector_thread = std::thread::spawn(move || {
+            let mut sink = term_holder.take().expect("terminal");
+            let receiver = std::thread::spawn(move || {
                 let mut out = Vec::new();
                 while let Ok(r) = rx.recv() {
+                    sink.report(&r);
+                    sink.flush();
                     out.push(r);
                 }
-                out
+                (sink, out)
             });
-            runner::execute(session2, cache2, the_plan, state2, tx, workers);
-            reports = collector_thread.join().unwrap_or_default();
+            timings = runner::execute(session2, cache2, the_plan, state2, tx, workers);
+            match receiver.join() {
+                Ok((sink, reps)) => {
+                    term_holder = Some(sink);
+                    reports = reps;
+                }
+                Err(_) => reports = Vec::new(),
+            }
         });
     }
+    let mut term = term_holder.expect("terminal returned");
     let run_time = run_start.elapsed().as_secs_f64();
+    disk_cache.store_durations(
+        reports
+            .iter()
+            .map(|r| (r.nodeid.clone(), r.duration + r.setup_duration + r.teardown_duration)),
+    );
 
-    // Reporting order follows collection order, which keeps output stable
-    // regardless of how the scheduler interleaved the work.
-    reports.sort_by_key(|r| r.index);
-    for r in &reports {
-        term.report(r);
-    }
     term.finish_progress();
+    // Summaries are emitted in collection order so they read the same way
+    // however the scheduler interleaved the work.
+    reports.sort_by_key(|r| r.index);
 
     // --- teardown -----------------------------------------------------------------
     for e in session_cache.teardown(py) {
@@ -481,16 +541,22 @@ fn run_session(py: Python<'_>, raw_argv: Vec<String>) -> error::Result<i32> {
         if !failed.is_empty() {
             term.section("FAILURES", '=', true);
             for r in &failed {
-                term.section(&r.nodeid, '_', false);
+                term.section(&failure_headline(&r.nodeid), '_', false);
                 term.line(r.longrepr.trim_end());
+                emit_captured(&mut term, r);
                 term.line("");
             }
         }
         if !errored.is_empty() {
             term.section("ERRORS", '=', true);
             for r in &errored {
-                term.section(&format!("ERROR at {} of {}", r.when.as_str(), r.nodeid), '_', false);
+                term.section(
+                    &format!("ERROR at {} of {}", r.when.as_str(), failure_headline(&r.nodeid)),
+                    '_',
+                    false,
+                );
                 term.line(r.longrepr.trim_end());
+                emit_captured(&mut term, r);
                 term.line("");
             }
         }
@@ -552,11 +618,15 @@ fn run_session(py: Python<'_>, raw_argv: Vec<String>) -> error::Result<i32> {
     term.section(&summary, '=', true);
     if cfg.verbosity() >= 1 {
         term.line(&format!(
-            "(collection {collect_time:.2}s, execution {run_time:.2}s, total {total_wall:.2}s)"
+            "(collection {collect_time:.2}s, parallel phase {:.2}s, serial phase {:.2}s, execution {run_time:.2}s, total {total_wall:.2}s)",
+            timings.parallel, timings.serial
         ));
     }
     term.flush();
 
+    if state.should_stop() && maxfail > 0 {
+        term.section(&format!("stopping after {maxfail} failures"), '!', true);
+    }
     let exit_msg = state.exit_message.lock().unwrap().clone();
     if let Some(msg) = exit_msg {
         eprintln!("!!!! {msg} !!!!");
@@ -566,6 +636,26 @@ fn run_session(py: Python<'_>, raw_argv: Vec<String>) -> error::Result<i32> {
         return Ok(EXIT_TESTSFAILED);
     }
     Ok(if any_failed { EXIT_TESTSFAILED } else { EXIT_OK })
+}
+
+/// Replay whatever the failing test wrote to stdout/stderr.
+fn emit_captured(term: &mut Terminal, r: &TestReport) {
+    if !r.captured_out.is_empty() {
+        term.section(&format!("Captured stdout {}", r.when.as_str()), '-', false);
+        term.line(r.captured_out.trim_end());
+    }
+    if !r.captured_err.is_empty() {
+        term.section(&format!("Captured stderr {}", r.when.as_str()), '-', false);
+        term.line(r.captured_err.trim_end());
+    }
+}
+
+/// pytest titles each failure block with the dotted test path, without the file.
+fn failure_headline(nodeid: &str) -> String {
+    match nodeid.split_once("::") {
+        Some((_, rest)) => rest.replace("::", "."),
+        None => nodeid.to_string(),
+    }
 }
 
 fn emit_short_summary(term: &mut Terminal, cfg: &ConfigData, reports: &[TestReport]) {
@@ -597,14 +687,12 @@ fn emit_short_summary(term: &mut Terminal, cfg: &ConfigData, reports: &[TestRepo
     }
     if want(Outcome::Failed) {
         for r in reports.iter().filter(|r| r.outcome == Outcome::Failed) {
-            let first = r.longrepr.lines().rev().find(|l| l.starts_with("E   ")).unwrap_or("");
-            lines.push(format!("FAILED {} - {}", r.nodeid, first.trim_start_matches("E   ")));
+            lines.push(format!("FAILED {} - {}", r.nodeid, r.exconly));
         }
     }
     if want(Outcome::Error) {
         for r in reports.iter().filter(|r| r.outcome == Outcome::Error) {
-            let first = r.longrepr.lines().rev().find(|l| l.starts_with("E   ")).unwrap_or("");
-            lines.push(format!("ERROR {} - {}", r.nodeid, first.trim_start_matches("E   ")));
+            lines.push(format!("ERROR {} - {}", r.nodeid, r.exconly));
         }
     }
     if chars.contains('p') || chars.contains('P') {

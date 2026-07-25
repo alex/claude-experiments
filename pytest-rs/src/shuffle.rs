@@ -62,6 +62,7 @@ pub fn resolve_seed(opt: &str) -> u64 {
     }
 }
 
+#[allow(dead_code)]
 pub fn save_seed(seed: u64) {
     let _ = std::fs::write(".pytest_rs_seed", seed.to_string());
 }

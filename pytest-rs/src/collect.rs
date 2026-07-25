@@ -108,9 +108,9 @@ pub struct Selector {
 }
 
 impl<'a> Collector<'a> {
-    pub fn new(cfg: Arc<ConfigData>) -> Self {
+    pub fn new(cfg: Arc<ConfigData>, hostility: crate::fixtures::HostilityContext) -> Self {
         let mut registry = FixtureRegistry::new();
-        crate::fixtures::register_builtins(&mut registry);
+        crate::fixtures::register_builtins(&mut registry, hostility);
         let python_files = non_empty(cfg.ini_list("python_files"), vec!["test_*.py".into(), "*_test.py".into()]);
         let python_classes = non_empty(cfg.ini_list("python_classes"), vec!["Test".into()]);
         let python_functions = non_empty(cfg.ini_list("python_functions"), vec!["test".into()]);
@@ -598,8 +598,14 @@ impl<'a> Collector<'a> {
             callspecs = self.apply_parametrize(py, callspecs, m, &base_nodeid)?;
         }
 
-        let thread_hostile_fixture = closure.order.iter().any(|d| d.thread_hostile);
-        let func_hostile = crate::threadsafety::callable_is_thread_hostile(py, func).unwrap_or(false);
+        let fixture_hostile: Option<String> = closure
+            .order
+            .iter()
+            .find(|d| d.thread_hostile)
+            .map(|d| format!("fixture {:?}", d.argname));
+        let func_hostile = crate::threadsafety::thread_hostile_reason(py, func)
+            .unwrap_or(None)
+            .map(|n| format!("references {n:?}"));
 
         let line = func
             .getattr("__code__")
@@ -637,19 +643,28 @@ impl<'a> Collector<'a> {
             all_marks.extend(class_marks.iter().cloned());
             all_marks.extend(ctx.module_marks.iter().cloned());
 
-            let mut hostile = thread_hostile_fixture || func_hostile;
-            if all_marks
+            let mut hostile_reason = fixture_hostile.clone().or_else(|| func_hostile.clone());
+            if let Some(m) = all_marks
                 .iter()
-                .any(|m| crate::threadsafety::MARK_THREAD_UNSAFE.contains(&m.name.as_str()))
+                .find(|m| crate::threadsafety::MARK_THREAD_UNSAFE.contains(&m.name.as_str()))
             {
-                hostile = true;
+                hostile_reason = Some(format!("marked {:?}", m.name));
+            }
+            // Scoping warning filters to one test needs `catch_warnings`, which
+            // swaps a process-global stack unless the interpreter scopes it per
+            // context.
+            if !crate::threadsafety::warnings_are_context_aware(py)
+                && all_marks.iter().any(|m| m.name == "filterwarnings")
+            {
+                hostile_reason = Some("marked \"filterwarnings\"".to_string());
             }
             if all_marks
                 .iter()
                 .any(|m| crate::threadsafety::MARK_THREAD_SAFE.contains(&m.name.as_str()))
             {
-                hostile = false;
+                hostile_reason = None;
             }
+            let hostile = hostile_reason.is_some();
 
             let mut keywords: Vec<String> = vec![item_name.clone(), name.to_string()];
             keywords.extend(cls_parts.iter().cloned());
@@ -664,6 +679,7 @@ impl<'a> Collector<'a> {
                 keywords.push(m.name.clone());
             }
 
+            let filter_specs = crate::warnings::marker_specs(py, &all_marks);
             let index = self.items.len();
             self.items.push(Arc::new(Item {
                 index,
@@ -683,9 +699,11 @@ impl<'a> Collector<'a> {
                 callspec: cs,
                 line,
                 thread_hostile: hostile,
+                hostile_reason,
                 group: Mutex::new(usize::MAX),
                 in_class,
                 keywords,
+                filter_specs,
             }));
         }
         own.clear();

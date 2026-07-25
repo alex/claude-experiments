@@ -18,11 +18,19 @@ use pyo3::types::{PyDict, PyList};
 struct Entry {
     path: String,
     lineno: usize,
-    funcname: String,
     source: Vec<String>,
     /// Index within `source` of the failing line.
     marked: usize,
     explanation: Option<String>,
+    locals: Vec<String>,
+}
+
+/// How a failure should be rendered.
+pub struct Style<'a> {
+    pub tb: &'a str,
+    pub rootdir: &'a std::path::Path,
+    pub showlocals: bool,
+    pub width: usize,
 }
 
 /// `ExcType: message`, matching `traceback.format_exception_only`.
@@ -51,7 +59,10 @@ pub fn native_traceback(py: Python<'_>, err: &PyErr) -> Option<String> {
     let val = err.value(py);
     let tb = err.traceback(py);
     let lines = tb_mod
-        .call_method1("format_exception", (ty, val, tb.map(|t| t.into_any()).unwrap_or(py.None().into_bound(py))))
+        .call_method1(
+            "format_exception",
+            (ty, val, tb.map(|t| t.into_any()).unwrap_or(py.None().into_bound(py))),
+        )
         .ok()?;
     let list = lines.cast::<PyList>().ok()?;
     let mut out = String::new();
@@ -61,76 +72,106 @@ pub fn native_traceback(py: Python<'_>, err: &PyErr) -> Option<String> {
     Some(out.trim_end().to_string())
 }
 
+/// The one-line description used in the `short test summary info` section.
+///
+/// Prefers the introspected explanation already rendered into `longrepr`
+/// (`assert 1 == 2` reads far better than a bare `AssertionError`), and falls
+/// back to the exception line when no traceback was rendered.
+pub fn short_description(py: Python<'_>, err: &PyErr, longrepr: &str) -> String {
+    if let Some(line) = longrepr.lines().find(|l| l.starts_with("E   ")) {
+        return line[4..].trim().to_string();
+    }
+    explain_exception(py, err).lines().next().unwrap_or_default().to_string()
+}
+
 /// Render a failure the way pytest's `--tb=long` does.
-pub fn format_failure(py: Python<'_>, err: &PyErr, style: &str, rootdir: &std::path::Path, showlocals: bool) -> String {
-    if style == "no" {
-        return String::new();
+pub fn format_failure(py: Python<'_>, err: &PyErr, style: &Style<'_>) -> String {
+    match style.tb {
+        "no" => return String::new(),
+        "native" => return native_traceback(py, err).unwrap_or_else(|| format_exception_only(py, err)),
+        _ => {}
     }
-    if style == "native" {
-        return native_traceback(py, err).unwrap_or_else(|| format_exception_only(py, err));
-    }
-    let entries = collect_entries(py, err, rootdir, style == "long" || style == "auto");
+    let want_source = style.tb != "line";
+    let entries = collect_entries(py, err, style.rootdir, want_source, style.showlocals);
     let exconly = explain_exception(py, err);
-    if style == "line" {
+    let exctype = err
+        .get_type(py)
+        .name()
+        .map(|n| n.to_string())
+        .unwrap_or_else(|_| "Exception".to_string());
+
+    if style.tb == "line" || entries.is_empty() {
         let loc = entries
             .last()
             .map(|e| format!("{}:{}: ", e.path, e.lineno))
             .unwrap_or_default();
         return format!("{loc}{}", exconly.lines().next().unwrap_or(""));
     }
-    let mut out = String::new();
-    let selected: Vec<&Entry> = match style {
-        "short" => entries.iter().collect(),
-        _ => entries.iter().collect(),
-    };
-    for (i, e) in selected.iter().enumerate() {
-        let last = i + 1 == selected.len();
-        if style == "short" {
-            out.push_str(&format!("{}:{}: in {}\n", e.path, e.lineno, e.funcname));
-            for (j, line) in e.source.iter().enumerate() {
-                let prefix = if j == e.marked { "    " } else { "    " };
-                out.push_str(&format!("{prefix}{line}\n"));
+
+    // `--tb=short` keeps one location line plus the failing statement per frame.
+    if style.tb == "short" {
+        let mut out = String::new();
+        for (i, e) in entries.iter().enumerate() {
+            out.push_str(&format!("{}:{}: in {}\n", e.path, e.lineno, "?"));
+            if let Some(line) = e.source.get(e.marked) {
+                out.push_str(&format!("    {line}\n"));
             }
-        } else {
-            for (j, line) in e.source.iter().enumerate() {
-                let prefix = if j == e.marked { ">   " } else { "    " };
-                out.push_str(&format!("{prefix}{line}\n"));
-            }
-            if let Some(ex) = &e.explanation {
-                for l in ex.lines() {
-                    out.push_str(&format!("E   {l}\n"));
-                }
-            }
-            if last {
+            if i + 1 == entries.len() {
                 for l in exconly.lines() {
                     out.push_str(&format!("E   {l}\n"));
                 }
             }
-            out.push('\n');
-            out.push_str(&format!("{}:{}: {}\n", e.path, e.lineno, if last { "" } else { "" }));
-            if !last {
-                out.push_str(&format!("{}\n", "_".repeat(40)));
+        }
+        return out.trim_end().to_string();
+    }
+
+    let mut out = String::new();
+    let sep = "_ ".repeat(style.width / 2);
+    for (i, e) in entries.iter().enumerate() {
+        let last = i + 1 == entries.len();
+        for (j, line) in e.source.iter().enumerate() {
+            let prefix = if j == e.marked { ">   " } else { "    " };
+            out.push_str(&format!("{prefix}{line}\n"));
+        }
+        if last {
+            if let Some(ex) = &e.explanation {
+                for l in ex.lines() {
+                    out.push_str(&format!("E   {l}\n"));
+                }
+            } else {
+                for l in exconly.lines() {
+                    out.push_str(&format!("E   {l}\n"));
+                }
             }
         }
-        let _ = showlocals;
-    }
-    if entries.is_empty() {
-        out.push_str(&exconly);
+        if !e.locals.is_empty() {
+            out.push('\n');
+            for l in &e.locals {
+                out.push_str(&format!("{l}\n"));
+            }
+        }
         out.push('\n');
-    } else if style != "short" {
-        // Final line carries the exception type, matching pytest's layout.
-        let last = entries.last().unwrap();
-        out = out.trim_end_matches('\n').to_string();
-        out.push('\n');
-        let _ = last;
+        if last {
+            out.push_str(&format!("{}:{}: {}\n", e.path, e.lineno, exctype));
+        } else {
+            out.push_str(&format!("{}:{}: \n", e.path, e.lineno));
+            out.push_str(&format!("{}\n", sep.trim_end()));
+        }
     }
-    out
+    out.trim_end().to_string()
 }
 
-fn collect_entries(py: Python<'_>, err: &PyErr, rootdir: &std::path::Path, want_source: bool) -> Vec<Entry> {
+fn collect_entries(
+    py: Python<'_>,
+    err: &PyErr,
+    rootdir: &std::path::Path,
+    want_source: bool,
+    showlocals: bool,
+) -> Vec<Entry> {
     let mut entries = Vec::new();
     let Some(tb) = err.traceback(py) else { return entries };
     let mut cur = tb.into_any();
+    let is_assertion = err.is_instance_of::<pyo3::exceptions::PyAssertionError>(py);
     loop {
         let Ok(frame) = cur.getattr("tb_frame") else { break };
         let lineno: usize = cur.getattr("tb_lineno").and_then(|l| l.extract()).unwrap_or(0);
@@ -140,42 +181,25 @@ fn collect_entries(py: Python<'_>, err: &PyErr, rootdir: &std::path::Path, want_
             .and_then(|c| c.getattr("co_filename").ok())
             .and_then(|f| f.extract().ok())
             .unwrap_or_default();
-        let funcname: String = code
-            .as_ref()
-            .and_then(|c| c.getattr("co_name").ok())
-            .and_then(|f| f.extract().ok())
-            .unwrap_or_default();
-        let hide = frame
-            .getattr("f_globals")
-            .ok()
-            .and_then(|g| g.cast_into::<PyDict>().ok())
-            .and_then(|g| g.get_item("__tracebackhide__").ok().flatten())
-            .map(|v| v.is_truthy().unwrap_or(false))
-            .unwrap_or(false)
-            || frame
-                .getattr("f_locals")
-                .ok()
-                .and_then(|l| l.cast_into::<PyDict>().ok())
-                .and_then(|l| l.get_item("__tracebackhide__").ok().flatten())
-                .map(|v| v.is_truthy().unwrap_or(false))
-                .unwrap_or(false);
-        let internal = filename.contains("/pytest_rs/") || filename.starts_with('<');
+        let hide = truthy_var(&frame, "f_globals", "__tracebackhide__") || truthy_var(&frame, "f_locals", "__tracebackhide__");
+        let internal = filename.starts_with('<');
         if !hide && !internal {
             let (source, marked) = if want_source {
                 read_source(py, &filename, lineno, code.as_ref())
             } else {
                 (Vec::new(), 0)
             };
-            let explanation = if err.is_instance_of::<pyo3::exceptions::PyAssertionError>(py) {
+            let explanation = if is_assertion {
                 explain_assertion(py, &frame, &filename, lineno)
             } else {
                 None
             };
+            let locals = if showlocals { render_locals(&frame) } else { Vec::new() };
             let display = std::path::Path::new(&filename)
                 .strip_prefix(rootdir)
                 .map(|p| p.to_string_lossy().to_string())
                 .unwrap_or_else(|_| filename.clone());
-            entries.push(Entry { path: display, lineno, funcname, source, marked, explanation });
+            entries.push(Entry { path: display, lineno, source, marked, explanation, locals });
         }
         match cur.getattr("tb_next") {
             Ok(n) if !n.is_none() => cur = n,
@@ -185,7 +209,33 @@ fn collect_entries(py: Python<'_>, err: &PyErr, rootdir: &std::path::Path, want_
     entries
 }
 
-/// Read the enclosing function body around `lineno`.
+fn truthy_var(frame: &Bound<'_, PyAny>, container: &str, name: &str) -> bool {
+    frame
+        .getattr(container)
+        .ok()
+        .and_then(|g| g.cast_into::<PyDict>().ok())
+        .and_then(|g| g.get_item(name).ok().flatten())
+        .map(|v| v.is_truthy().unwrap_or(false))
+        .unwrap_or(false)
+}
+
+fn render_locals(frame: &Bound<'_, PyAny>) -> Vec<String> {
+    let Ok(locals) = frame.getattr("f_locals").and_then(|l| l.cast_into::<PyDict>().map_err(PyErr::from)) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for (k, v) in locals.iter() {
+        let Ok(name) = k.extract::<String>() else { continue };
+        if name.starts_with("@") || name == "__tracebackhide__" {
+            continue;
+        }
+        out.push(format!("{name:<10} = {}", safe_repr(&v)));
+    }
+    out.sort();
+    out
+}
+
+/// Read the enclosing function body up to and including `lineno`.
 fn read_source(py: Python<'_>, filename: &str, lineno: usize, code: Option<&Bound<'_, PyAny>>) -> (Vec<String>, usize) {
     let Ok(linecache) = py.import("linecache") else { return (Vec::new(), 0) };
     let first: usize = code
@@ -205,31 +255,35 @@ fn read_source(py: Python<'_>, filename: &str, lineno: usize, code: Option<&Boun
         let s: String = l.extract().unwrap_or_default();
         lines.push(s.trim_end().to_string());
     }
-    // Trim common indentation so the block reads like pytest's output.
+    // Dedent by the first line's indentation so the block keeps its internal
+    // shape (pytest shows the `def` at the left margin, body indented).
     let indent = lines
-        .iter()
-        .filter(|l| !l.trim().is_empty())
+        .first()
         .map(|l| l.len() - l.trim_start().len())
-        .min()
         .unwrap_or(0);
     let lines: Vec<String> = lines
         .into_iter()
-        .map(|l| if l.len() >= indent { l[indent..].to_string() } else { l })
+        .map(|l| {
+            if l.len() >= indent && l.chars().take(indent).all(char::is_whitespace) {
+                l[indent..].to_string()
+            } else {
+                l.trim_start().to_string()
+            }
+        })
         .collect();
     let marked = lines.len().saturating_sub(1);
     (lines, marked)
 }
 
 fn explain_exception(py: Python<'_>, err: &PyErr) -> String {
-    let base = format_exception_only(py, err);
     if err.is_instance_of::<pyo3::exceptions::PyAssertionError>(py) {
         let msg = err.value(py).str().map(|s| s.to_string()).unwrap_or_default();
         if msg.is_empty() {
-            return "assert failed".to_string();
+            return "AssertionError".to_string();
         }
-        return format!("assert {msg}");
+        return format!("AssertionError: {msg}");
     }
-    base
+    format_exception_only(py, err)
 }
 
 /// Re-evaluate the failing `assert` expression to describe why it failed.
@@ -249,15 +303,38 @@ fn explain_assertion(py: Python<'_>, frame: &Bound<'_, PyAny>, filename: &str, l
     let body = parsed.getattr("body").ok()?;
     let stmt = body.get_item(0).ok()?;
     let test = stmt.getattr("test").ok()?;
+    // `assert expr, "message"` keeps the message in the exception itself.
+    let user_msg = stmt
+        .getattr("msg")
+        .ok()
+        .filter(|m| !m.is_none())
+        .and_then(|m| eval_node(py, &ast, &m, &frame.getattr("f_globals").ok()?, &frame.getattr("f_locals").ok()?))
+        .and_then(|v| v.str().ok())
+        .map(|s| s.to_string());
+
     let globals = frame.getattr("f_globals").ok()?;
     let locals = frame.getattr("f_locals").ok()?;
 
     let cmp_cls = ast.getattr("Compare").ok()?;
-    if !test.is_instance(&cmp_cls).unwrap_or(false) {
-        // Fall back to showing the value of the whole expression.
+    let core = if test.is_instance(&cmp_cls).unwrap_or(false) {
+        explain_compare(py, &ast, &test, &globals, &locals)?
+    } else {
         let v = eval_node(py, &ast, &test, &globals, &locals)?;
-        return Some(format!("assert {}", safe_repr(&v)));
+        format!("assert {}", safe_repr(&v))
+    };
+    match user_msg {
+        Some(m) if !m.is_empty() => Some(format!("AssertionError: {m}\n{core}")),
+        _ => Some(core),
     }
+}
+
+fn explain_compare(
+    py: Python<'_>,
+    ast: &Bound<'_, PyAny>,
+    test: &Bound<'_, PyAny>,
+    globals: &Bound<'_, PyAny>,
+    locals: &Bound<'_, PyAny>,
+) -> Option<String> {
     let left = test.getattr("left").ok()?;
     let ops = test.getattr("ops").ok()?;
     let comparators = test.getattr("comparators").ok()?;
@@ -266,8 +343,8 @@ fn explain_assertion(py: Python<'_>, frame: &Bound<'_, PyAny>, filename: &str, l
     }
     let op = ops.get_item(0).ok()?;
     let right = comparators.get_item(0).ok()?;
-    let lv = eval_node(py, &ast, &left, &globals, &locals)?;
-    let rv = eval_node(py, &ast, &right, &globals, &locals)?;
+    let lv = eval_node(py, ast, &left, globals, locals)?;
+    let rv = eval_node(py, ast, &right, globals, locals)?;
     let opname = op.get_type().name().ok()?.to_string();
     let sym = match opname.as_str() {
         "Eq" => "==",
@@ -312,8 +389,10 @@ fn eval_node<'py>(
 
 fn safe_repr(v: &Bound<'_, PyAny>) -> String {
     let s = v.repr().map(|r| r.to_string()).unwrap_or_else(|_| "<unrepresentable>".to_string());
-    if s.len() > 240 {
-        format!("{}...{}", &s[..120], &s[s.len() - 60..])
+    if s.chars().count() > 240 {
+        let head: String = s.chars().take(120).collect();
+        let tail: String = s.chars().skip(s.chars().count() - 60).collect();
+        format!("{head}...{tail}")
     } else {
         s
     }
@@ -330,17 +409,15 @@ fn describe_difference(py: Python<'_>, left: &Bound<'_, PyAny>, right: &Bound<'_
         "str" => {
             let a: String = left.extract().ok()?;
             let b: String = right.extract().ok()?;
-            let pos = a.chars().zip(b.chars()).position(|(x, y)| x != y);
-            match pos {
+            match a.chars().zip(b.chars()).position(|(x, y)| x != y) {
                 Some(i) => Some(format!("  First differing character at index {i}")),
-                None => Some(format!("  Strings differ in length: {} != {}", a.len(), b.len())),
+                None => Some(format!("  Strings differ in length: {} != {}", a.chars().count(), b.chars().count())),
             }
         }
         "bytes" => {
             let a: Vec<u8> = left.extract().ok()?;
             let b: Vec<u8> = right.extract().ok()?;
-            let pos = a.iter().zip(b.iter()).position(|(x, y)| x != y);
-            match pos {
+            match a.iter().zip(b.iter()).position(|(x, y)| x != y) {
                 Some(i) => Some(format!("  First differing byte at index {i}: {:#04x} != {:#04x}", a[i], b[i])),
                 None => Some(format!("  Lengths differ: {} != {}", a.len(), b.len())),
             }

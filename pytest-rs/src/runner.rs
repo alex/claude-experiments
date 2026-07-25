@@ -83,7 +83,12 @@ pub struct Plan {
 }
 
 /// Partition items into serial groups.
-pub fn plan(session: &Session, parallel: bool) -> Plan {
+///
+/// `durations` holds per-node-id timings recorded by an earlier run; when
+/// present, groups are started longest-first (the LPT heuristic), which is what
+/// keeps a single expensive group from being picked up last and defining the
+/// makespan.
+pub fn plan(session: &Session, parallel: bool, durations: &FxHashMap<String, f64>) -> Plan {
     let items = &session.items;
     if !parallel {
         return Plan { groups: Vec::new(), serial: (0..items.len()).collect() };
@@ -130,8 +135,21 @@ pub fn plan(session: &Session, parallel: bool) -> Plan {
         buckets.entry(root).or_default().push(i);
     }
     let mut groups: Vec<Vec<usize>> = order.into_iter().filter_map(|r| buckets.remove(&r)).collect();
-    // Longest-first keeps the tail of the run from being one slow group.
-    groups.sort_by_key(|g| std::cmp::Reverse(g.len()));
+    // Longest-first keeps the tail of the run from being one slow group.  With
+    // no recorded durations, item count is the best proxy available.
+    const ASSUMED: f64 = 0.001;
+    let weight = |g: &Vec<usize>| -> f64 {
+        g.iter()
+            .map(|&i| durations.get(&items[i].nodeid).copied().unwrap_or(ASSUMED))
+            .sum()
+    };
+    if durations.is_empty() {
+        groups.sort_by_key(|g| std::cmp::Reverse(g.len()));
+    } else {
+        let mut keyed: Vec<(f64, Vec<usize>)> = groups.into_iter().map(|g| (weight(&g), g)).collect();
+        keyed.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+        groups = keyed.into_iter().map(|(_, g)| g).collect();
+    }
     Plan { groups, serial }
 }
 
@@ -157,6 +175,11 @@ impl RunState {
 }
 
 /// Execute the whole session, sending reports through `tx`.
+pub struct PhaseTimings {
+    pub parallel: f64,
+    pub serial: f64,
+}
+
 pub fn execute(
     session: Arc<Session>,
     session_cache: Arc<SessionCache>,
@@ -164,8 +187,14 @@ pub fn execute(
     state: Arc<RunState>,
     tx: mpsc::Sender<TestReport>,
     workers: usize,
-) {
-    let queue = Arc::new(Mutex::new(plan.groups));
+) -> PhaseTimings {
+    let mut timings = PhaseTimings { parallel: 0.0, serial: 0.0 };
+    let phase_start = Instant::now();
+    // Workers pop from the back, so reverse to hand out the heaviest group
+    // first.
+    let mut ordered = plan.groups;
+    ordered.reverse();
+    let queue = Arc::new(Mutex::new(ordered));
     let mut handles = Vec::new();
     if workers > 1 {
         for wid in 1..workers {
@@ -184,8 +213,10 @@ pub fn execute(
     for h in handles {
         let _ = h.join();
     }
+    timings.parallel = phase_start.elapsed().as_secs_f64();
 
     // Serial phase: thread-hostile items, one at a time.
+    let serial_start = Instant::now();
     if !plan.serial.is_empty() && !state.should_stop() {
         let worker = Arc::new(Worker::new(session.clone(), session_cache.clone()));
         install_worker(worker.clone());
@@ -202,6 +233,8 @@ pub fn execute(
         });
         crate::runtime::clear_worker();
     }
+    timings.serial = serial_start.elapsed().as_secs_f64();
+    timings
 }
 
 fn worker_loop(
@@ -241,11 +274,33 @@ fn worker_loop(
 }
 
 /// Run a single test through setup / call / teardown.
+///
+/// Capturing is started and stopped here rather than inside the body: the body
+/// has many early exits, and a thread that leaves its buffer registered would
+/// collect the next test's output too.
 pub fn run_one(py: Python<'_>, worker: &Arc<Worker>, item: &Arc<Item>, state: &RunState, wid: usize) -> TestReport {
+    let capturing = worker.session.capture_mode != crate::capture::Mode::No;
+    if capturing {
+        let _ = crate::capture::start(py);
+    }
+    let mut rep = run_phases(py, worker, item, state, wid);
+    if capturing {
+        if let Ok((out, err)) = crate::capture::stop(py) {
+            rep.captured_out = out;
+            rep.captured_err = err;
+        }
+    }
+    rep
+}
+
+fn run_phases(py: Python<'_>, worker: &Arc<Worker>, item: &Arc<Item>, state: &RunState, wid: usize) -> TestReport {
     let cfg: &ConfigData = &worker.session.cfg;
-    let tb_style = cfg.str_opt("tbstyle");
-    let showlocals = cfg.flag("showlocals");
-    let rootdir = cfg.rootdir.clone();
+    let style = crate::traceback::Style {
+        tb: &worker.session.tb_style,
+        rootdir: &cfg.rootdir,
+        showlocals: worker.session.showlocals,
+        width: worker.session.term_width,
+    };
     let mut rep = TestReport {
         index: item.index,
         nodeid: item.nodeid.clone(),
@@ -256,13 +311,16 @@ pub fn run_one(py: Python<'_>, worker: &Arc<Worker>, item: &Arc<Item>, state: &R
         setup_duration: 0.0,
         teardown_duration: 0.0,
         longrepr: String::new(),
+        exconly: String::new(),
         reason: String::new(),
         location: item.location(),
         bench: None,
         worker: wid,
+        captured_out: String::new(),
+        captured_err: String::new(),
     };
     let t_start = Instant::now();
-    let marks = item.all_marks(true);
+    let marks = item.marks_for_eval();
     let globals = item
         .module
         .bind(py)
@@ -280,12 +338,12 @@ pub fn run_one(py: Python<'_>, worker: &Arc<Worker>, item: &Arc<Item>, state: &R
             return rep;
         }
         Ok(SkipDecision::Run) => {}
-        Err(e) => return fail_report(py, rep, &e, When::Setup, &tb_style, &rootdir, showlocals, state, t_start),
+        Err(e) => return fail_report(py, rep, &e, When::Setup, &style, state, t_start),
     }
     let xfail_strict = cfg.ini_value("xfail_strict").as_bool();
     let xfail = match evaluate_xfail(py, &marks, globals.as_ref(), xfail_strict) {
         Ok(x) => x,
-        Err(e) => return fail_report(py, rep, &e, When::Setup, &tb_style, &rootdir, showlocals, state, t_start),
+        Err(e) => return fail_report(py, rep, &e, When::Setup, &style, state, t_start),
     };
     if let Some(spec) = &xfail {
         if !spec.run {
@@ -300,11 +358,11 @@ pub fn run_one(py: Python<'_>, worker: &Arc<Worker>, item: &Arc<Item>, state: &R
     // --- setup ------------------------------------------------------------
     let py_item = match Py::new(py, PyItem { item: item.clone(), cfg: worker.session.cfg.clone() }) {
         Ok(v) => v.into_bound(py).into_any(),
-        Err(e) => return fail_report(py, rep, &e, When::Setup, &tb_style, &rootdir, showlocals, state, t_start),
+        Err(e) => return fail_report(py, rep, &e, When::Setup, &style, state, t_start),
     };
     for hook in &worker.session.hooks.runtest_setup {
         if let Err(e) = call_hook(py, hook.bind(py), &[("item", py_item.clone())]) {
-            return finish_with_error(py, worker, item, rep, e, When::Setup, &tb_style, &rootdir, showlocals, state, t_start);
+            return finish_with_error(py, worker, item, rep, e, When::Setup, &style, state, t_start);
         }
     }
     worker.enter_item(py, item);
@@ -313,22 +371,22 @@ pub fn run_one(py: Python<'_>, worker: &Arc<Worker>, item: &Arc<Item>, state: &R
     if let Some(cls) = &item.cls {
         match cls.bind(py).call0() {
             Ok(inst) => *worker.instance.lock().unwrap() = Some(inst.unbind()),
-            Err(e) => {
-                return finish_with_error(py, worker, item, rep, e, When::Setup, &tb_style, &rootdir, showlocals, state, t_start)
-            }
+            Err(e) => return finish_with_error(py, worker, item, rep, e, When::Setup, &style, state, t_start),
         }
     }
     let kwargs = match worker.fill_arguments(py, item) {
         Ok(k) => k,
-        Err(e) => {
-            return finish_with_error(py, worker, item, rep, e, When::Setup, &tb_style, &rootdir, showlocals, state, t_start)
-        }
+        Err(e) => return finish_with_error(py, worker, item, rep, e, When::Setup, &style, state, t_start),
     };
     rep.setup_duration = t_start.elapsed().as_secs_f64();
 
     // --- call --------------------------------------------------------------
     let t_call = Instant::now();
+    let scoped_filters = crate::warnings::Scoped::enter(py, &item.filter_specs).unwrap_or(None);
     let call_result = invoke(py, worker, item, kwargs.bind(py));
+    if let Some(scope) = scoped_filters {
+        scope.exit(py);
+    }
     let call_elapsed = t_call.elapsed().as_secs_f64();
 
     match call_result {
@@ -345,7 +403,7 @@ pub fn run_one(py: Python<'_>, worker: &Arc<Worker>, item: &Arc<Item>, state: &R
             }
         }
         Err(e) => {
-            classify(py, &mut rep, &e, xfail.as_ref(), &tb_style, &rootdir, showlocals, state);
+            classify(py, &mut rep, &e, xfail.as_ref(), &style, state);
         }
     }
     rep.duration = call_elapsed;
@@ -357,7 +415,8 @@ pub fn run_one(py: Python<'_>, worker: &Arc<Worker>, item: &Arc<Item>, state: &R
             if rep.outcome == Outcome::Passed {
                 rep.outcome = Outcome::Error;
                 rep.when = When::Teardown;
-                rep.longrepr = crate::traceback::format_failure(py, &e, &tb_style, &rootdir, showlocals);
+                rep.longrepr = crate::traceback::format_failure(py, &e, &style);
+                rep.exconly = crate::traceback::short_description(py, &e, &rep.longrepr);
                 state.record_failure();
             }
         }
@@ -371,8 +430,12 @@ pub fn run_one(py: Python<'_>, worker: &Arc<Worker>, item: &Arc<Item>, state: &R
     }
     *worker.instance.lock().unwrap() = None;
     rep.teardown_duration = t_teardown.elapsed().as_secs_f64();
-    if let Some(b) = take_bench_result(worker, &item.name) {
-        rep.bench = Some(b);
+    // Only benchmarks touch the shared result store; taking its lock for every
+    // test would serialise the worker pool on a global mutex.
+    if item.closure.names.iter().any(|n| n == "benchmark") {
+        if let Some(b) = take_bench_result(worker, &item.name) {
+            rep.bench = Some(b);
+        }
     }
     rep
 }
@@ -422,15 +485,13 @@ fn classify(
     rep: &mut TestReport,
     e: &PyErr,
     xfail: Option<&crate::marks::XfailSpec>,
-    tb_style: &str,
-    rootdir: &std::path::Path,
-    showlocals: bool,
+    style: &crate::traceback::Style<'_>,
     state: &RunState,
 ) {
     if e.is_instance_of::<Skipped>(py) {
         rep.outcome = Outcome::Skipped;
         rep.reason = outcome_message(py, e);
-        if let Some(loc) = raising_location(py, e, rootdir) {
+        if let Some(loc) = raising_location(py, e, style.rootdir) {
             rep.location = loc;
         }
         return;
@@ -468,11 +529,13 @@ fn classify(
             .unwrap_or(true);
         if !pytrace {
             rep.longrepr = outcome_message(py, e);
+            rep.exconly = outcome_message(py, e);
             state.record_failure();
             return;
         }
     }
-    rep.longrepr = crate::traceback::format_failure(py, e, tb_style, rootdir, showlocals);
+    rep.longrepr = crate::traceback::format_failure(py, e, style);
+    rep.exconly = crate::traceback::short_description(py, e, &rep.longrepr);
     state.record_failure();
 }
 
@@ -512,9 +575,7 @@ fn fail_report(
     mut rep: TestReport,
     e: &PyErr,
     when: When,
-    tb_style: &str,
-    rootdir: &std::path::Path,
-    showlocals: bool,
+    style: &crate::traceback::Style<'_>,
     state: &RunState,
     t_start: Instant,
 ) -> TestReport {
@@ -522,12 +583,13 @@ fn fail_report(
     if e.is_instance_of::<Skipped>(py) {
         rep.outcome = Outcome::Skipped;
         rep.reason = outcome_message(py, e);
-        if let Some(loc) = raising_location(py, e, rootdir) {
+        if let Some(loc) = raising_location(py, e, style.rootdir) {
             rep.location = loc;
         }
     } else {
         rep.outcome = Outcome::Error;
-        rep.longrepr = crate::traceback::format_failure(py, e, tb_style, rootdir, showlocals);
+        rep.longrepr = crate::traceback::format_failure(py, e, style);
+        rep.exconly = crate::traceback::short_description(py, e, &rep.longrepr);
         state.record_failure();
     }
     rep.duration = t_start.elapsed().as_secs_f64();
@@ -543,13 +605,13 @@ fn finish_with_error(
     rep: TestReport,
     e: PyErr,
     when: When,
-    tb_style: &str,
-    rootdir: &std::path::Path,
-    showlocals: bool,
+    style: &crate::traceback::Style<'_>,
     state: &RunState,
     t_start: Instant,
 ) -> TestReport {
-    let out = fail_report(py, rep, &e, when, tb_style, rootdir, showlocals, state, t_start);
+    let out = fail_report(py, rep, &e, when, style, state, t_start);
     let _ = worker.exit_item(py);
     out
 }
+
+

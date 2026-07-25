@@ -41,19 +41,11 @@ pub fn make_builtin(
             let base = tmp_root(py, worker)?;
             Ok(Py::new(py, TmpPathFactory { base: base.unbind() })?.into_any())
         }
-        Builtin::CapSys => {
-            let cap = Py::new(py, Capture::new(py, false)?)?;
-            cap.bind(py).borrow_mut().start(py)?;
-            let stop = cap.bind(py).getattr("_stop")?;
-            worker.add_finalizer_public(crate::fixtures::Scope::Function, Finalizer::Callback(stop.unbind()));
-            Ok(cap.into_any())
-        }
-        Builtin::CapFd => {
-            let cap = Py::new(py, Capture::new(py, true)?)?;
-            cap.bind(py).borrow_mut().start(py)?;
-            let stop = cap.bind(py).getattr("_stop")?;
-            worker.add_finalizer_public(crate::fixtures::Scope::Function, Finalizer::Callback(stop.unbind()));
-            Ok(cap.into_any())
+        Builtin::CapSys | Builtin::CapFd => {
+            // Capturing is already active for this worker thread; the fixture
+            // is just a handle onto that thread's buffers.
+            crate::capture::start(py)?;
+            Ok(Py::new(py, Capture { binary: false })?.into_any())
         }
         Builtin::RecWarn => {
             let warnings = py.import("warnings")?;
@@ -375,66 +367,48 @@ fn resolve_dotted<'py>(py: Python<'py>, dotted: &str) -> PyResult<(Bound<'py, Py
     }
 }
 
-/// `capsys` / `capfd`
+/// `capsys` / `capfd` — a handle onto the calling thread's capture buffers.
 #[pyclass(module = "pytest", name = "CaptureFixture")]
 pub struct Capture {
-    fd_level: bool,
-    saved: Option<(Py<PyAny>, Py<PyAny>)>,
-    out: Py<PyAny>,
-    err: Py<PyAny>,
-    last: Mutex<(String, String)>,
-}
-
-impl Capture {
-    fn new(py: Python<'_>, fd_level: bool) -> PyResult<Self> {
-        let io = py.import("io")?;
-        Ok(Capture {
-            fd_level,
-            saved: None,
-            out: io.getattr("StringIO")?.call0()?.unbind(),
-            err: io.getattr("StringIO")?.call0()?.unbind(),
-            last: Mutex::new((String::new(), String::new())),
-        })
-    }
-
-    fn start(&mut self, py: Python<'_>) -> PyResult<()> {
-        let sys = py.import("sys")?;
-        self.saved = Some((sys.getattr("stdout")?.unbind(), sys.getattr("stderr")?.unbind()));
-        sys.setattr("stdout", self.out.bind(py))?;
-        sys.setattr("stderr", self.err.bind(py))?;
-        Ok(())
-    }
+    binary: bool,
 }
 
 #[pymethods]
 impl Capture {
     fn readouterr(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
-        let out: String = self.out.bind(py).call_method0("getvalue")?.extract()?;
-        let err: String = self.err.bind(py).call_method0("getvalue")?.extract()?;
-        self.out.bind(py).call_method1("truncate", (0,))?;
-        self.out.bind(py).call_method1("seek", (0,))?;
-        self.err.bind(py).call_method1("truncate", (0,))?;
-        self.err.bind(py).call_method1("seek", (0,))?;
-        *self.last.lock().unwrap() = (out.clone(), err.clone());
+        let (out, err) = crate::capture::read(py)?;
         let collections = py.import("collections")?;
         let nt = collections.getattr("namedtuple")?.call1(("CaptureResult", vec!["out", "err"]))?;
+        if self.binary {
+            return Ok(nt.call1((out.into_bytes(), err.into_bytes()))?.unbind());
+        }
         Ok(nt.call1((out, err))?.unbind())
     }
 
-    fn _stop(&mut self, py: Python<'_>) -> PyResult<()> {
-        if let Some((o, e)) = self.saved.take() {
-            let sys = py.import("sys")?;
-            sys.setattr("stdout", o.bind(py))?;
-            sys.setattr("stderr", e.bind(py))?;
-        }
-        let _ = self.fd_level;
+    fn disabled(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        Ok(Py::new(py, CaptureDisabled { saved: Mutex::new(None) })?.into_any())
+    }
+}
+
+/// `with capsys.disabled():` — lets a block write straight to the terminal.
+#[pyclass(module = "pytest", name = "CaptureDisabled")]
+pub struct CaptureDisabled {
+    saved: Mutex<Option<(Py<PyAny>, Py<PyAny>)>>,
+}
+
+#[pymethods]
+impl CaptureDisabled {
+    fn __enter__(&self, py: Python<'_>) -> PyResult<()> {
+        *self.saved.lock().unwrap() = crate::capture::suspend(py);
         Ok(())
     }
 
-    fn disabled(slf: Py<Self>, py: Python<'_>) -> PyResult<Py<PyAny>> {
-        let _ = slf;
-        let contextlib = py.import("contextlib")?;
-        Ok(contextlib.getattr("nullcontext")?.call0()?.unbind())
+    #[pyo3(signature = (*_args))]
+    fn __exit__(&self, _args: &Bound<'_, PyTuple>) -> PyResult<bool> {
+        if let Some(saved) = self.saved.lock().unwrap().take() {
+            crate::capture::resume(saved);
+        }
+        Ok(false)
     }
 }
 

@@ -62,14 +62,29 @@ pub enum Builtin {
     Cache,
 }
 
+/// Interpreter and configuration facts that decide whether a built-in fixture
+/// forces its test onto the serialised path.
+#[derive(Clone, Copy, Debug)]
+pub struct HostilityContext {
+    /// `warnings.catch_warnings()` is scoped per context (CPython 3.14+).
+    pub context_aware_warnings: bool,
+    /// Benchmarks are actually timed rather than run once.
+    pub benchmarks_enabled: bool,
+}
+
 impl Builtin {
     /// Built-in fixtures that mutate process-global state and therefore force
     /// the owning test onto the serialised execution path.
-    pub fn thread_hostile(self) -> bool {
-        matches!(
-            self,
-            Builtin::MonkeyPatch | Builtin::CapSys | Builtin::CapFd | Builtin::RecWarn | Builtin::Benchmark
-        )
+    pub fn thread_hostile(self, ctx: HostilityContext) -> bool {
+        match self {
+            // `recwarn` is only hazardous while warning filters are global.
+            Builtin::RecWarn => !ctx.context_aware_warnings,
+            // A disabled benchmark just calls the function once; there is
+            // nothing to protect from the noise of other workers.
+            Builtin::Benchmark => ctx.benchmarks_enabled,
+            Builtin::MonkeyPatch | Builtin::CapSys | Builtin::CapFd => true,
+            _ => false,
+        }
     }
 
     pub fn scope(self) -> Scope {
@@ -439,7 +454,7 @@ pub fn make_fixturedef(
     let argnames = if wants_self { raw_argnames[1..].to_vec() } else { raw_argnames };
     let is_gen = is_generator(py, func)?;
     let uid = reg.alloc_uid();
-    let thread_hostile = crate::threadsafety::callable_is_thread_hostile(py, func).unwrap_or(false);
+    let thread_hostile = crate::threadsafety::thread_hostile_reason(py, func).unwrap_or(None).is_some();
     Ok(Arc::new(FixtureDef {
         uid,
         argname,
@@ -459,7 +474,7 @@ pub fn make_fixturedef(
 }
 
 /// Register the fixtures the engine implements natively.
-pub fn register_builtins(reg: &mut FixtureRegistry) {
+pub fn register_builtins(reg: &mut FixtureRegistry, ctx: HostilityContext) {
     let entries: &[(&str, Builtin)] = &[
         ("request", Builtin::Request),
         ("pytestconfig", Builtin::PytestConfig),
@@ -488,7 +503,7 @@ pub fn register_builtins(reg: &mut FixtureRegistry) {
             baseid: String::new(),
             builtin: Some(*b),
             wants_self: false,
-            thread_hostile: b.thread_hostile(),
+            thread_hostile: b.thread_hostile(ctx),
             location: "<pytest-rs builtin>".to_string(),
         }));
     }

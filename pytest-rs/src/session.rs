@@ -122,6 +122,8 @@ pub struct Item {
     pub line: usize,
     /// Set when the item may not overlap with other tests.
     pub thread_hostile: bool,
+    /// Why the item was serialised, for `-vv` reporting.
+    pub hostile_reason: Option<String>,
     /// Identifies the serial group this item belongs to; items with the same
     /// group id must run sequentially on one thread.
     pub group: Mutex<usize>,
@@ -129,6 +131,8 @@ pub struct Item {
     pub in_class: bool,
     /// Keywords used by `-k` matching.
     pub keywords: Vec<String>,
+    /// Specs contributed by `@pytest.mark.filterwarnings`, resolved once.
+    pub filter_specs: Vec<String>,
 }
 
 impl Item {
@@ -138,6 +142,17 @@ impl Item {
             v.extend(self.extra_marks.lock().unwrap().iter().cloned());
         }
         v
+    }
+
+    /// Markers for the runner's own evaluation, avoiding a clone (and the
+    /// reference-count traffic that comes with it) in the common case where
+    /// nothing was added at runtime.
+    pub fn marks_for_eval(&self) -> std::borrow::Cow<'_, [MarkData]> {
+        if self.extra_marks.lock().unwrap().is_empty() {
+            std::borrow::Cow::Borrowed(&self.marks)
+        } else {
+            std::borrow::Cow::Owned(self.all_marks(true))
+        }
     }
 
     pub fn location(&self) -> String {
@@ -205,6 +220,12 @@ pub struct Session {
     pub seed: u64,
     /// Collected benchmark timings.
     pub bench_store: Arc<crate::bench::BenchStore>,
+    /// How per-test output is captured.
+    pub capture_mode: crate::capture::Mode,
+    /// Failure rendering settings, resolved once instead of per test.
+    pub tb_style: String,
+    pub showlocals: bool,
+    pub term_width: usize,
 }
 
 // The engine only ever hands out `Arc<Session>` and mutates through interior

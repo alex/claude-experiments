@@ -26,6 +26,15 @@ from pathlib import Path
 LINE = re.compile(r"^(?P<nodeid>\S+\.py::\S+)\s+(?P<outcome>[A-Z]+)")
 ROOT = Path(__file__).resolve().parent.parent
 
+# Tests that are *meant* to behave differently under the two runners, with the
+# reason.  Anything else that diverges is a compatibility bug.
+KNOWN_DIVERGENCES = {
+    "test_capture.py::test_capture_is_per_thread": (
+        "pytest captures process-globally, so a helper thread's output leaks "
+        "into the test's buffer; pytest-rs keys buffers by thread"
+    ),
+}
+
 
 def expected_outcome(nodeid: str) -> str:
     name = nodeid.rsplit("::", 1)[-1]
@@ -71,13 +80,15 @@ def run(cmd: list[str], cwd: Path) -> str:
     return proc.stdout + proc.stderr
 
 
-def check(label: str, results: dict[str, str]) -> int:
+def check(label: str, results: dict[str, str], reference: bool = False) -> int:
     if not results:
         print(f"{label}: no results parsed", file=sys.stderr)
         return 1
     bad = 0
     for nodeid, outcome in sorted(results.items()):
         want = expected_outcome(nodeid)
+        if reference and nodeid in KNOWN_DIVERGENCES:
+            continue
         if outcome != want:
             print(f"  ! {nodeid}: expected {want}, got {outcome}")
             bad += 1
@@ -106,10 +117,17 @@ def main() -> int:
         except FileNotFoundError:
             ref = {}
         if ref:
-            status |= check("pytest   ", ref)
-            differing = sorted(n for n in set(rs) & set(ref) if rs[n] != ref[n])
+            status |= check("pytest   ", ref, reference=True)
+            differing = sorted(
+                n for n in set(rs) & set(ref) if rs[n] != ref[n] and n not in KNOWN_DIVERGENCES
+            )
+            expected_divergences = sorted(
+                n for n in set(rs) & set(ref) if rs[n] != ref[n] and n in KNOWN_DIVERGENCES
+            )
             only_rs = sorted(set(rs) - set(ref))
             only_py = sorted(set(ref) - set(rs))
+            for n in expected_divergences:
+                print(f"  ~ expected divergence {n}: {KNOWN_DIVERGENCES[n]}")
             for n in differing:
                 print(f"  ! divergence {n}: pytest={ref[n]} pytest-rs={rs[n]}")
             for n in only_rs:

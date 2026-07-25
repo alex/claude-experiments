@@ -63,6 +63,38 @@ Built-in fixtures: `request`, `pytestconfig`, `monkeypatch`, `tmp_path`,
 `tmp_path_factory`, `capsys`, `capfd`, `recwarn`, `benchmark`,
 `record_property`, `cache`.
 
+## Output capturing
+
+Capturing is on by default, as in pytest, and output from a failing test is
+replayed under `Captured stdout call` / `Captured stderr call`.
+
+The implementation differs because pytest's does not survive concurrency:
+swapping `sys.stdout` or dup'ing file descriptors is process-global. Instead a
+proxy is installed over `sys.stdout`/`sys.stderr` once for the whole session and
+given a per-thread buffer. A worker with capturing active writes into its own
+buffer; a thread without one falls through to the real stream. Nothing is
+swapped while tests run.
+
+The consequence: `--capture=fd` cannot be honoured literally, because a process
+has a single file descriptor 1. It behaves as `--capture=sys`, which catches
+everything written through Python but not writes issued directly by C extensions
+to fd 1. `--capture=no` / `-s` and `--capture=tee-sys` work as documented, and
+`capsys.disabled()` suspends the calling thread's buffer only.
+
+## Warnings
+
+`filterwarnings` (ini), `-W`, and `@pytest.mark.filterwarnings` are supported,
+using pytest's `action:message:category:module:lineno` spec with dotted category
+paths. pytest's own defaults (`always::DeprecationWarning`,
+`always::PendingDeprecationWarning`) are installed first.
+
+A `filterwarnings` marker scopes filters to one test with
+`warnings.catch_warnings()`, which swaps a process-global stack on CPython
+before 3.14. On those interpreters a marked test is moved to the serialised
+path; from 3.14 onwards `catch_warnings` is context-scoped (always so on
+free-threaded builds) and the test stays parallel. The same reasoning applies to
+`pytest.warns` and the `recwarn` fixture.
+
 ## conftest hooks
 
 Discovered by name in every `conftest.py` from the rootdir down. Hook
@@ -72,6 +104,9 @@ implementations are called with only the parameters they declare.
 `pytest_report_header`, `pytest_collection_modifyitems`, `pytest_runtest_setup`,
 `pytest_runtest_teardown`, `pytest_sessionstart`, `pytest_sessionfinish`,
 `pytest_terminal_summary`, `pytest_itemcollected`, `pytest_collectstart`.
+
+`pytest_collection_modifyitems` may reorder or drop entries in `items`; the list
+is read back after the hooks run and the changes take effect.
 
 `parser.addoption` / `parser.addini` / `parser.getgroup` are honoured, and
 options registered from a conftest are available to `config.getoption`
@@ -86,9 +121,13 @@ arguments.
 
 Recognised ini options: `addopts`, `testpaths`, `python_files`,
 `python_classes`, `python_functions`, `norecursedirs`, `markers`,
-`filterwarnings`, `console_output_style`, `xfail_strict`,
-`empty_parameter_set_mark`, `pythonpath`, `usefixtures`, `minversion`,
-`required_plugins`, `cache_dir`.
+`filterwarnings`, `console_output_style` (`progress`, `count`, `classic`,
+`progress-even-when-capture-no`), `xfail_strict`, `empty_parameter_set_mark`,
+`pythonpath`, `usefixtures`, `minversion`, `required_plugins`, `cache_dir`.
+
+`cache_dir` also holds pytest-rs's own cross-run state: the randomisation seed
+(so `--randomly-seed=last` works) and per-test durations, which let the scheduler
+start the most expensive groups first on subsequent runs.
 
 ## Command line
 

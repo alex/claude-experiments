@@ -33,11 +33,16 @@ pub struct TestReport {
     pub setup_duration: f64,
     pub teardown_duration: f64,
     pub longrepr: String,
+    /// One-line description used by the short summary.
+    pub exconly: String,
     pub reason: String,
     /// `path:line` used by the `-r s` summary.
     pub location: String,
     pub bench: Option<crate::bench::BenchResult>,
     pub worker: usize,
+    /// Output written by the test, replayed when it fails.
+    pub captured_out: String,
+    pub captured_err: String,
 }
 
 pub struct Colors {
@@ -65,11 +70,19 @@ impl Colors {
     }
 }
 
+/// How the per-test progress indicator is rendered.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum ProgressStyle {
+    None,
+    Percent,
+    Count,
+}
+
 pub struct Terminal {
     pub width: usize,
     pub colors: Colors,
     pub verbosity: i64,
-    pub show_progress: bool,
+    pub progress: ProgressStyle,
     /// Characters written on the current line.
     col: usize,
     written: usize,
@@ -94,7 +107,7 @@ pub fn terminal_width() -> usize {
 }
 
 impl Terminal {
-    pub fn new(cfg: &ConfigData, total: usize, parallel: bool) -> Self {
+    pub fn new(cfg: &ConfigData, total: usize, parallel: bool, capture_disabled: bool) -> Self {
         let color_opt = cfg.str_opt("color");
         let is_tty = unsafe { libc_isatty() };
         let enabled = match color_opt.as_str() {
@@ -102,13 +115,21 @@ impl Terminal {
             "no" | "never" => false,
             _ => is_tty && std::env::var("NO_COLOR").is_err(),
         };
+        // pytest hides the percentage when output is not captured, unless the
+        // style explicitly opts back in.
         let style = cfg.ini_str("console_output_style");
-        let show_progress = style.starts_with("progress") || style.is_empty();
+        let progress = match style.as_str() {
+            "classic" => ProgressStyle::None,
+            "count" => ProgressStyle::Count,
+            "progress-even-when-capture-no" => ProgressStyle::Percent,
+            _ if capture_disabled => ProgressStyle::None,
+            _ => ProgressStyle::Percent,
+        };
         Terminal {
             width: terminal_width(),
             colors: Colors { enabled },
             verbosity: cfg.verbosity(),
-            show_progress,
+            progress,
             col: 0,
             written: 0,
             total,
@@ -158,8 +179,17 @@ impl Terminal {
         if self.total == 0 {
             return String::new();
         }
-        let pct = self.written * 100 / self.total;
-        format!(" [{pct:>3}%]")
+        match self.progress {
+            ProgressStyle::None => String::new(),
+            ProgressStyle::Percent => {
+                let pct = self.written * 100 / self.total;
+                format!(" [{pct:>3}%]")
+            }
+            ProgressStyle::Count => {
+                let width = self.total.to_string().len();
+                format!(" [{:>width$}/{}]", self.written, self.total)
+            }
+        }
     }
 
     /// Emit the per-test progress indicator.
@@ -171,7 +201,7 @@ impl Terminal {
                 Outcome::Failed | Outcome::Error => self.colors.red(r.outcome.word()),
                 _ => self.colors.yellow(r.outcome.word()),
             };
-            let suffix = if self.show_progress { self.progress_suffix() } else { String::new() };
+            let suffix = self.progress_suffix();
             let text = format!("{} {}{}", r.nodeid, word, suffix);
             self.line(&text);
             return;
@@ -179,8 +209,8 @@ impl Terminal {
         // Compact mode: one character per test.
         if !self.parallel && self.current_file.as_deref() != Some(r.relpath.as_str()) {
             if self.col > 0 {
-                let pad = self.width.saturating_sub(self.col + 6);
-                let suffix = if self.show_progress { self.progress_suffix() } else { String::new() };
+                let suffix = self.progress_suffix();
+                let pad = self.width.saturating_sub(self.col + suffix.len());
                 self.write(&" ".repeat(pad.min(self.width)));
                 self.write(&suffix);
                 self.write("\n");
@@ -197,22 +227,16 @@ impl Terminal {
         self.write(&ch);
         let limit = self.width.saturating_sub(8);
         if self.col >= limit {
-            let suffix = if self.show_progress { self.progress_suffix() } else { String::new() };
+            let suffix = self.progress_suffix();
             self.write(&suffix);
             self.write("\n");
-            if !self.parallel {
-                if let Some(f) = &self.current_file {
-                    let f = f.clone();
-                    let _ = f;
-                }
-            }
         }
     }
 
     pub fn finish_progress(&mut self) {
         if self.col > 0 {
-            let pad = self.width.saturating_sub(self.col + 6);
-            let suffix = if self.show_progress { self.progress_suffix() } else { String::new() };
+            let suffix = self.progress_suffix();
+            let pad = self.width.saturating_sub(self.col + suffix.len());
             self.write(&" ".repeat(pad.min(self.width)));
             self.write(&suffix);
             self.write("\n");
