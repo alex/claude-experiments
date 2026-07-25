@@ -160,6 +160,8 @@ Failures the run never reached (because of `-x` or `--maxfail`) stay in the
 list, so `--lf` after an early exit still knows about them.
 
 Parallelism: `-n` / `--numprocesses` (threads, not processes), `--no-parallel`.
+At `-v` the run reports the parallelism it actually achieved (CPU time across
+all threads over wall time), and at `-vv` which tests were serialised and why.
 
 Built-in plugin behaviours:
 

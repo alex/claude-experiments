@@ -520,6 +520,7 @@ fn run_session(py: Python<'_>, raw_argv: Vec<String>) -> error::Result<i32> {
     let (tx, rx) = mpsc::channel::<TestReport>();
     let mut reports: Vec<TestReport> = Vec::with_capacity(session.items.len());
     let mut timings = runner::PhaseTimings { parallel: 0.0, serial: 0.0 };
+    let cpu_before = process_cpu_seconds(py);
     let run_start = Instant::now();
     // The terminal moves into the receiving thread so progress is written as
     // results land rather than being buffered until the run ends.  Reporting
@@ -552,6 +553,7 @@ fn run_session(py: Python<'_>, raw_argv: Vec<String>) -> error::Result<i32> {
     }
     let mut term = term_holder.expect("terminal returned");
     let run_time = run_start.elapsed().as_secs_f64();
+    let cpu_used = process_cpu_seconds(py) - cpu_before;
     disk_cache.store_durations(
         reports
             .iter()
@@ -690,6 +692,17 @@ fn run_session(py: Python<'_>, raw_argv: Vec<String>) -> error::Result<i32> {
             "(collection {collect_time:.2}s, parallel phase {:.2}s, serial phase {:.2}s, execution {run_time:.2}s, total {total_wall:.2}s)",
             timings.parallel, timings.serial
         ));
+        // CPU time across all threads against wall time: how much parallelism
+        // the run actually achieved, as opposed to how much was asked for.
+        // A figure well below the worker count means the tests are contending
+        // on something — the interpreter, or a lock inside the code under test.
+        if cpu_used > 0.0 && run_time > 0.0 {
+            let achieved = cpu_used / run_time;
+            term.line(&format!(
+                "parallelism: {achieved:.2}x observed with {workers} worker{} ({cpu_used:.1}s CPU in {run_time:.1}s wall)",
+                if workers == 1 { "" } else { "s" }
+            ));
+        }
     }
     term.flush();
 
@@ -921,6 +934,14 @@ fn resolve_workers(py: Python<'_>, cfg: &ConfigData) -> usize {
         other => other.parse::<usize>().unwrap_or(1),
     };
     requested.clamp(1, 256)
+}
+
+/// Total CPU time consumed by this process, across every thread.
+fn process_cpu_seconds(py: Python<'_>) -> f64 {
+    py.import("time")
+        .and_then(|m| m.call_method0("process_time"))
+        .and_then(|v| v.extract::<f64>())
+        .unwrap_or(0.0)
 }
 
 fn apply_pythonpath(py: Python<'_>, cfg: &ConfigData) -> PyResult<()> {

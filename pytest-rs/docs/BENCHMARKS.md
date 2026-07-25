@@ -56,6 +56,23 @@ two-deep fixture chain).
 28 s, which is most of the serial-mode difference; the rest of the run is real
 crypto.
 
+## Worker count
+
+`-v` reports the parallelism the run actually achieved — CPU time across all
+threads divided by wall time — which is the number to look at when deciding how
+many workers a suite can use. On cryptography, free-threaded 3.14:
+
+| Workers | Wall | Observed parallelism | CPU |
+| --- | --- | --- | --- |
+| 1 | 22.2 s | 0.86× | 19.0 s |
+| 2 | 11.6 s | 1.71× | 19.8 s |
+| 4 | 9.1 s | 2.46× | 22.3 s |
+| 8 | 9.5 s | 2.57× | 24.3 s |
+
+Past four workers the wall time stops improving and CPU keeps climbing: that is
+contention, not work. (The 0.86× at one worker is time blocked reading test
+vectors off disk, which `time.process_time()` correctly does not count.)
+
 ## Why threads stop where they do
 
 Two things bound the parallel numbers, and only one of them is ours.
