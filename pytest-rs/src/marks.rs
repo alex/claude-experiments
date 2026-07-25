@@ -5,7 +5,7 @@ use pyo3::exceptions::{PyAttributeError, PyTypeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList, PyString, PyTuple};
 
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
 /// A single applied marker.
 #[derive(Clone)]
@@ -205,18 +205,13 @@ pub fn store_mark(py: Python<'_>, obj: &Bound<'_, PyAny>, mark: &Mark) -> PyResu
 pub struct MarkGenerator {
     /// Registered marker names (from the `markers` ini option) used by
     /// `--strict-markers`.
-    pub known: Arc<parking_lot_lite::RwLock<KnownMarkers>>,
+    pub known: Arc<RwLock<KnownMarkers>>,
 }
 
 #[derive(Default)]
 pub struct KnownMarkers {
     pub names: rustc_hash::FxHashSet<String>,
     pub strict: bool,
-}
-
-/// A minimal RwLock shim so the pyclass stays `Sync` without extra deps.
-pub mod parking_lot_lite {
-    pub use std::sync::RwLock;
 }
 
 const BUILTIN_MARKS: &[&str] = &[
@@ -241,7 +236,8 @@ impl MarkGenerator {
             let guard = self.known.read().unwrap();
             if guard.strict && !guard.names.contains(name) {
                 return Err(PyErr::new::<crate::outcomes::UsageErrorPy, _>(format!(
-                    "{name:?} not found in `markers` configuration option"
+                    "{} not found in `markers` configuration option",
+                    crate::error::py_repr(name)
                 )));
             }
         }
@@ -454,19 +450,13 @@ pub fn evaluate_xfail(
         if m.name != "xfail" {
             continue;
         }
-        // A positional argument is a condition; `reason` is keyword only in
-        // modern pytest but historically could be positional after it.
+        // `xfail(condition=False, *, reason='', raises=None, run=True,
+        // strict=False)`: the only positional is the condition, and a string
+        // condition is evaluated against the test module's globals.
         let mut fired = true;
         let args = m.args.bind(py);
         if !args.is_empty() {
-            let first = args.get_item(0)?;
-            if !first.is_instance_of::<PyString>() || args.len() > 1 {
-                fired = eval_condition(py, &first, globals)?;
-            } else {
-                // Single string positional: ambiguous. pytest treats it as a
-                // condition expression, so do the same.
-                fired = eval_condition(py, &first, globals)?;
-            }
+            fired = eval_condition(py, &args.get_item(0)?, globals)?;
         }
         if let Some(c) = m.kwarg(py, "condition") {
             fired = eval_condition(py, &c, globals)?;

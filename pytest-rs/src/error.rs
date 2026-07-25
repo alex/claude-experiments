@@ -51,3 +51,13 @@ impl From<Error> for pyo3::PyErr {
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
+
+/// Render a string the way Python's `!r` does, so messages that users grep for
+/// (skip reasons in particular) match pytest's wording exactly.
+pub fn py_repr(s: &str) -> String {
+    if s.contains('\'') && !s.contains('"') {
+        format!("\"{s}\"")
+    } else {
+        format!("'{}'", s.replace('\\', "\\\\").replace('\'', "\\'"))
+    }
+}

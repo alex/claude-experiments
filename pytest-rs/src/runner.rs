@@ -104,8 +104,13 @@ pub fn plan(session: &Session, parallel: bool, durations: &FxHashMap<String, f64
         }
         for def in &item.closure.order {
             let shares = match def.scope {
+                // Function scoped instances are never shared between tests.
                 Scope::Function => false,
-                Scope::Session => def.thread_hostile,
+                // Session scoped fixtures live in the process-wide cache rather
+                // than being grouped.  A thread-hostile one makes every item in
+                // its closure hostile, so those items are already on the serial
+                // path and never reach here.
+                Scope::Session => false,
                 _ => true,
             };
             if !shares || def.builtin.is_some() {
@@ -506,6 +511,16 @@ fn classify(
         rep.longrepr = outcome_message(py, e);
         state.stop.store(true, Ordering::Relaxed);
         *state.exit_message.lock().unwrap() = Some(outcome_message(py, e));
+        return;
+    }
+    // Ctrl-C reaches whichever thread is running Python; stop the whole
+    // session rather than recording it as one test's failure.
+    if e.is_instance_of::<pyo3::exceptions::PyKeyboardInterrupt>(py) {
+        rep.outcome = Outcome::Failed;
+        rep.longrepr = "KeyboardInterrupt".to_string();
+        rep.exconly = "KeyboardInterrupt".to_string();
+        state.stop.store(true, Ordering::Relaxed);
+        *state.exit_message.lock().unwrap() = Some("KeyboardInterrupt".to_string());
         return;
     }
     if let Some(spec) = xfail {

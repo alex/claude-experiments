@@ -198,7 +198,6 @@ impl<'a> Collector<'a> {
         }
         let modules = sys.getattr("modules")?;
         if let Ok(Some(existing)) = modules.cast::<PyDict>()?.get_item(dotted.as_str()) {
-            // Guard against a name collision with a different file.
             let same = existing
                 .getattr("__file__")
                 .ok()
@@ -208,9 +207,37 @@ impl<'a> Collector<'a> {
             if same {
                 return Ok(existing.unbind());
             }
+            // The name is taken by a different file.  This happens whenever a
+            // project has `conftest.py` at more than one level without
+            // `__init__.py`: every one of them wants the name `conftest`.
+            // Load this file directly so each conftest gets its own module
+            // object, and leave the most recently loaded one under the shared
+            // name, which is what pytest ends up with too.
+            return self.import_by_location(py, path, &dotted);
         }
         let importlib = py.import("importlib")?;
         let module = importlib.call_method1("import_module", (dotted.as_str(),))?;
+        Ok(module.unbind())
+    }
+
+    /// Import a file by path, bypassing the module-name lookup.
+    fn import_by_location(&self, py: Python<'_>, path: &Path, name: &str) -> PyResult<Py<PyAny>> {
+        let util = py.import("importlib.util")?;
+        let spec = util.call_method1("spec_from_file_location", (name, path.to_string_lossy().as_ref()))?;
+        if spec.is_none() {
+            return Err(pyo3::exceptions::PyImportError::new_err(format!(
+                "could not build an import spec for {}",
+                path.display()
+            )));
+        }
+        let module = util.call_method1("module_from_spec", (&spec,))?;
+        let sys = py.import("sys")?;
+        sys.getattr("modules")?.set_item(name, &module)?;
+        let loader = spec.getattr("loader")?;
+        if let Err(e) = loader.call_method1("exec_module", (&module,)) {
+            let _ = sys.getattr("modules")?.del_item(name);
+            return Err(e);
+        }
         Ok(module.unbind())
     }
 
@@ -700,7 +727,6 @@ impl<'a> Collector<'a> {
                 line,
                 thread_hostile: hostile,
                 hostile_reason,
-                group: Mutex::new(usize::MAX),
                 in_class,
                 keywords,
                 filter_specs,

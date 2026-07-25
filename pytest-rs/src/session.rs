@@ -124,9 +124,6 @@ pub struct Item {
     pub thread_hostile: bool,
     /// Why the item was serialised, for `-vv` reporting.
     pub hostile_reason: Option<String>,
-    /// Identifies the serial group this item belongs to; items with the same
-    /// group id must run sequentially on one thread.
-    pub group: Mutex<usize>,
     /// Whether the test function takes `self`.
     pub in_class: bool,
     /// Keywords used by `-k` matching.
@@ -211,8 +208,6 @@ pub struct Session {
     pub hooks: Hooks,
     /// Number of worker threads.
     pub workers: usize,
-    /// Node ids that were collected but deselected.
-    pub deselected: Vec<String>,
     /// Errors captured while importing modules during collection.
     pub collect_errors: Vec<(String, String)>,
     pub start_time: std::time::SystemTime,
@@ -265,9 +260,9 @@ impl Config {
                 return Ok(d.unbind());
             }
             if skip {
-                return Err(crate::outcomes::skip_error(py, &format!("no {dest:?} option found"), false));
+                return Err(crate::outcomes::skip_error(py, &format!("no {} option found", crate::error::py_repr(&dest)), false));
             }
-            return Err(PyValueError::new_err(format!("no option named {name:?}")));
+            return Err(PyValueError::new_err(format!("no option named {}", crate::error::py_repr(name))));
         }
         Ok(value_to_py(py, &val)?)
     }
@@ -290,7 +285,7 @@ impl Config {
     fn getini(&self, py: Python<'_>, name: &str) -> PyResult<Py<PyAny>> {
         let v = self.data.ini_value(name);
         if matches!(v, Value::None) {
-            return Err(PyValueError::new_err(format!("unknown configuration value: {name:?}")));
+            return Err(PyValueError::new_err(format!("unknown configuration value: {}", crate::error::py_repr(name))));
         }
         value_to_py(py, &v)
     }

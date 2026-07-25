@@ -2,8 +2,6 @@
 
 import pytest
 
-from conftest import SETUP_LOG  # noqa: F401  (imported for the finalisation test)
-
 
 def test_simple_fixture(simple):
     assert simple == "simple-value"

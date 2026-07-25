@@ -237,7 +237,20 @@ pub fn build_closure(
         in_progress.insert(name.to_string());
         for dep in &def.argnames {
             if dep == name {
-                // A fixture overriding a same-named fixture from a wider scope.
+                // Overriding a same-named fixture from a wider scope: pull the
+                // overridden definition and its dependencies into the closure,
+                // since the override will ask for it at run time.
+                let chain = reg.resolve_chain(name, nodeid);
+                if let Some(idx) = chain.iter().position(|d| d.uid == def.uid) {
+                    if let Some(parent) = idx.checked_sub(1).and_then(|i| chain.get(i)) {
+                        for pdep in &parent.argnames {
+                            if pdep != name {
+                                visit(reg, nodeid, pdep, seen, in_progress, order);
+                            }
+                        }
+                        order.push(parent.clone());
+                    }
+                }
                 continue;
             }
             visit(reg, nodeid, dep, seen, in_progress, order);
@@ -257,7 +270,14 @@ pub fn build_closure(
         visit(reg, nodeid, name, &mut seen, &mut in_progress, &mut order);
     }
 
-    let names = order.iter().map(|d| d.argname.clone()).collect();
+    // An override and the definition it shadows share a name, so dedupe for
+    // `request.fixturenames`.
+    let mut names: Vec<String> = Vec::with_capacity(order.len());
+    for d in &order {
+        if !names.contains(&d.argname) {
+            names.push(d.argname.clone());
+        }
+    }
     FixtureClosure { order, direct: direct.to_vec(), names }
 }
 

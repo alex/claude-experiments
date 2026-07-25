@@ -29,8 +29,12 @@ pub fn make_builtin(
         }
         Builtin::TmpPath => {
             let base = tmp_root(py, worker)?;
-            let name = sanitize(&item.name);
-            let dir = base.call_method1("joinpath", (name.as_str(),))?;
+            // Derive the directory from the whole node id, not just the test
+            // name: two tests called `test_foo` in different modules would
+            // otherwise share a directory, and racing to create it under the
+            // thread pool is exactly the kind of bug that shows up once a
+            // month.
+            let dir = base.call_method1("joinpath", (unique_dir_name(&item.nodeid).as_str(),))?;
             let kwargs = PyDict::new(py);
             kwargs.set_item("parents", true)?;
             kwargs.set_item("exist_ok", true)?;
@@ -79,6 +83,19 @@ fn sanitize(name: &str) -> String {
         .chars()
         .take(60)
         .collect()
+}
+
+/// A readable, collision-free directory name for a node id.
+fn unique_dir_name(nodeid: &str) -> String {
+    // FNV-1a over the full id keeps the suffix stable across runs while the
+    // readable prefix stays useful when poking at the directory by hand.
+    let mut hash: u64 = 0xcbf29ce484222325;
+    for b in nodeid.as_bytes() {
+        hash ^= *b as u64;
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    let tail = nodeid.rsplit("::").next().unwrap_or(nodeid);
+    format!("{}-{hash:08x}", sanitize(tail))
 }
 
 fn tmp_root<'py>(py: Python<'py>, worker: &Worker) -> PyResult<Bound<'py, PyAny>> {

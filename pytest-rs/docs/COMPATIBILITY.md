@@ -56,8 +56,11 @@ the `argname{index}` fallback, and the duplicate-id disambiguation suffixes.
   `@staticmethod`-wrapped fixtures are not.
 * Fixture parametrisation (`@pytest.fixture(params=...)`) expands items before
   `parametrize` markers, matching pytest's hook ordering and id layout.
-* Overriding a fixture of the same name at a narrower scope works; the most
-  specific definition visible to a node id wins.
+* Overriding a fixture of the same name at a narrower scope works at conftest,
+  module and class level, including the chaining form where the override
+  requests its own name (`def simple(simple)`) — that resolves to the next
+  definition down the chain, not to itself. The most specific definition visible
+  to a node id wins.
 
 Built-in fixtures: `request`, `pytestconfig`, `monkeypatch`, `tmp_path`,
 `tmp_path_factory`, `capsys`, `capfd`, `recwarn`, `benchmark`,
@@ -94,6 +97,19 @@ before 3.14. On those interpreters a marked test is moved to the serialised
 path; from 3.14 onwards `catch_warnings` is context-scoped (always so on
 free-threaded builds) and the test stays parallel. The same reasoning applies to
 `pytest.warns` and the `recwarn` fixture.
+
+## Module import
+
+Files are imported with pytest's `prepend` semantics: walk up while
+`__init__.py` exists to find the package root, insert it on `sys.path`, import
+by dotted name.
+
+Outside a package every `conftest.py` wants the module name `conftest`. When the
+name is already taken by a different file the module is loaded directly from its
+path instead, so each conftest gets its own module object and its fixtures and
+hooks are all registered. The most recently loaded one keeps the shared name in
+`sys.modules`, matching where pytest ends up — which means `from conftest import
+X` inside a test module is as unreliable here as it is there.
 
 ## conftest hooks
 
@@ -134,7 +150,8 @@ start the most expensive groups first on subsequent runs.
 Selection and reporting: `-k`, `-m`, `-x`, `--maxfail`, `-v`, `-q`, `-s`,
 `--capture`, `--tb`, `-r`, `--strict-markers`, `--collect-only`, `--durations`,
 `--ignore`, `--deselect`, `--no-header`, `--no-summary`, `--color`, `-p no:NAME`,
-`--rootdir`, `-c`, node-id selectors (`path::Class::test[param]`).
+`--rootdir`, `-c`, `-W`, `-l`/`--showlocals`, `--junitxml`, and node-id
+selectors (`path::Class::test[param]`).
 
 Parallelism: `-n` / `--numprocesses` (threads, not processes), `--no-parallel`.
 
@@ -160,7 +177,7 @@ Installing the real plugins is unnecessary and their entry points are ignored.
 * Third-party plugins and the `pluggy` hook system. `config.pluginmanager`
   exists but is inert.
 * `unittest.TestCase` and `doctest` collection.
-* `--pdb`, `--trace`, `--lf`/`--ff` (accepted, no effect), `--junitxml`.
+* `--pdb`, `--trace`, `--lf`/`--ff` (accepted, no effect).
 * `pytest_runtest_protocol`, `pytest_runtest_makereport`, hook wrappers, and the
   `Node` class hierarchy beyond what `request.node` needs.
 * Import modes other than `prepend`.

@@ -18,6 +18,7 @@ pub mod error;
 pub mod expr;
 pub mod fixtures;
 pub mod ids;
+pub mod junit;
 pub mod marks;
 pub mod outcomes;
 pub mod pymod;
@@ -205,6 +206,10 @@ fn run_session(py: Python<'_>, raw_argv: Vec<String>) -> error::Result<i32> {
     let files = collector.discover_files(&targets);
     for (path, parts) in &files {
         collector.collect_file(py, path, parts)?;
+        if py.check_signals().is_err() {
+            eprintln!("\n!!!!!!!!!!!!!!!!!!! KeyboardInterrupt !!!!!!!!!!!!!!!!!!!!");
+            return Ok(EXIT_INTERRUPTED);
+        }
     }
     let collect_time = collect_start.elapsed().as_secs_f64();
 
@@ -317,7 +322,6 @@ fn run_session(py: Python<'_>, raw_argv: Vec<String>) -> error::Result<i32> {
         items,
         hooks: std::mem::take(&mut collector.hooks),
         workers,
-        deselected: Vec::new(),
         collect_errors: std::mem::take(&mut collector.errors),
         start_time: std::time::SystemTime::now(),
         seed,
@@ -562,6 +566,20 @@ fn run_session(py: Python<'_>, raw_argv: Vec<String>) -> error::Result<i32> {
         }
     }
 
+    let xmlpath = cfg.str_opt("xmlpath");
+    if !xmlpath.is_empty() {
+        let xml = junit::render(&reports, run_time, "pytest");
+        let target = std::path::Path::new(&xmlpath);
+        if let Some(parent) = target.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        if let Err(e) = std::fs::write(target, xml) {
+            term.line(&format!("could not write {xmlpath}: {e}"));
+        } else if cfg.verbosity() >= 1 {
+            term.line(&format!("generated xml file: {xmlpath}"));
+        }
+    }
+
     emit_short_summary(&mut term, &cfg, &reports);
     emit_durations(&mut term, &cfg, &reports);
     emit_bench_table(&mut term, &cfg, &bench_store);
@@ -629,7 +647,8 @@ fn run_session(py: Python<'_>, raw_argv: Vec<String>) -> error::Result<i32> {
     }
     let exit_msg = state.exit_message.lock().unwrap().clone();
     if let Some(msg) = exit_msg {
-        eprintln!("!!!! {msg} !!!!");
+        term.section(&msg, '!', true);
+        term.flush();
         return Ok(EXIT_INTERRUPTED);
     }
     if cov_failed {
@@ -744,17 +763,7 @@ fn emit_bench_table(term: &mut Terminal, cfg: &ConfigData, store: &Arc<bench::Be
     }
     let all_times: Vec<f64> = results.iter().flat_map(|r| r.times.clone()).collect();
     let (unit, factor) = bench::scale(&all_times);
-    term.section(&format!("benchmark: {} tests", results.len()), '-', false);
-    term.line(&format!(
-        "{:<48} {:>10} {:>10} {:>10} {:>10} {:>8}",
-        format!("Name (time in {unit})"),
-        "Min",
-        "Max",
-        "Mean",
-        "StdDev",
-        "Rounds"
-    ));
-    term.line(&"-".repeat(term.width.min(100)));
+
     let mut sorted: Vec<&bench::BenchResult> = results.iter().collect();
     let key = cfg.str_opt("benchmark_sort");
     sorted.sort_by(|a, b| {
@@ -762,26 +771,71 @@ fn emit_bench_table(term: &mut Terminal, cfg: &ConfigData, store: &Arc<bench::Be
             "max" => (a.max(), b.max()),
             "mean" => (a.mean(), b.mean()),
             "stddev" => (a.stddev(), b.stddev()),
+            "median" => (a.median(), b.median()),
             _ => (a.min(), b.min()),
         };
         x.partial_cmp(&y).unwrap_or(std::cmp::Ordering::Equal)
     });
-    for r in sorted {
-        let mut name = r.name.clone();
-        if name.len() > 47 {
-            name.truncate(47);
-        }
-        term.line(&format!(
-            "{:<48} {:>10.4} {:>10.4} {:>10.4} {:>10.4} {:>8}",
-            name,
-            r.min() * factor,
-            r.max() * factor,
-            r.mean() * factor,
-            r.stddev() * factor,
-            r.rounds
-        ));
+
+    // Lay the table out to fit its widest entry rather than a fixed guess.
+    let cells: Vec<(String, [String; 6])> = sorted
+        .iter()
+        .map(|r| {
+            (
+                r.name.clone(),
+                [
+                    format!("{:.4}", r.min() * factor),
+                    format!("{:.4}", r.max() * factor),
+                    format!("{:.4}", r.mean() * factor),
+                    format!("{:.4}", r.stddev() * factor),
+                    format!("{:.4}", r.median() * factor),
+                    r.rounds.to_string(),
+                ],
+            )
+        })
+        .collect();
+    let headers = ["Min", "Max", "Mean", "StdDev", "Median", "Rounds"];
+    let name_header = format!("Name (time in {unit})");
+    let name_width = cells
+        .iter()
+        .map(|(n, _)| n.len())
+        .chain(std::iter::once(name_header.len()))
+        .max()
+        .unwrap_or(20)
+        .min(60);
+    let widths: Vec<usize> = (0..headers.len())
+        .map(|i| {
+            cells
+                .iter()
+                .map(|(_, c)| c[i].len())
+                .chain(std::iter::once(headers[i].len()))
+                .max()
+                .unwrap_or(8)
+        })
+        .collect();
+    let total_width: usize = name_width + 2 + widths.iter().map(|w| w + 2).sum::<usize>();
+
+    term.section(&format!("benchmark: {} tests", results.len()), '-', false);
+    let mut header = format!("{name_header:<name_width$}");
+    for (h, w) in headers.iter().zip(&widths) {
+        header.push_str(&format!("  {h:>w$}"));
     }
-    term.line(&"-".repeat(term.width.min(100)));
+    term.line(&header);
+    term.line(&"-".repeat(total_width));
+    for (name, values) in &cells {
+        let mut truncated = name.clone();
+        if truncated.len() > name_width {
+            truncated.truncate(name_width.saturating_sub(1));
+            truncated.push('~');
+        }
+        let mut row = format!("{truncated:<name_width$}");
+        for (v, w) in values.iter().zip(&widths) {
+            row.push_str(&format!("  {v:>w$}"));
+        }
+        term.line(&row);
+    }
+    term.line(&"-".repeat(total_width));
+    term.line("Legend: times are per-call; Rounds is how many calls were timed.");
 }
 
 fn resolve_workers(py: Python<'_>, cfg: &ConfigData) -> usize {

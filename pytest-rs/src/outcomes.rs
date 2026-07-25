@@ -158,7 +158,7 @@ pub fn importorskip<'py>(
             if !e.is_instance_of::<pyo3::exceptions::PyImportError>(py) {
                 return Err(e);
             }
-            let msg = reason.unwrap_or_else(|| format!("could not import {modname:?}: {e}"));
+            let msg = reason.unwrap_or_else(|| format!("could not import {}: {e}", crate::error::py_repr(modname)));
             return Err(skip_error(py, &msg, false));
         }
     };
@@ -171,8 +171,10 @@ pub fn importorskip<'py>(
         if !ok {
             let msg = reason.unwrap_or_else(|| {
                 format!(
-                    "module {modname:?} has __version__ {:?}, required is: {minv:?}",
-                    verattr.unwrap_or_default()
+                    "module {} has __version__ {}, required is: {}",
+                    crate::error::py_repr(modname),
+                    crate::error::py_repr(&verattr.unwrap_or_default()),
+                    crate::error::py_repr(minv)
                 )
             });
             return Err(skip_error(py, &msg, false));

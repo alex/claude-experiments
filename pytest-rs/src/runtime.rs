@@ -77,7 +77,7 @@ fn run_finalizer(py: Python<'_>, f: &Finalizer) -> PyResult<()> {
         Finalizer::Generator(gen, name) => {
             let g = gen.bind(py);
             match g.call_method0("__next__") {
-                Ok(_) => Err(Failed::new_err(format!("fixture {name:?} yielded more than once"))),
+                Ok(_) => Err(Failed::new_err(format!("fixture {} yielded more than once", crate::error::py_repr(name)))),
                 Err(e) if e.is_instance_of::<pyo3::exceptions::PyStopIteration>(py) => Ok(()),
                 Err(e) => Err(e),
             }
@@ -244,11 +244,33 @@ impl Worker {
                 return Ok(v.clone_ref(py));
             }
         }
-        let Some(def) = self.session.registry.resolve(name, &item.nodeid) else {
-            return Err(Failed::new_err(format!(
-                "fixture {name:?} not found\n> available fixtures: {}",
-                available_fixtures(&self.session, &item.nodeid).join(", ")
-            )));
+        // A fixture that requests its own name is overriding a wider-scoped
+        // definition, so it must resolve to the one *below* it in the chain —
+        // resolving to itself would recurse forever.
+        let def = match requester {
+            Some(r) if r.argname == name => {
+                let chain = self.session.registry.resolve_chain(name, &item.nodeid);
+                let pos = chain.iter().position(|d| d.uid == r.uid);
+                match pos.and_then(|i| i.checked_sub(1)).and_then(|i| chain.get(i).cloned()) {
+                    Some(d) => d,
+                    None => {
+                        return Err(Failed::new_err(format!(
+                            "fixture {} overrides itself but there is no wider definition to fall back on",
+                            crate::error::py_repr(name)
+                        )))
+                    }
+                }
+            }
+            _ => match self.session.registry.resolve(name, &item.nodeid) {
+                Some(d) => d,
+                None => {
+                    return Err(Failed::new_err(format!(
+                        "fixture {} not found\n> available fixtures: {}",
+                        crate::error::py_repr(name),
+                        available_fixtures(&self.session, &item.nodeid).join(", ")
+                    )))
+                }
+            },
         };
         self.get_fixture_def(py, item, &def)
     }
@@ -521,7 +543,7 @@ impl FixtureRequest {
 
 /// Raise the fixture-not-found error in the shape pytest uses.
 pub fn fixture_lookup_error(name: &str, item: &Item) -> PyErr {
-    Failed::new_err(format!("fixture {name:?} not found for {}", item.nodeid))
+    Failed::new_err(format!("fixture {} not found for {}", crate::error::py_repr(name), item.nodeid))
 }
 
 /// Helper used by the builtin fixtures to raise a skip.
