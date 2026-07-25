@@ -48,7 +48,85 @@ pub fn format_exception_only(py: Python<'_>, err: &PyErr) -> String {
     }
 }
 
-/// Full Python-style traceback, used for collection errors.
+/// Render an import failure the way pytest does: the frames that belong to the
+/// user's code, and none of the `importlib` bootstrap machinery that sits
+/// between us and it.
+pub fn format_import_failure(py: Python<'_>, err: &PyErr, what: &str, path: &str) -> String {
+    let mut out = format!("ImportError while importing {what} {}.\n", crate::error::py_repr(path));
+    if what.starts_with("test module") {
+        out.push_str("Hint: make sure your test modules/packages have valid Python names.\n");
+    }
+    out.push_str("Traceback:\n");
+    let mut any = false;
+    if let Some(tb) = err.traceback(py) {
+        let mut cur = tb.into_any();
+        loop {
+            let Ok(frame) = cur.getattr("tb_frame") else { break };
+            let lineno: usize = cur.getattr("tb_lineno").and_then(|l| l.extract()).unwrap_or(0);
+            let code = frame.getattr("f_code").ok();
+            let filename: String = code
+                .as_ref()
+                .and_then(|c| c.getattr("co_filename").ok())
+                .and_then(|f| f.extract().ok())
+                .unwrap_or_default();
+            let name: String = code
+                .as_ref()
+                .and_then(|c| c.getattr("co_name").ok())
+                .and_then(|f| f.extract().ok())
+                .unwrap_or_default();
+            if !is_import_machinery(&filename) {
+                any = true;
+                out.push_str(&format!("{filename}:{lineno}: in {name}\n"));
+                if let Ok(linecache) = py.import("linecache") {
+                    if let Ok(line) = linecache.call_method1("getline", (filename.as_str(), lineno)) {
+                        if let Ok(text) = line.extract::<String>() {
+                            if !text.trim().is_empty() {
+                                out.push_str(&format!("    {}\n", text.trim_end()));
+                            }
+                        }
+                    }
+                }
+            }
+            match cur.getattr("tb_next") {
+                Ok(n) if !n.is_none() => cur = n,
+                _ => break,
+            }
+        }
+    }
+    if !any {
+        // A syntax error never reaches the module's frame, so there is nothing
+        // to walk; its own location is in the exception.
+        if let Some(loc) = syntax_error_location(py, err) {
+            out.push_str(&loc);
+        }
+    }
+    out.push_str(&format!("E   {}\n", format_exception_only(py, err)));
+    out.trim_end().to_string()
+}
+
+fn is_import_machinery(filename: &str) -> bool {
+    filename.starts_with('<')
+        || filename.contains("importlib/_bootstrap")
+        || filename.ends_with("importlib/__init__.py")
+}
+
+fn syntax_error_location(py: Python<'_>, err: &PyErr) -> Option<String> {
+    let val = err.value(py);
+    let filename: String = val.getattr("filename").ok()?.extract().ok()?;
+    let lineno: usize = val.getattr("lineno").ok()?.extract().ok()?;
+    let text: String = val
+        .getattr("text")
+        .ok()
+        .and_then(|t| t.extract::<String>().ok())
+        .unwrap_or_default();
+    let mut out = format!("{filename}:{lineno}: in <module>\n");
+    if !text.trim().is_empty() {
+        out.push_str(&format!("    {}\n", text.trim_end()));
+    }
+    Some(out)
+}
+
+/// Full Python-style traceback, kept for cases with no obvious user frame.
 pub fn format_collect_error(py: Python<'_>, err: &PyErr) -> String {
     native_traceback(py, err).unwrap_or_else(|| format_exception_only(py, err))
 }

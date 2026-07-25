@@ -264,7 +264,16 @@ impl<'a> Collector<'a> {
                 continue;
             }
             self.seen_conftests.insert(cpath.clone());
-            let module = self.import_path(py, &cpath).map_err(Error::Py)?;
+            // A conftest that will not import is a configuration problem, not a
+            // test failure: report it the way pytest does and stop.
+            let module = self.import_path(py, &cpath).map_err(|e| {
+                Error::Usage(crate::traceback::format_import_failure(
+                    py,
+                    &e,
+                    "conftest",
+                    &cpath.to_string_lossy(),
+                ))
+            })?;
             let baseid = {
                 let rel = self.relpath(&d);
                 if rel == "." || rel.is_empty() {
@@ -406,7 +415,13 @@ impl<'a> Collector<'a> {
             Ok(m) => m,
             Err(e) => {
                 let rel = self.relpath(path);
-                self.errors.push((rel, crate::traceback::format_collect_error(py, &e)));
+                let text = crate::traceback::format_import_failure(
+                    py,
+                    &e,
+                    "test module",
+                    &path.to_string_lossy(),
+                );
+                self.errors.push((rel, text));
                 return Ok(());
             }
         };
