@@ -17,7 +17,6 @@
 
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
-use pyo3::types::PyList;
 use rustc_hash::FxHashMap;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread::ThreadId;
@@ -288,7 +287,3 @@ pub fn resume(saved: (Py<PyAny>, Py<PyAny>)) {
     buffers.err.insert(tid, saved.1);
 }
 
-#[allow(dead_code)]
-fn _keep(py: Python<'_>) {
-    let _ = PyList::empty(py);
-}

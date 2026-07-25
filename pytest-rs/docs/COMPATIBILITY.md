@@ -168,7 +168,18 @@ Built-in plugin behaviours:
   imported and uses coverage.py's thread concurrency mode.
 * **pytest-randomly** — on by default with a per-run seed printed in the header;
   `--randomly-seed=N|last|default`, `--randomly-dont-reorganize`,
-  `--randomly-dont-reset-seed`, `-p no:randomly`.
+  `--randomly-dont-reset-seed`, `-p no:randomly`. Modules are shuffled, then
+  classes within a module, then tests within a class, so related tests stay
+  adjacent — which also lets module-scoped fixtures live for one contiguous
+  span.
+
+  One behaviour is deliberately narrowed: pytest-randomly reseeds Python's
+  global RNG before *every* test. That is only meaningful when one test runs at
+  a time; several workers reseeding a process-global generator would produce
+  neither reproducibility nor isolation. `pytest-rs` seeds once from the session
+  seed, which keeps a run reproducible for a given `--randomly-seed` without
+  pretending to give per-test isolation that threads cannot deliver.
+  `--randomly-dont-reset-seed` skips even that.
 
 Installing the real plugins is unnecessary and their entry points are ignored.
 

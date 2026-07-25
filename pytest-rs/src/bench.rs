@@ -66,37 +66,7 @@ impl BenchResult {
         let q1 = s[s.len() / 4];
         let q3 = s[s.len() * 3 / 4];
         q3 - q1
-    }
-    pub fn ops(&self) -> f64 {
-        let m = self.mean();
-        if m > 0.0 {
-            1.0 / m
-        } else {
-            0.0
-        }
-    }
-    /// `outliers` in pytest-benchmark's "N;M" form (mild; severe).
-    pub fn outliers(&self) -> (usize, usize) {
-        let q = self.iqr();
-        if q == 0.0 {
-            return (0, 0);
-        }
-        let mut s = self.times.clone();
-        s.sort_by(|a, b| a.partial_cmp(b).unwrap());
-        let q1 = s[s.len() / 4];
-        let q3 = s[s.len() * 3 / 4];
-        let mut mild = 0;
-        let mut severe = 0;
-        for t in &self.times {
-            if *t < q1 - 3.0 * q || *t > q3 + 3.0 * q {
-                severe += 1;
-            } else if *t < q1 - 1.5 * q || *t > q3 + 1.5 * q {
-                mild += 1;
-            }
-        }
-        (mild, severe)
-    }
-}
+    }}
 
 /// Global collection point for benchmark results.
 #[derive(Default)]

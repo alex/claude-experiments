@@ -23,7 +23,7 @@ use crate::fixtures::Scope;
 use crate::marks::{evaluate_skip, evaluate_xfail, SkipDecision};
 use crate::outcomes::{outcome_message, Exit, Failed, Outcome, Skipped, XFailed};
 use crate::report::{TestReport, When};
-use crate::runtime::{install_worker, SessionCache, Worker};
+use crate::runtime::{SessionCache, Worker};
 use crate::session::{ConfigData, Item, PyItem, Session};
 
 /// Call a hook implementation, passing only the arguments it declares.
@@ -223,8 +223,7 @@ pub fn execute(
     // Serial phase: thread-hostile items, one at a time.
     let serial_start = Instant::now();
     if !plan.serial.is_empty() && !state.should_stop() {
-        let worker = Arc::new(Worker::new(session.clone(), session_cache.clone()));
-        install_worker(worker.clone());
+        let worker = Worker::new(session.clone(), session_cache.clone());
         Python::attach(|py| {
             for &idx in &plan.serial {
                 if state.should_stop() {
@@ -236,7 +235,6 @@ pub fn execute(
             }
             worker.drain(py);
         });
-        crate::runtime::clear_worker();
     }
     timings.serial = serial_start.elapsed().as_secs_f64();
     timings
@@ -250,8 +248,7 @@ fn worker_loop(
     tx: mpsc::Sender<TestReport>,
     wid: usize,
 ) {
-    let worker = Arc::new(Worker::new(session.clone(), session_cache));
-    install_worker(worker.clone());
+    let worker = Worker::new(session.clone(), session_cache);
     loop {
         if state.should_stop() {
             break;
@@ -275,7 +272,6 @@ fn worker_loop(
             }
         });
     }
-    crate::runtime::clear_worker();
 }
 
 /// Run a single test through setup / call / teardown.

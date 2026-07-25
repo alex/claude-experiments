@@ -259,10 +259,3 @@ fn mutates_via(py: Python<'_>, code: &Bound<'_, PyAny>, name: &str) -> PyResult<
     }
     Ok(false)
 }
-
-/// Reset the analysis cache (used by tests).
-pub fn clear_cache() {
-    if let Ok(mut guard) = CACHE.lock() {
-        *guard = None;
-    }
-}

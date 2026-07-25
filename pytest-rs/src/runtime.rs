@@ -16,15 +16,15 @@
 //! fixture whose body is flagged as thread hostile by the static analysis falls
 //! back to the grouping behaviour.
 
-use pyo3::exceptions::{PyKeyError, PyRuntimeError};
+use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
-use pyo3::types::{PyDict, PyList, PyString, PyTuple};
+use pyo3::types::{PyDict, PyList};
 use rustc_hash::FxHashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 
 use crate::fixtures::{Builtin, FixtureDef, Scope};
 use crate::outcomes::{Failed, Skipped};
-use crate::session::{Config, ConfigData, Item, PyItem, Session};
+use crate::session::{Config, Item, PyItem, Session};
 
 /// Something that must run when a scope ends.
 pub enum Finalizer {
@@ -98,19 +98,25 @@ pub struct Worker {
     pub teardown_errors: Mutex<Vec<String>>,
     /// The instance of the test class the current item belongs to, if any.
     pub instance: Mutex<Option<Py<PyAny>>>,
+    /// A handle back to this worker, so `request` objects can reference it
+    /// without a thread-local that has to be installed and torn down.
+    me: Mutex<Weak<Worker>>,
 }
 
 const SCOPE_CHAIN: [Scope; 5] = [Scope::Session, Scope::Package, Scope::Module, Scope::Class, Scope::Function];
 
 impl Worker {
-    pub fn new(session: Arc<Session>, session_cache: Arc<SessionCache>) -> Self {
-        Worker {
+    pub fn new(session: Arc<Session>, session_cache: Arc<SessionCache>) -> Arc<Self> {
+        let worker = Arc::new(Worker {
             session,
             session_cache,
             frames: Mutex::new(Vec::new()),
             teardown_errors: Mutex::new(Vec::new()),
             instance: Mutex::new(None),
-        }
+            me: Mutex::new(Weak::new()),
+        });
+        *worker.me.lock().unwrap() = Arc::downgrade(&worker);
+        worker
     }
 
     /// Bring the frame stack in line with `item`, tearing down anything that no
@@ -228,13 +234,12 @@ impl Worker {
         requester: Option<&Arc<FixtureDef>>,
     ) -> PyResult<Py<PyAny>> {
         if name == "request" {
+            let Some(worker) = self.handle() else {
+                return Err(PyRuntimeError::new_err("the request fixture outlived its worker"));
+            };
             return Ok(Py::new(
                 py,
-                FixtureRequest {
-                    worker: self.clone_handle(),
-                    item: item.clone(),
-                    def: requester.cloned(),
-                },
+                FixtureRequest { worker, item: item.clone(), def: requester.cloned() },
             )?
             .into_any());
         }
@@ -282,7 +287,19 @@ impl Worker {
 
         if shared_session {
             let slot = self.session_cache.slot(key);
-            let mut guard = slot.lock().unwrap();
+            // The slot lock is held while the fixture body runs, so a second
+            // worker must not block on it while holding the GIL: the holder
+            // would never get the interpreter back and both threads would
+            // wedge.  Wait with the GIL released instead.
+            let mut guard = loop {
+                match slot.try_lock() {
+                    Ok(g) => break g,
+                    Err(std::sync::TryLockError::WouldBlock) => {
+                        py.detach(|| std::thread::sleep(std::time::Duration::from_micros(200)));
+                    }
+                    Err(std::sync::TryLockError::Poisoned(e)) => break e.into_inner(),
+                }
+            };
             if let Some(v) = guard.as_ref() {
                 return Ok(v.clone_ref(py));
             }
@@ -375,22 +392,9 @@ impl Worker {
         Ok(())
     }
 
-    fn clone_handle(&self) -> Arc<Worker> {
-        WORKER_HANDLE.with(|h| h.borrow().clone().expect("worker handle not installed"))
+    fn handle(&self) -> Option<Arc<Worker>> {
+        self.me.lock().unwrap().upgrade()
     }
-}
-
-thread_local! {
-    static WORKER_HANDLE: std::cell::RefCell<Option<Arc<Worker>>> = const { std::cell::RefCell::new(None) };
-}
-
-/// Install the current worker so `FixtureRequest` objects can reference it.
-pub fn install_worker(w: Arc<Worker>) {
-    WORKER_HANDLE.with(|h| *h.borrow_mut() = Some(w));
-}
-
-pub fn clear_worker() {
-    WORKER_HANDLE.with(|h| *h.borrow_mut() = None);
 }
 
 fn available_fixtures(session: &Session, nodeid: &str) -> Vec<String> {
@@ -541,11 +545,6 @@ impl FixtureRequest {
     }
 }
 
-/// Raise the fixture-not-found error in the shape pytest uses.
-pub fn fixture_lookup_error(name: &str, item: &Item) -> PyErr {
-    Failed::new_err(format!("fixture {} not found for {}", crate::error::py_repr(name), item.nodeid))
-}
-
 /// Helper used by the builtin fixtures to raise a skip.
 pub fn skip_err(py: Python<'_>, reason: &str) -> PyErr {
     let e = Skipped::new_err(reason.to_string());
@@ -553,10 +552,3 @@ pub fn skip_err(py: Python<'_>, reason: &str) -> PyErr {
     e
 }
 
-#[allow(dead_code)]
-fn _keep_imports(py: Python<'_>) {
-    let _ = PyString::new(py, "");
-    let _ = PyTuple::empty(py);
-    let _: PyErr = PyKeyError::new_err("");
-    let _ = ConfigData::verbosity;
-}

@@ -2,15 +2,15 @@
 //! and expansion of parametrised tests into concrete items.
 
 use pyo3::prelude::*;
-use pyo3::types::{PyDict, PyList, PyString, PyTuple, PyType};
+use pyo3::types::{PyDict, PyTuple, PyType};
 use rustc_hash::{FxHashMap, FxHashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-use crate::config::{normalize, Value};
+use crate::config::normalize;
 use crate::error::{Error, Result};
 use crate::fixtures::{
-    build_closure, scan_namespace, signature_argnames, usefixtures_from_marks, FixtureDef, FixtureRegistry, Scope,
+    build_closure, scan_namespace, signature_argnames, usefixtures_from_marks, FixtureDef, FixtureRegistry,
 };
 use crate::ids;
 use crate::marks::{self, MarkData};
@@ -985,11 +985,6 @@ fn selector_matches(selector: &[String], chain: &[String]) -> bool {
     selector[..n] == chain[..n]
 }
 
-/// Convenience used by tests and the JSON collect-only output.
-pub fn nodeids(items: &[Arc<Item>]) -> Vec<String> {
-    items.iter().map(|i| i.nodeid.clone()).collect()
-}
-
 /// Reorder items so that all tests from the same module stay adjacent, which
 /// keeps module-scoped fixtures alive for a contiguous run.
 pub fn group_by_module(items: &mut [Arc<Item>]) {
@@ -1002,11 +997,6 @@ pub fn group_by_module(items: &mut [Arc<Item>]) {
         }
     }
     items.sort_by_key(|i| (order[&i.relpath], i.index));
-}
-
-/// Turn a `Value` list option into `PathBuf`s relative to rootdir.
-pub fn value_paths(v: &Value, rootdir: &Path) -> Vec<PathBuf> {
-    v.str_list().iter().map(|s| rootdir.join(s)).collect()
 }
 
 #[cfg(test)]
@@ -1030,10 +1020,3 @@ mod tests {
     }
 }
 
-/// Placeholder so `PyString`/`PyList` imports stay used in all cfgs.
-#[allow(dead_code)]
-fn _unused(py: Python<'_>) {
-    let _ = PyString::new(py, "");
-    let _ = PyList::empty(py);
-    let _ = Scope::Function;
-}

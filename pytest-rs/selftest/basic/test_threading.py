@@ -1,6 +1,7 @@
 """Scheduling invariants that must hold whether or not workers are threaded."""
 
 import threading
+import time
 
 import pytest
 
@@ -10,6 +11,11 @@ _LOCK = threading.Lock()
 
 @pytest.fixture(scope="session")
 def counted_session():
+    # Slow on purpose: a session fixture is built under a per-instance lock,
+    # and the interesting case is a second worker arriving while the first is
+    # still inside the body.  Waiting on that lock must not be done while
+    # holding the interpreter, or the two threads wedge against each other.
+    time.sleep(0.05)
     with _LOCK:
         _CONSTRUCTIONS["session"] += 1
     return "session-value"

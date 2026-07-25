@@ -43,6 +43,9 @@ impl Rng {
 }
 
 /// Derive the session seed from the `--randomly-seed` option.
+///
+/// `last` is resolved by the caller from the on-disk cache, so it never reaches
+/// here.
 pub fn resolve_seed(opt: &str) -> u64 {
     match opt {
         "" | "default" => {
@@ -54,17 +57,8 @@ pub fn resolve_seed(opt: &str) -> u64 {
                 .unwrap_or(0x5EED)
                 % 4_294_967_296
         }
-        "last" => std::fs::read_to_string(".pytest_rs_seed")
-            .ok()
-            .and_then(|s| s.trim().parse().ok())
-            .unwrap_or(0),
         other => other.parse().unwrap_or(0),
     }
-}
-
-#[allow(dead_code)]
-pub fn save_seed(seed: u64) {
-    let _ = std::fs::write(".pytest_rs_seed", seed.to_string());
 }
 
 /// Shuffle modules, then classes inside each module, then tests inside each

@@ -645,7 +645,7 @@ impl Parser {
             OptionSpec::new(&["--randomly-seed"], Store).dest("randomly_seed").default(Value::Str("default".into()))
                 .group("randomisation")
                 .help("random seed; 'last' reuses the previous run's, 'default' picks a fresh one each run"),
-            OptionSpec::new(&["--randomly-dont-reset-seed"], StoreFalse).dest("randomly_reset_seed").group("randomisation").help("do not reseed the global RNG before each test"),
+            OptionSpec::new(&["--randomly-dont-reset-seed"], StoreFalse).dest("randomly_reset_seed").group("randomisation").help("do not seed the global RNG from the session seed"),
             OptionSpec::new(&["--randomly-dont-reorganize", "--randomly-dont-shuffle"], StoreFalse)
                 .dest("randomly_reorganize").group("randomisation").help("keep the collected order"),
             // --- pytest-benchmark built-ins ----------------------------------

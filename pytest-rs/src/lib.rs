@@ -1,9 +1,8 @@
 //! pytest-rs — a pytest-compatible test runner implemented in Rust with pyo3.
 
 use pyo3::prelude::*;
-use pyo3::types::{PyDict, PyList};
+use pyo3::types::PyList;
 use std::collections::BTreeMap;
-use std::path::Path;
 use std::sync::{mpsc, Arc, Mutex, RwLock};
 use std::time::Instant;
 
@@ -35,7 +34,7 @@ pub mod warnings;
 use crate::config::{split_ini, IniType, Parser, Value, INI_SPECS};
 use crate::marks::KnownMarkers;
 use crate::outcomes::Outcome;
-use crate::report::{format_duration, outcome_summary, TestReport, Terminal, When};
+use crate::report::{format_duration, outcome_summary, TestReport, Terminal};
 use crate::runner::{plan, RunState};
 use crate::runtime::SessionCache;
 use crate::session::{ArgParser, Config, ConfigData, Session};
@@ -480,6 +479,11 @@ fn run_session(py: Python<'_>, raw_argv: Vec<String>) -> error::Result<i32> {
             term.line(&format!("  serialised: {n:>4} test(s) — {reason}"));
         }
     }
+    // pytest-randomly reseeds the global RNG before every test.  That is only
+    // meaningful when one test runs at a time; several workers reseeding a
+    // process-global generator gives neither reproducibility nor isolation.
+    // Seed once from the session seed instead, which still makes a run
+    // reproducible for a given `--randomly-seed`.
     if randomly_enabled && cfg.get("randomly_reset_seed").as_bool() {
         let _ = shuffle::reseed_python(py, seed);
     }
@@ -956,9 +960,3 @@ fn _pytest_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     Ok(())
 }
 
-#[allow(dead_code)]
-fn _unused(py: Python<'_>) {
-    let _ = PyDict::new(py);
-    let _ = Path::new("");
-    let _: Option<When> = None;
-}
