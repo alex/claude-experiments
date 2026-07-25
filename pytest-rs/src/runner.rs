@@ -322,15 +322,11 @@ fn run_phases(py: Python<'_>, worker: &Arc<Worker>, item: &Arc<Item>, state: &Ru
     };
     let t_start = Instant::now();
     let marks = item.marks_for_eval();
-    let globals = item
-        .module
-        .bind(py)
-        .getattr("__dict__")
-        .ok()
-        .and_then(|d| d.cast_into::<PyDict>().ok());
+    let module = item.module.bind(py);
+    let scope = crate::marks::MarkScope { module: Some(module) };
 
     // --- skip / xfail markers -------------------------------------------
-    match evaluate_skip(py, &marks, globals.as_ref()) {
+    match evaluate_skip(py, &marks, scope) {
         Ok(SkipDecision::Skip(reason)) => {
             rep.outcome = Outcome::Skipped;
             rep.when = When::Setup;
@@ -342,7 +338,7 @@ fn run_phases(py: Python<'_>, worker: &Arc<Worker>, item: &Arc<Item>, state: &Ru
         Err(e) => return fail_report(py, rep, &e, When::Setup, &style, state, t_start),
     }
     let xfail_strict = cfg.ini_value("xfail_strict").as_bool();
-    let xfail = match evaluate_xfail(py, &marks, globals.as_ref(), xfail_strict) {
+    let xfail = match evaluate_xfail(py, &marks, scope, xfail_strict) {
         Ok(x) => x,
         Err(e) => return fail_report(py, rep, &e, When::Setup, &style, state, t_start),
     };
@@ -357,12 +353,21 @@ fn run_phases(py: Python<'_>, worker: &Arc<Worker>, item: &Arc<Item>, state: &Ru
     }
 
     // --- setup ------------------------------------------------------------
-    let py_item = match Py::new(py, PyItem { item: item.clone(), cfg: worker.session.cfg.clone() }) {
-        Ok(v) => v.into_bound(py).into_any(),
-        Err(e) => return fail_report(py, rep, &e, When::Setup, &style, state, t_start),
+    // Only the setup/teardown hooks need the Python-visible item, and most
+    // suites have neither.
+    let needs_py_item =
+        !worker.session.hooks.runtest_setup.is_empty() || !worker.session.hooks.runtest_teardown.is_empty();
+    let py_item = if needs_py_item {
+        match Py::new(py, PyItem { item: item.clone(), cfg: worker.session.cfg.clone() }) {
+            Ok(v) => Some(v.into_bound(py).into_any()),
+            Err(e) => return fail_report(py, rep, &e, When::Setup, &style, state, t_start),
+        }
+    } else {
+        None
     };
     for hook in &worker.session.hooks.runtest_setup {
-        if let Err(e) = call_hook(py, hook.bind(py), &[("item", py_item.clone())]) {
+        let arg = py_item.clone().expect("item wrapper");
+        if let Err(e) = call_hook(py, hook.bind(py), &[("item", arg)]) {
             return finish_with_error(py, worker, item, rep, e, When::Setup, &style, state, t_start);
         }
     }
@@ -412,7 +417,8 @@ fn run_phases(py: Python<'_>, worker: &Arc<Worker>, item: &Arc<Item>, state: &Ru
     // --- teardown -----------------------------------------------------------
     let t_teardown = Instant::now();
     for hook in &worker.session.hooks.runtest_teardown {
-        if let Err(e) = call_hook(py, hook.bind(py), &[("item", py_item.clone())]) {
+        let arg = py_item.clone().expect("item wrapper");
+        if let Err(e) = call_hook(py, hook.bind(py), &[("item", arg)]) {
             if rep.outcome == Outcome::Passed {
                 rep.outcome = Outcome::Error;
                 rep.when = When::Teardown;

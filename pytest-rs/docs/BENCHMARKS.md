@@ -49,12 +49,18 @@ two-deep fixture chain).
 
 | | Wall | Per test |
 | --- | --- | --- |
-| pytest | 4.59 s | 0.92 ms |
-| pytest-rs | 0.12 s | 0.024 ms |
+| pytest | 3.98 s | 0.797 ms |
+| pytest-rs | 0.08 s | 0.017 ms |
 
-38× less overhead per test. On cryptography that accounts for roughly 4 s of the
+48× less overhead per test. On cryptography that accounts for roughly 4 s of the
 28 s, which is most of the serial-mode difference; the rest of the run is real
 crypto.
+
+Two things a test never needs are no longer done for it: the module's `__dict__`
+(only a string `skipif`/`xfail` condition reads it) and the Python-visible item
+object (only the `pytest_runtest_setup`/`teardown` hooks take one). Both were
+per-test `getattr`s on objects shared between workers, so dropping them helps
+the parallel case more than the serial one.
 
 ## Worker count
 

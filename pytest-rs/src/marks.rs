@@ -364,19 +364,35 @@ pub enum SkipDecision {
     Skip(String),
 }
 
+/// The module a set of markers belongs to.  Held unevaluated because reaching
+/// for `__dict__` costs a `getattr` and a shared reference count bump on every
+/// test, while only a string `skipif`/`xfail` condition ever needs it.
+#[derive(Clone, Copy)]
+pub struct MarkScope<'a, 'py> {
+    pub module: Option<&'a Bound<'py, PyAny>>,
+}
+
+impl<'py> MarkScope<'_, 'py> {
+    fn globals(&self, _py: Python<'py>) -> Option<Bound<'py, PyDict>> {
+        self.module?.getattr("__dict__").ok()?.cast_into::<PyDict>().ok()
+    }
+
+    pub fn none() -> Self {
+        MarkScope { module: None }
+    }
+}
+
 /// Evaluate a `condition` that may be a bool-ish object or a string expression
 /// evaluated against the test module's globals (pytest's legacy behaviour).
-fn eval_condition(py: Python<'_>, cond: &Bound<'_, PyAny>, globals: Option<&Bound<'_, PyDict>>) -> PyResult<bool> {
+fn eval_condition(py: Python<'_>, cond: &Bound<'_, PyAny>, scope: MarkScope<'_, '_>) -> PyResult<bool> {
     if let Ok(s) = cond.cast::<PyString>() {
         let src = s.to_str()?;
         let builtins = py.import("builtins")?;
-        let g = match globals {
-            Some(g) => g.clone(),
-            None => PyDict::new(py),
-        };
         let g2 = PyDict::new(py);
-        for (k, v) in g.iter() {
-            g2.set_item(k, v)?;
+        if let Some(g) = scope.globals(py) {
+            for (k, v) in g.iter() {
+                g2.set_item(k, v)?;
+            }
         }
         g2.set_item("__builtins__", builtins)?;
         g2.set_item("os", py.import("os")?)?;
@@ -390,11 +406,7 @@ fn eval_condition(py: Python<'_>, cond: &Bound<'_, PyAny>, globals: Option<&Boun
 }
 
 /// Apply `skip`/`skipif` markers, returning a skip reason if any fires.
-pub fn evaluate_skip(
-    py: Python<'_>,
-    marks: &[MarkData],
-    globals: Option<&Bound<'_, PyDict>>,
-) -> PyResult<SkipDecision> {
+pub fn evaluate_skip(py: Python<'_>, marks: &[MarkData], scope: MarkScope<'_, '_>) -> PyResult<SkipDecision> {
     for m in marks {
         match m.name.as_str() {
             "skip" => {
@@ -415,7 +427,7 @@ pub fn evaluate_skip(
                     conditions.push(c);
                 }
                 for cond in conditions {
-                    if eval_condition(py, &cond, globals)? {
+                    if eval_condition(py, &cond, scope)? {
                         let r = reason.clone().unwrap_or_else(|| {
                             format!(
                                 "condition: {}",
@@ -443,7 +455,7 @@ pub struct XfailSpec {
 pub fn evaluate_xfail(
     py: Python<'_>,
     marks: &[MarkData],
-    globals: Option<&Bound<'_, PyDict>>,
+    scope: MarkScope<'_, '_>,
     default_strict: bool,
 ) -> PyResult<Option<XfailSpec>> {
     for m in marks {
@@ -456,10 +468,10 @@ pub fn evaluate_xfail(
         let mut fired = true;
         let args = m.args.bind(py);
         if !args.is_empty() {
-            fired = eval_condition(py, &args.get_item(0)?, globals)?;
+            fired = eval_condition(py, &args.get_item(0)?, scope)?;
         }
         if let Some(c) = m.kwarg(py, "condition") {
-            fired = eval_condition(py, &c, globals)?;
+            fired = eval_condition(py, &c, scope)?;
         }
         if !fired {
             continue;
