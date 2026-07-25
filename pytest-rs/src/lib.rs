@@ -265,6 +265,9 @@ fn run_session(py: Python<'_>, raw_argv: Vec<String>) -> error::Result<i32> {
         .iter()
         .any(|p| p == "no:randomly" || p == "no:random_order");
     let disk_cache = cache::Cache::new(&cfg.rootdir, &cfg.ini_str("cache_dir"));
+    if cfg.flag("cacheclear") {
+        disk_cache.clear();
+    }
     let seed = match cfg.str_opt("randomly_seed").as_str() {
         "last" => disk_cache.last_seed().unwrap_or(0),
         other => shuffle::resolve_seed(other),
@@ -276,6 +279,29 @@ fn run_session(py: Python<'_>, raw_argv: Vec<String>) -> error::Result<i32> {
         disk_cache.store_seed(seed);
     } else {
         collect::group_by_module(&mut items);
+    }
+    // --- last-failed selection and ordering -------------------------------------
+    // Applied after the shuffle so it wins: asking for the previous failures
+    // first and then randomising them back into the middle would be useless.
+    let mut lastfailed_note = String::new();
+    if cfg.flag("lf") || cfg.flag("ff") {
+        let failed = disk_cache.last_failed();
+        let matching = items.iter().filter(|i| failed.contains(&i.nodeid)).count();
+        if matching == 0 {
+            lastfailed_note = if failed.is_empty() {
+                "run-last-failure: no previously failed tests, not deselecting items".to_string()
+            } else {
+                "run-last-failure: previously failed tests are no longer collected".to_string()
+            };
+        } else if cfg.flag("lf") {
+            let before = items.len();
+            items.retain(|i| failed.contains(&i.nodeid));
+            deselected += before - items.len();
+            lastfailed_note = format!("run-last-failure: rerun previous {matching} failures");
+        } else {
+            items.sort_by_key(|i| !failed.contains(&i.nodeid));
+            lastfailed_note = format!("run-last-failure: rerun previous {matching} failures first");
+        }
     }
     let items: Vec<Arc<session::Item>> = items;
 
@@ -366,6 +392,9 @@ fn run_session(py: Python<'_>, raw_argv: Vec<String>) -> error::Result<i32> {
         }
         if randomly_enabled {
             term.line(&format!("Using --randomly-seed={seed}"));
+        }
+        if !lastfailed_note.is_empty() {
+            term.line(&lastfailed_note);
         }
         term.line(&format!("workers: {workers} thread{}", if workers == 1 { "" } else { "s" }));
         for hook in &session.hooks.report_header {
@@ -528,6 +557,24 @@ fn run_session(py: Python<'_>, raw_argv: Vec<String>) -> error::Result<i32> {
             .iter()
             .map(|r| (r.nodeid.clone(), r.duration + r.setup_duration + r.teardown_duration)),
     );
+    // Keep failures the run never got to, so `--lf` after `-x` still knows
+    // about them.
+    {
+        let ran: std::collections::HashSet<&str> = reports.iter().map(|r| r.nodeid.as_str()).collect();
+        let mut failed: Vec<String> = reports
+            .iter()
+            .filter(|r| matches!(r.outcome, Outcome::Failed | Outcome::Error))
+            .map(|r| r.nodeid.clone())
+            .collect();
+        for old in disk_cache.last_failed() {
+            if !ran.contains(old.as_str()) {
+                failed.push(old);
+            }
+        }
+        failed.sort();
+        failed.dedup();
+        disk_cache.store_last_failed(failed.into_iter());
+    }
 
     term.finish_progress();
     // Summaries are emitted in collection order so they read the same way

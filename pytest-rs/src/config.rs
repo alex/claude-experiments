@@ -683,9 +683,12 @@ impl Parser {
             // --- Misc compatibility shims ------------------------------------
             OptionSpec::new(&["--version", "-V"], Count).dest("version"),
             OptionSpec::new(&["-h", "--help"], StoreTrue).dest("help"),
-            OptionSpec::new(&["--lf", "--last-failed"], StoreTrue).dest("lf"),
-            OptionSpec::new(&["--ff", "--failed-first"], StoreTrue).dest("ff"),
-            OptionSpec::new(&["--cache-clear"], StoreTrue).dest("cacheclear"),
+            OptionSpec::new(&["--lf", "--last-failed"], StoreTrue).dest("lf").group("selection")
+                .help("rerun only the tests that failed in the previous run"),
+            OptionSpec::new(&["--ff", "--failed-first"], StoreTrue).dest("ff").group("selection")
+                .help("run the tests that failed in the previous run first, then the rest"),
+            OptionSpec::new(&["--cache-clear"], StoreTrue).dest("cacheclear").group("general")
+                .help("discard the cached seed, durations and last-failed list before running"),
             OptionSpec::new(&["-p", "--plugin"], Append).dest("plugins"),
             OptionSpec::new(&["--assert"], Store).dest("assertmode").default(Value::Str("rewrite".into())),
         ];

@@ -5,7 +5,7 @@
 //! but every run after that starts the expensive groups first, which is what
 //! decides the makespan when a handful of tests dominate.
 
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 use std::path::{Path, PathBuf};
 
 pub struct Cache {
@@ -67,5 +67,27 @@ impl Cache {
             body.push_str(&format!("{secs:.6}\t{nodeid}\n"));
         }
         self.write("durations", &body);
+    }
+
+    /// Node ids that failed or errored in the previous run, for `--lf`/`--ff`.
+    pub fn last_failed(&self) -> FxHashSet<String> {
+        match std::fs::read_to_string(self.path("lastfailed")) {
+            Ok(text) => text.lines().map(|l| l.to_string()).filter(|l| !l.is_empty()).collect(),
+            Err(_) => FxHashSet::default(),
+        }
+    }
+
+    pub fn store_last_failed(&self, nodeids: impl Iterator<Item = String>) {
+        let mut body = String::new();
+        for id in nodeids {
+            body.push_str(&id);
+            body.push('\n');
+        }
+        self.write("lastfailed", &body);
+    }
+
+    /// Forget everything (`--cache-clear`).
+    pub fn clear(&self) {
+        let _ = std::fs::remove_dir_all(&self.dir);
     }
 }

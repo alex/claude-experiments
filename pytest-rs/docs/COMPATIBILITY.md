@@ -151,8 +151,13 @@ start the most expensive groups first on subsequent runs.
 Selection and reporting: `-k`, `-m`, `-x`, `--maxfail`, `-v`, `-q`, `-s`,
 `--capture`, `--tb`, `-r`, `--strict-markers`, `--collect-only`, `--durations`,
 `--ignore`, `--deselect`, `--no-header`, `--no-summary`, `--color`, `-p no:NAME`,
-`--rootdir`, `-c`, `-W`, `-l`/`--showlocals`, `--junitxml`, and node-id
-selectors (`path::Class::test[param]`).
+`--rootdir`, `-c`, `-W`, `-l`/`--showlocals`, `--junitxml`, `--lf`/`--ff`,
+`--cache-clear`, and node-id selectors (`path::Class::test[param]`).
+
+`--lf`/`--ff` are applied after the order randomisation, so the previous
+failures really do come first rather than being shuffled back into the middle.
+Failures the run never reached (because of `-x` or `--maxfail`) stay in the
+list, so `--lf` after an early exit still knows about them.
 
 Parallelism: `-n` / `--numprocesses` (threads, not processes), `--no-parallel`.
 
@@ -189,7 +194,7 @@ Installing the real plugins is unnecessary and their entry points are ignored.
 * Third-party plugins and the `pluggy` hook system. `config.pluginmanager`
   exists but is inert.
 * `unittest.TestCase` and `doctest` collection.
-* `--pdb`, `--trace`, `--lf`/`--ff` (accepted, no effect).
+* `--pdb`, `--trace`, `--sw`/`--stepwise`, `--nf`/`--new-first`.
 * `pytest_runtest_protocol`, `pytest_runtest_makereport`, hook wrappers, and the
   `Node` class hierarchy beyond what `request.node` needs.
 * Import modes other than `prepend`.

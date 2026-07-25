@@ -96,6 +96,25 @@ def check(label: str, results: dict[str, str], reference: bool = False) -> int:
     return 1 if bad else 0
 
 
+def check_last_failed(pytest_rs: str, corpus: Path) -> int:
+    """A full run, then `--lf`, must come back with exactly the failures."""
+    common = ["-v", "--tb=no", "-p", "no:randomly"]
+    subprocess.run([pytest_rs, *common, "--cache-clear"], cwd=corpus, capture_output=True, text=True)
+    first = parse(run([pytest_rs, *common], corpus))
+    expected = {n for n, o in first.items() if o in {"FAILED", "ERROR"}}
+    second = parse(run([pytest_rs, *common, "--lf"], corpus))
+    if set(second) != expected:
+        missing = sorted(expected - set(second))
+        extra = sorted(set(second) - expected)
+        for n in missing:
+            print(f"  ! --lf did not rerun {n}")
+        for n in extra:
+            print(f"  ! --lf reran {n}, which passed")
+        return 1
+    print(f"--lf      : reran exactly the {len(expected)} failing tests")
+    return 0
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--pytest-rs", default="pytest-rs")
@@ -138,6 +157,7 @@ def main() -> int:
                 status |= 1
             else:
                 print("runners agree on every test")
+    status |= check_last_failed(args.pytest_rs, corpus)
     return status
 
 
