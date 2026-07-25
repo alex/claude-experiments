@@ -900,14 +900,41 @@ fn flatten_strings(v: &Bound<'_, PyAny>) -> Vec<String> {
 fn print_help(parser: &Parser) {
     println!("usage: pytest-rs [options] [file_or_dir] [file_or_dir] [...]\n");
     println!("A pytest-compatible test runner implemented in Rust.\n");
-    println!("options:");
+    const ORDER: &[(&str, &str)] = &[
+        ("selection", "selecting tests"),
+        ("collection", "collection"),
+        ("reporting", "reporting"),
+        ("parallelism", "parallelism (threads, not processes)"),
+        ("benchmark", "benchmarking (pytest-benchmark behaviour, built in)"),
+        ("coverage", "coverage (pytest-cov behaviour, built in)"),
+        ("randomisation", "test order randomisation (pytest-randomly behaviour, built in)"),
+        ("general", "general"),
+    ];
     let mut seen = std::collections::BTreeSet::new();
+    let mut rows: Vec<(&str, String, &str)> = Vec::new();
     for spec in &parser.specs {
         if spec.help.is_empty() || !seen.insert(spec.dest.clone()) {
             continue;
         }
-        println!("  {:<32} {}", spec.names.join(", "), spec.help);
+        rows.push((spec.group, spec.names.join(", "), spec.help.as_str()));
     }
+    let width = rows.iter().map(|(_, n, _)| n.len()).max().unwrap_or(24).min(36);
+    for (group, title) in ORDER {
+        let mut printed = false;
+        for (g, names, help) in rows.iter().filter(|(g, _, _)| g == group) {
+            let _ = g;
+            if !printed {
+                println!("{title}:");
+                printed = true;
+            }
+            println!("  {names:<width$}  {help}");
+        }
+        if printed {
+            println!();
+        }
+    }
+    println!("Options accepted for compatibility but not implemented are omitted here;");
+    println!("see docs/COMPATIBILITY.md.");
 }
 
 #[pyfunction]

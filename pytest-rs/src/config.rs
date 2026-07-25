@@ -47,6 +47,8 @@ pub struct OptionSpec {
     /// Value used when an `OptionalStore` option is given without a value.
     pub const_value: Option<Value>,
     pub help: String,
+    /// Heading this option appears under in `--help`.
+    pub group: &'static str,
     /// Restrict values to this set (argparse `choices`).
     pub choices: Option<Vec<String>>,
 }
@@ -68,8 +70,14 @@ impl OptionSpec {
             },
             const_value: None,
             help: String::new(),
+            group: "general",
             choices: None,
         }
+    }
+
+    pub fn group(mut self, g: &'static str) -> Self {
+        self.group = g;
+        self
     }
 
     pub fn dest(mut self, dest: &str) -> Self {
@@ -576,81 +584,83 @@ impl Parser {
         use OptType::*;
         let specs = vec![
             OptionSpec::new(&["-k"], Store).dest("keyword").default(Value::Str(String::new()))
-                .help("only run tests which match the given substring expression"),
+                .help("only run tests which match the given substring expression").group("selection"),
             OptionSpec::new(&["-m"], Store).dest("markexpr").default(Value::Str(String::new()))
-                .help("only run tests matching given mark expression"),
+                .help("only run tests matching given mark expression").group("selection"),
             OptionSpec::new(&["-x", "--exitfirst"], StoreTrue).dest("exitfirst")
-                .help("exit instantly on first error or failed test"),
+                .help("exit instantly on first error or failed test").group("selection"),
             OptionSpec::new(&["--maxfail"], Store).dest("maxfail").ty(Int).default(Value::Int(0))
-                .help("exit after first num failures or errors"),
+                .help("exit after first num failures or errors").group("selection"),
             OptionSpec::new(&["-v", "--verbose"], Count).dest("verbose")
-                .help("increase verbosity"),
+                .help("increase verbosity").group("reporting"),
             OptionSpec::new(&["-q", "--quiet"], Count).dest("quiet")
-                .help("decrease verbosity"),
+                .help("decrease verbosity").group("reporting"),
             OptionSpec::new(&["--verbosity"], Store).dest("verbose").ty(Int),
             OptionSpec::new(&["-s"], StoreTrue).dest("capture_no")
-                .help("shortcut for --capture=no"),
+                .help("shortcut for --capture=no").group("reporting"),
             OptionSpec::new(&["--capture"], Store).dest("capture").default(Value::Str("fd".into()))
-                .help("per-test capturing method: one of fd|sys|no|tee-sys"),
+                .help("per-test capturing method: one of fd|sys|no|tee-sys").group("reporting"),
             OptionSpec::new(&["--tb"], Store).dest("tbstyle").default(Value::Str("auto".into()))
-                .help("traceback print mode (auto/long/short/line/native/no)"),
+                .help("traceback print mode (auto/long/short/line/native/no)").group("reporting"),
             OptionSpec::new(&["-r"], Store).dest("reportchars").default(Value::Str("fE".into()))
-                .help("show extra test summary info as specified by chars"),
+                .help("show extra test summary info as specified by chars").group("reporting"),
             OptionSpec::new(&["--strict-markers", "--strict"], StoreTrue).dest("strict_markers")
-                .help("markers not registered in the `markers` section of the configuration file raise errors"),
+                .help("markers not registered in the `markers` section of the configuration file raise errors").group("collection"),
             OptionSpec::new(&["--strict-config"], StoreTrue).dest("strict_config"),
             OptionSpec::new(&["-p"], Append).dest("plugins")
-                .help("early-load given plugin module name or entry point"),
+                .help("early-load given plugin module name or entry point").group("general"),
             OptionSpec::new(&["--collect-only", "--collectonly", "--co"], StoreTrue).dest("collectonly")
-                .help("only collect tests, don't execute them"),
-            OptionSpec::new(&["--rootdir"], Store).dest("rootdir"),
-            OptionSpec::new(&["-c", "--config-file"], Store).dest("inifilename"),
+                .help("only collect tests, don't execute them").group("collection"),
+            OptionSpec::new(&["--rootdir"], Store).dest("rootdir").group("general").help("define the root directory for test paths"),
+            OptionSpec::new(&["-c", "--config-file"], Store).dest("inifilename").group("general").help("load configuration from this file instead of searching"),
             OptionSpec::new(&["--durations"], Store).dest("durations").ty(Int).default(Value::Int(-1))
-                .help("show N slowest setup/test durations (N=0 for all)"),
-            OptionSpec::new(&["--durations-min"], Store).dest("durations_min").ty(Float).default(Value::Float(0.005)),
-            OptionSpec::new(&["--no-header"], StoreTrue).dest("no_header"),
-            OptionSpec::new(&["--no-summary"], StoreTrue).dest("no_summary"),
-            OptionSpec::new(&["--color"], Store).dest("color").default(Value::Str("auto".into())),
-            OptionSpec::new(&["--ignore"], Append).dest("ignore"),
-            OptionSpec::new(&["--ignore-glob"], Append).dest("ignore_glob"),
-            OptionSpec::new(&["--deselect"], Append).dest("deselect"),
-            OptionSpec::new(&["-W", "--pythonwarnings"], Append).dest("pythonwarnings"),
-            OptionSpec::new(&["--continue-on-collection-errors"], StoreTrue).dest("continue_on_collection_errors"),
+                .help("show N slowest setup/test durations (N=0 for all)").group("reporting"),
+            OptionSpec::new(&["--durations-min"], Store).dest("durations_min").ty(Float).default(Value::Float(0.005)).group("reporting").help("minimum duration to report in --durations"),
+            OptionSpec::new(&["--no-header"], StoreTrue).dest("no_header").group("reporting").help("disable the session header"),
+            OptionSpec::new(&["--no-summary"], StoreTrue).dest("no_summary").group("reporting").help("disable the failure and short summaries"),
+            OptionSpec::new(&["--color"], Store).dest("color").default(Value::Str("auto".into())).group("reporting").help("colour the terminal output: auto|yes|no"),
+            OptionSpec::new(&["--ignore"], Append).dest("ignore").group("collection").help("ignore this path during collection"),
+            OptionSpec::new(&["--ignore-glob"], Append).dest("ignore_glob").group("collection").help("ignore paths matching this glob during collection"),
+            OptionSpec::new(&["--deselect"], Append).dest("deselect").group("collection").help("deselect this node id"),
+            OptionSpec::new(&["-W", "--pythonwarnings"], Append).dest("pythonwarnings").group("reporting").help("set a warning filter, as `-W` for the interpreter"),
+            OptionSpec::new(&["--continue-on-collection-errors"], StoreTrue).dest("continue_on_collection_errors").group("collection").help("run tests even if collection raised somewhere"),
             OptionSpec::new(&["--import-mode"], Store).dest("importmode").default(Value::Str("prepend".into())),
-            OptionSpec::new(&["--basetemp"], Store).dest("basetemp"),
-            OptionSpec::new(&["--junitxml", "--junit-xml"], Store).dest("xmlpath"),
+            OptionSpec::new(&["--basetemp"], Store).dest("basetemp").group("general").help("base directory for `tmp_path`"),
+            OptionSpec::new(&["--junitxml", "--junit-xml"], Store).dest("xmlpath").group("reporting").help("write an xunit2 XML report to this path"),
             OptionSpec::new(&["--fulltrace", "--full-trace"], StoreTrue).dest("fulltrace"),
-            OptionSpec::new(&["-l", "--showlocals"], StoreTrue).dest("showlocals"),
+            OptionSpec::new(&["-l", "--showlocals"], StoreTrue).dest("showlocals").group("reporting").help("show local variables in tracebacks"),
             OptionSpec::new(&["--co-json"], Store).dest("co_json")
-                .help("(pytest-rs) write the collected node ids to a JSON file"),
+                .help("write the collected node ids to a JSON file"),
             // --- Parallelism (thread based; xdist-compatible spelling) -------
             OptionSpec::new(&["-n", "--numprocesses"], Store).dest("numprocesses").default(Value::Str("auto".into()))
-                .help("number of worker threads; 'auto'/'logical' use the CPU count, 0 disables threading"),
+                .group("parallelism")
+                .help("worker threads; 'auto' means the CPU count on a free-threaded interpreter and 1 otherwise"),
             OptionSpec::new(&["--dist"], Store).dest("dist").default(Value::Str("load".into())),
             OptionSpec::new(&["--max-worker-restart"], Store).dest("max_worker_restart"),
             OptionSpec::new(&["--threads"], Store).dest("numprocesses"),
             OptionSpec::new(&["--no-parallel"], StoreTrue).dest("no_parallel")
-                .help("(pytest-rs) run every test on the main thread"),
+                .group("parallelism").help("run every test on the main thread"),
             OptionSpec::new(&["--tx"], Append).dest("tx"),
             // --- pytest-randomly built-ins -----------------------------------
             OptionSpec::new(&["--randomly-seed"], Store).dest("randomly_seed").default(Value::Str("default".into()))
-                .help("set the random seed; 'last' reuses the previous seed, 'default' uses a fixed seed"),
-            OptionSpec::new(&["--randomly-dont-reset-seed"], StoreFalse).dest("randomly_reset_seed"),
+                .group("randomisation")
+                .help("random seed; 'last' reuses the previous run's, 'default' picks a fresh one each run"),
+            OptionSpec::new(&["--randomly-dont-reset-seed"], StoreFalse).dest("randomly_reset_seed").group("randomisation").help("do not reseed the global RNG before each test"),
             OptionSpec::new(&["--randomly-dont-reorganize", "--randomly-dont-shuffle"], StoreFalse)
-                .dest("randomly_reorganize"),
+                .dest("randomly_reorganize").group("randomisation").help("keep the collected order"),
             // --- pytest-benchmark built-ins ----------------------------------
-            OptionSpec::new(&["--benchmark-disable"], StoreTrue).dest("benchmark_disable"),
-            OptionSpec::new(&["--benchmark-enable"], StoreTrue).dest("benchmark_enable"),
-            OptionSpec::new(&["--benchmark-only"], StoreTrue).dest("benchmark_only"),
-            OptionSpec::new(&["--benchmark-skip"], StoreTrue).dest("benchmark_skip"),
+            OptionSpec::new(&["--benchmark-disable"], StoreTrue).dest("benchmark_disable").group("benchmark").help("run benchmarked functions once instead of timing them"),
+            OptionSpec::new(&["--benchmark-enable"], StoreTrue).dest("benchmark_enable").group("benchmark").help("time benchmarked functions even if disabled in the config"),
+            OptionSpec::new(&["--benchmark-only"], StoreTrue).dest("benchmark_only").group("benchmark").help("run only tests that use the benchmark fixture"),
+            OptionSpec::new(&["--benchmark-skip"], StoreTrue).dest("benchmark_skip").group("benchmark").help("skip tests that use the benchmark fixture"),
             OptionSpec::new(&["--benchmark-autosave"], StoreTrue).dest("benchmark_autosave"),
-            OptionSpec::new(&["--benchmark-disable-gc"], StoreTrue).dest("benchmark_disable_gc"),
-            OptionSpec::new(&["--benchmark-sort"], Store).dest("benchmark_sort").default(Value::Str("min".into())),
+            OptionSpec::new(&["--benchmark-disable-gc"], StoreTrue).dest("benchmark_disable_gc").group("benchmark").help("disable the garbage collector while timing"),
+            OptionSpec::new(&["--benchmark-sort"], Store).dest("benchmark_sort").default(Value::Str("min".into())).group("benchmark").help("sort the results table by min|max|mean|stddev|median"),
             OptionSpec::new(&["--benchmark-columns"], Store).dest("benchmark_columns")
                 .default(Value::Str("min, max, mean, stddev, median, iqr, outliers, ops, rounds".into())),
-            OptionSpec::new(&["--benchmark-min-rounds"], Store).dest("benchmark_min_rounds").ty(Int).default(Value::Int(5)),
-            OptionSpec::new(&["--benchmark-max-time"], Store).dest("benchmark_max_time").ty(Float).default(Value::Float(1.0)),
-            OptionSpec::new(&["--benchmark-min-time"], Store).dest("benchmark_min_time").ty(Float).default(Value::Float(0.000005)),
+            OptionSpec::new(&["--benchmark-min-rounds"], Store).dest("benchmark_min_rounds").ty(Int).default(Value::Int(5)).group("benchmark").help("minimum number of timed rounds"),
+            OptionSpec::new(&["--benchmark-max-time"], Store).dest("benchmark_max_time").ty(Float).default(Value::Float(1.0)).group("benchmark").help("time budget per benchmark, in seconds"),
+            OptionSpec::new(&["--benchmark-min-time"], Store).dest("benchmark_min_time").ty(Float).default(Value::Float(0.000005)).group("benchmark").help("minimum duration of a single timed round"),
             OptionSpec::new(&["--benchmark-warmup"], Store).dest("benchmark_warmup").default(Value::Str("auto".into())),
             OptionSpec::new(&["--benchmark-warmup-iterations"], Store).dest("benchmark_warmup_iterations").ty(Int)
                 .default(Value::Int(100000)),
@@ -661,14 +671,14 @@ impl Parser {
                 .ty(Int).default(Value::Int(10)),
             // --- pytest-cov built-ins ----------------------------------------
             OptionSpec::new(&["--cov"], Append).dest("cov_source")
-                .help("measure coverage for the given path or package"),
-            OptionSpec::new(&["--cov-report"], Append).dest("cov_report"),
-            OptionSpec::new(&["--cov-config"], Store).dest("cov_config").default(Value::Str(".coveragerc".into())),
-            OptionSpec::new(&["--cov-branch"], StoreTrue).dest("cov_branch"),
-            OptionSpec::new(&["--cov-append"], StoreTrue).dest("cov_append"),
-            OptionSpec::new(&["--cov-fail-under"], Store).dest("cov_fail_under").ty(Float),
+                .help("measure coverage for the given path or package").group("coverage"),
+            OptionSpec::new(&["--cov-report"], Append).dest("cov_report").group("coverage").help("report type: term|term-missing|html|xml|json|annotate[:dest]"),
+            OptionSpec::new(&["--cov-config"], Store).dest("cov_config").default(Value::Str(".coveragerc".into())).group("coverage").help("coverage.py configuration file"),
+            OptionSpec::new(&["--cov-branch"], StoreTrue).dest("cov_branch").group("coverage").help("measure branch coverage as well as statements"),
+            OptionSpec::new(&["--cov-append"], StoreTrue).dest("cov_append").group("coverage").help("add to existing coverage data instead of replacing it"),
+            OptionSpec::new(&["--cov-fail-under"], Store).dest("cov_fail_under").ty(Float).group("coverage").help("fail the run if total coverage is below this percentage"),
             OptionSpec::new(&["--cov-context"], Store).dest("cov_context"),
-            OptionSpec::new(&["--no-cov"], StoreTrue).dest("no_cov"),
+            OptionSpec::new(&["--no-cov"], StoreTrue).dest("no_cov").group("coverage").help("disable coverage even if --cov was given"),
             OptionSpec::new(&["--no-cov-on-fail"], StoreTrue).dest("no_cov_on_fail"),
             // --- Misc compatibility shims ------------------------------------
             OptionSpec::new(&["--version", "-V"], Count).dest("version"),
