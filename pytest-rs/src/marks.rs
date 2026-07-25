@@ -373,12 +373,8 @@ pub struct MarkScope<'a, 'py> {
 }
 
 impl<'py> MarkScope<'_, 'py> {
-    fn globals(&self, _py: Python<'py>) -> Option<Bound<'py, PyDict>> {
+    fn globals(&self) -> Option<Bound<'py, PyDict>> {
         self.module?.getattr("__dict__").ok()?.cast_into::<PyDict>().ok()
-    }
-
-    pub fn none() -> Self {
-        MarkScope { module: None }
     }
 }
 
@@ -389,7 +385,7 @@ fn eval_condition(py: Python<'_>, cond: &Bound<'_, PyAny>, scope: MarkScope<'_, 
         let src = s.to_str()?;
         let builtins = py.import("builtins")?;
         let g2 = PyDict::new(py);
-        if let Some(g) = scope.globals(py) {
+        if let Some(g) = scope.globals() {
             for (k, v) in g.iter() {
                 g2.set_item(k, v)?;
             }
