@@ -73,7 +73,105 @@ pub fn make_builtin(
         }
         Builtin::Cache => Ok(Py::new(py, CacheFixture { data: Mutex::new(Default::default()) })?.into_any()),
         Builtin::Doctest => Ok(py.None()),
+        Builtin::XunitModule => {
+            let module = item.module.bind(py).clone();
+            xunit(py, worker, def.scope, &module, &["setUpModule", "setup_module"], &["tearDownModule", "teardown_module"], &module)
+        }
+        Builtin::XunitClass | Builtin::UnittestClass => {
+            let Some(cls) = &item.cls else { return Ok(py.None()) };
+            let cls = cls.bind(py).clone();
+            let (setup, teardown): (&[&str], &[&str]) = match which {
+                Builtin::UnittestClass => (&["setUpClass"], &["tearDownClass"]),
+                _ => (&["setup_class"], &["teardown_class"]),
+            };
+            xunit(py, worker, def.scope, &cls, setup, teardown, &cls)
+        }
+        Builtin::XunitFunction => {
+            // Registered against the module, so class based tests see it too;
+            // for those `setup_method` is the applicable hook instead.
+            if item.cls.is_some() {
+                return Ok(py.None());
+            }
+            let module = item.module.bind(py).clone();
+            let func = item.func.bind(py).clone();
+            xunit(py, worker, def.scope, &module, &["setup_function"], &["teardown_function"], &func)
+        }
+        Builtin::XunitMethod => {
+            let instance = worker.instance.lock().unwrap().as_ref().map(|i| i.clone_ref(py));
+            let Some(instance) = instance else { return Ok(py.None()) };
+            let instance = instance.bind(py).clone();
+            let func = item.func.bind(py).clone();
+            xunit(py, worker, def.scope, &instance, &["setup_method"], &["teardown_method"], &func)
+        }
     }
+}
+
+/// Run an xunit-style setup function now and queue its teardown for the end of
+/// `scope`.  `holder` is where the functions are looked up, `arg` is what they
+/// are passed when they declare a parameter.
+fn xunit(
+    py: Python<'_>,
+    worker: &Worker,
+    scope: crate::fixtures::Scope,
+    holder: &Bound<'_, PyAny>,
+    setup_names: &[&str],
+    teardown_names: &[&str],
+    arg: &Bound<'_, PyAny>,
+) -> PyResult<Py<PyAny>> {
+    if let Some(f) = first_callable(holder, setup_names) {
+        call_with_optional_argument(&f, arg)?;
+    }
+    // Registered only once setup succeeded, matching the generator fixture
+    // pytest injects: a `yield` that is never reached runs no teardown.
+    if let Some(f) = first_callable(holder, teardown_names) {
+        let bound = bind_optional_argument(py, &f, arg)?;
+        worker.add_finalizer_public(scope, Finalizer::Callback(bound.unbind()));
+    }
+    Ok(py.None())
+}
+
+fn first_callable<'py>(holder: &Bound<'py, PyAny>, names: &[&str]) -> Option<Bound<'py, PyAny>> {
+    for name in names {
+        if let Ok(f) = holder.getattr(*name) {
+            // A `@pytest.fixture` of the same name is a fixture, not an xunit
+            // function; pytest ignores it here and so do we.
+            if f.is_callable() && f.getattr("_pytestfixturefunction").is_err() {
+                return Some(f);
+            }
+        }
+    }
+    None
+}
+
+/// pytest passes the module/class/function only when the callable declares a
+/// parameter for it, so both `def setup_module(mod)` and `def setup_module()`
+/// work.
+fn wants_argument(func: &Bound<'_, PyAny>) -> bool {
+    let Ok(code) = func.getattr("__code__") else { return true };
+    let Ok(count) = code.getattr("co_argcount").and_then(|c| c.extract::<usize>()) else { return true };
+    let bound = usize::from(func.getattr("__self__").is_ok());
+    count > bound
+}
+
+fn call_with_optional_argument(func: &Bound<'_, PyAny>, arg: &Bound<'_, PyAny>) -> PyResult<()> {
+    if wants_argument(func) {
+        func.call1((arg,))?;
+    } else {
+        func.call0()?;
+    }
+    Ok(())
+}
+
+/// The same rule, deferred: finalizers are called with no arguments.
+fn bind_optional_argument<'py>(
+    py: Python<'py>,
+    func: &Bound<'py, PyAny>,
+    arg: &Bound<'py, PyAny>,
+) -> PyResult<Bound<'py, PyAny>> {
+    if !wants_argument(func) {
+        return Ok(func.clone());
+    }
+    py.import("functools")?.getattr("partial")?.call1((func, arg))
 }
 
 fn sanitize(name: &str) -> String {

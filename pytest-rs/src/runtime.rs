@@ -122,13 +122,12 @@ impl Worker {
     /// Bring the frame stack in line with `item`, tearing down anything that no
     /// longer applies.
     pub fn enter_item(&self, py: Python<'_>, item: &Arc<Item>) -> Vec<String> {
-        let desired: Vec<(Scope, String)> = SCOPE_CHAIN.iter().map(|s| (*s, item.scope_key(*s))).collect();
         let mut errors = Vec::new();
         let divergence = {
             let frames = self.frames.lock().unwrap();
             let mut i = 0usize;
-            while i < frames.len() && i < desired.len() {
-                if frames[i].scope != desired[i].0 || frames[i].key != desired[i].1 {
+            while i < frames.len() && i < SCOPE_CHAIN.len() {
+                if frames[i].scope != SCOPE_CHAIN[i] || !item.scope_key_is(SCOPE_CHAIN[i], &frames[i].key) {
                     break;
                 }
                 i += 1;
@@ -154,25 +153,53 @@ impl Worker {
         }
         {
             let mut frames = self.frames.lock().unwrap();
-            for (scope, key) in desired.into_iter().skip(frames.len()) {
-                frames.push(ScopeFrame { scope, key, cache: FxHashMap::default(), finalizers: Vec::new() });
+            for scope in SCOPE_CHAIN.iter().skip(frames.len()) {
+                frames.push(ScopeFrame {
+                    scope: *scope,
+                    key: item.scope_key(*scope),
+                    cache: FxHashMap::default(),
+                    finalizers: Vec::new(),
+                });
             }
         }
         errors
     }
 
-    /// Tear down the function scope frame after a test completes.
-    pub fn exit_item(&self, py: Python<'_>) -> Vec<String> {
+    /// Tear down the function scope after a test completes, plus every wider
+    /// scope the test running next does not share.
+    ///
+    /// Deferring the wider scopes to the next test's setup would be simpler,
+    /// but then a failing `teardown_class` or module-scoped fixture would have
+    /// no test to be reported against — it belongs to the last test that used
+    /// the scope.  pytest decides the same way, from the same `nextitem`.
+    pub fn exit_item(&self, py: Python<'_>, next: Option<&Arc<Item>>) -> Vec<String> {
         let mut errors = Vec::new();
-        let frame = {
-            let mut frames = self.frames.lock().unwrap();
-            if frames.last().map(|f| f.scope == Scope::Function).unwrap_or(false) {
-                frames.pop()
-            } else {
-                None
+        let keep = match next {
+            None => 0,
+            Some(item) => {
+                let frames = self.frames.lock().unwrap();
+                let mut i = 0usize;
+                while i < frames.len()
+                    && i < SCOPE_CHAIN.len()
+                    && SCOPE_CHAIN[i] != Scope::Function
+                    && frames[i].scope == SCOPE_CHAIN[i]
+                    && item.scope_key_is(SCOPE_CHAIN[i], &frames[i].key)
+                {
+                    i += 1;
+                }
+                i
             }
         };
-        if let Some(mut frame) = frame {
+        loop {
+            let frame = {
+                let mut frames = self.frames.lock().unwrap();
+                if frames.len() <= keep {
+                    None
+                } else {
+                    frames.pop()
+                }
+            };
+            let Some(mut frame) = frame else { break };
             while let Some(f) = frame.finalizers.pop() {
                 if let Err(e) = run_finalizer(py, &f) {
                     errors.push(crate::traceback::format_exception_only(py, &e));

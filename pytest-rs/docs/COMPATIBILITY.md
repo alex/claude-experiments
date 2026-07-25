@@ -67,6 +67,50 @@ Built-in fixtures: `request`, `pytestconfig`, `monkeypatch`, `tmp_path`,
 `tmp_path_factory`, `capsys`, `capfd`, `recwarn`, `benchmark`,
 `record_property`, `cache`.
 
+## xunit-style setup and teardown
+
+`setup_module`/`teardown_module` (and the `setUpModule`/`tearDownModule`
+spelling), `setup_class`/`teardown_class`, `setup_method`/`teardown_method` and
+`setup_function`/`teardown_function` are all supported, including the form that
+takes no argument at all.
+
+They are implemented the way pytest implements them — as autouse fixtures
+injected at the right scope while the module or class is collected — which gets
+the ordering rules for free: wider scopes run first, teardown runs in reverse,
+and a setup that raises does not run its own teardown. It also means the
+scheduler knows that every test under a `setup_module` shares state, so they
+stay on one thread.
+
+The fixture is only injected when the function actually exists. That matters:
+giving every module a module-scoped fixture would put every test in a module
+into one serial group and flatten the thread pool.
+
+## `unittest.TestCase`
+
+Collected whatever the class is called and despite having a constructor, as in
+pytest — `python_classes` does not apply. Methods are discovered with
+`unittest.TestLoader`, so the `test` prefix and the alphabetical ordering are
+unittest's rather than pytest's.
+
+`TestCase.run()` does the running: `setUp`, the method, `tearDown` and
+`addCleanup` callbacks are unittest's business, and it reports what happened to
+a result object rather than by letting exceptions escape. `pytest-rs` hands it a
+result object and translates back — a recorded failure becomes the original
+exception, `@unittest.skip`/`skipTest` become `Skipped`,
+`@unittest.expectedFailure` becomes `XFailed`, and an unexpected success becomes
+a plain failure. Frames belonging to the `unittest` package are hidden from
+tracebacks (they set `__unittest` in their module globals), so a failing
+`assertEqual` points at the test.
+
+`setUpClass`/`tearDownClass` become a class-scoped autouse fixture, but only for
+classes that actually override them; every `TestCase` inherits a no-op pair, and
+honouring those would serialise a class per group for nothing.
+
+pytest markers still apply — `skip`, `skipif`, `xfail`, `usefixtures` — and an
+autouse `@pytest.fixture` defined in the class works. Fixtures cannot be
+requested as method arguments, which is pytest's rule too. `subTest` is a
+no-op passthrough, matching pytest without `pytest-subtests`.
+
 ## Output capturing
 
 Capturing is on by default, as in pytest, and output from a failing test is
@@ -195,11 +239,17 @@ Installing the real plugins is unnecessary and their entry points are ignored.
 
 * Third-party plugins and the `pluggy` hook system. `config.pluginmanager`
   exists but is inert.
-* `unittest.TestCase` and `doctest` collection.
+* `doctest` collection.
 * `--pdb`, `--trace`, `--sw`/`--stepwise`, `--nf`/`--new-first`.
 * `pytest_runtest_protocol`, `pytest_runtest_makereport`, hook wrappers, and the
   `Node` class hierarchy beyond what `request.node` needs.
 * Import modes other than `prepend`.
+
+One report per test, not three. pytest emits a setup, a call and a teardown
+report and counts them separately, so a test that passes but whose teardown
+raises is reported as *both* a pass and an error. `pytest-rs` keeps one report
+per test, which in that case reads as an error alone. The failure is still shown
+and still fails the run; only the tally in the summary line differs.
 
 ## Assertion output
 

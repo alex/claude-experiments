@@ -60,6 +60,17 @@ pub enum Builtin {
     Doctest,
     RecordProperty,
     Cache,
+    /// xunit-style `setup_module`/`teardown_module` (and the `setUpModule`
+    /// spelling), injected only into modules that define one.
+    XunitModule,
+    /// `setup_class`/`teardown_class`.
+    XunitClass,
+    /// `setUpClass`/`tearDownClass` on a `unittest.TestCase`.
+    UnittestClass,
+    /// `setup_function`/`teardown_function`, for module level tests only.
+    XunitFunction,
+    /// `setup_method`/`teardown_method` on a test class.
+    XunitMethod,
 }
 
 /// Interpreter and configuration facts that decide whether a built-in fixture
@@ -527,6 +538,46 @@ pub fn register_builtins(reg: &mut FixtureRegistry, ctx: HostilityContext) {
             location: "<pytest-rs builtin>".to_string(),
         }));
     }
+}
+
+/// Register a synthesised autouse fixture standing in for one of the
+/// xunit-style `setup_*`/`teardown_*` functions.
+///
+/// pytest injects an equivalent generator fixture while collecting the module
+/// or class, which is what gives those functions their ordering: higher scopes
+/// run first, teardown runs in reverse, and a failing setup skips its own
+/// teardown.  Reusing the fixture machinery here gets all of that for free —
+/// and, more importantly, makes the scheduler aware that every test under a
+/// `setup_module` shares state, so they stay on one thread.
+///
+/// The fixture is only registered when the module or class actually defines
+/// one of the functions; otherwise every module would gain a module-scoped
+/// fixture and the whole suite would collapse into one serial group.
+pub fn insert_xunit(
+    reg: &mut FixtureRegistry,
+    argname: String,
+    scope: Scope,
+    baseid: &str,
+    builtin: Builtin,
+    location: String,
+) {
+    let uid = reg.alloc_uid();
+    reg.insert(Arc::new(FixtureDef {
+        uid,
+        argname,
+        func: None,
+        scope,
+        params: None,
+        param_ids: None,
+        autouse: true,
+        is_generator: false,
+        argnames: Vec::new(),
+        baseid: baseid.to_string(),
+        builtin: Some(builtin),
+        wants_self: false,
+        thread_hostile: false,
+        location,
+    }));
 }
 
 /// Scan a module/class namespace for fixture definitions.

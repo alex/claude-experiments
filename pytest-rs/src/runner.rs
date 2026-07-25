@@ -225,12 +225,13 @@ pub fn execute(
     if !plan.serial.is_empty() && !state.should_stop() {
         let worker = Worker::new(session.clone(), session_cache.clone());
         Python::attach(|py| {
-            for &idx in &plan.serial {
+            for (pos, &idx) in plan.serial.iter().enumerate() {
                 if state.should_stop() {
                     break;
                 }
                 let item = session.items[idx].clone();
-                let rep = run_one(py, &worker, &item, &state, 0);
+                let next = plan.serial.get(pos + 1).map(|&n| &session.items[n]);
+                let rep = run_one(py, &worker, &item, next, &state, 0);
                 let _ = tx.send(rep);
             }
             worker.drain(py);
@@ -259,12 +260,13 @@ fn worker_loop(
         };
         let Some(group) = group else { break };
         Python::attach(|py| {
-            for idx in group {
+            for (pos, &idx) in group.iter().enumerate() {
                 if state.should_stop() {
                     break;
                 }
                 let item = session.items[idx].clone();
-                let rep = run_one(py, &worker, &item, &state, wid);
+                let next = group.get(pos + 1).map(|&n| &session.items[n]);
+                let rep = run_one(py, &worker, &item, next, &state, wid);
                 let _ = tx.send(rep);
             }
             for e in worker.drain(py) {
@@ -279,12 +281,19 @@ fn worker_loop(
 /// Capturing is started and stopped here rather than inside the body: the body
 /// has many early exits, and a thread that leaves its buffer registered would
 /// collect the next test's output too.
-pub fn run_one(py: Python<'_>, worker: &Arc<Worker>, item: &Arc<Item>, state: &RunState, wid: usize) -> TestReport {
+pub fn run_one(
+    py: Python<'_>,
+    worker: &Arc<Worker>,
+    item: &Arc<Item>,
+    next: Option<&Arc<Item>>,
+    state: &RunState,
+    wid: usize,
+) -> TestReport {
     let capturing = worker.session.capture_mode != crate::capture::Mode::No;
     if capturing {
         let _ = crate::capture::start(py);
     }
-    let mut rep = run_phases(py, worker, item, state, wid);
+    let mut rep = run_phases(py, worker, item, next, state, wid);
     if capturing {
         if let Ok((out, err)) = crate::capture::stop(py) {
             rep.captured_out = out;
@@ -294,7 +303,14 @@ pub fn run_one(py: Python<'_>, worker: &Arc<Worker>, item: &Arc<Item>, state: &R
     rep
 }
 
-fn run_phases(py: Python<'_>, worker: &Arc<Worker>, item: &Arc<Item>, state: &RunState, wid: usize) -> TestReport {
+fn run_phases(
+    py: Python<'_>,
+    worker: &Arc<Worker>,
+    item: &Arc<Item>,
+    next: Option<&Arc<Item>>,
+    state: &RunState,
+    wid: usize,
+) -> TestReport {
     let cfg: &ConfigData = &worker.session.cfg;
     let style = crate::traceback::Style {
         tb: &worker.session.tb_style,
@@ -367,21 +383,27 @@ fn run_phases(py: Python<'_>, worker: &Arc<Worker>, item: &Arc<Item>, state: &Ru
     for hook in &worker.session.hooks.runtest_setup {
         let arg = py_item.clone().expect("item wrapper");
         if let Err(e) = call_hook(py, hook.bind(py), &[("item", arg)]) {
-            return finish_with_error(py, worker, item, rep, e, When::Setup, &style, state, t_start);
+            return finish_with_error(py, worker, next, rep, e, When::Setup, &style, state, t_start);
         }
     }
     worker.enter_item(py, item);
     // The test class instance must exist before fixtures run: class level
     // fixtures are bound to it, and `request.instance` exposes it.
     if let Some(cls) = &item.cls {
-        match cls.bind(py).call0() {
+        // A `TestCase` is constructed with the name of the method it will run;
+        // everything else takes no arguments.
+        let built = match item.unittest {
+            true => cls.bind(py).call1((item.originalname.as_str(),)),
+            false => cls.bind(py).call0(),
+        };
+        match built {
             Ok(inst) => *worker.instance.lock().unwrap() = Some(inst.unbind()),
-            Err(e) => return finish_with_error(py, worker, item, rep, e, When::Setup, &style, state, t_start),
+            Err(e) => return finish_with_error(py, worker, next, rep, e, When::Setup, &style, state, t_start),
         }
     }
     let kwargs = match worker.fill_arguments(py, item) {
         Ok(k) => k,
-        Err(e) => return finish_with_error(py, worker, item, rep, e, When::Setup, &style, state, t_start),
+        Err(e) => return finish_with_error(py, worker, next, rep, e, When::Setup, &style, state, t_start),
     };
     rep.setup_duration = t_start.elapsed().as_secs_f64();
 
@@ -427,11 +449,12 @@ fn run_phases(py: Python<'_>, worker: &Arc<Worker>, item: &Arc<Item>, state: &Ru
             }
         }
     }
-    let errors = worker.exit_item(py);
+    let errors = worker.exit_item(py, next);
     if !errors.is_empty() && rep.outcome == Outcome::Passed {
         rep.outcome = Outcome::Error;
         rep.when = When::Teardown;
         rep.longrepr = errors.join("\n");
+        rep.exconly = errors[0].lines().next().unwrap_or_default().to_string();
         state.record_failure();
     }
     *worker.instance.lock().unwrap() = None;
@@ -469,20 +492,11 @@ fn invoke<'py>(
         .map(|i| i.clone_ref(py))
         .ok_or_else(|| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>("missing test instance"))?;
     let instance = instance.bind(py);
-    // xunit-style per-method setup, if present.
-    if let Ok(setup) = instance.getattr("setup_method") {
-        if setup.is_callable() {
-            setup.call1((item.func.bind(py),))?;
-        }
+    if item.unittest {
+        return crate::unittest::run_case(py, instance);
     }
     let bound = instance.getattr(item.originalname.as_str())?;
-    let result = bound.call((), Some(kwargs));
-    if let Ok(teardown) = instance.getattr("teardown_method") {
-        if teardown.is_callable() {
-            teardown.call1((item.func.bind(py),))?;
-        }
-    }
-    result
+    bound.call((), Some(kwargs))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -544,8 +558,12 @@ fn classify(
             .map(|v| v.is_truthy().unwrap_or(true))
             .unwrap_or(true);
         if !pytrace {
-            rep.longrepr = outcome_message(py, e);
-            rep.exconly = outcome_message(py, e);
+            let message = outcome_message(py, e);
+            rep.longrepr = message.clone();
+            // The body loses its traceback, but the one-line summary still
+            // names the exception, as `ExceptionInfo.exconly()` does.
+            let name = e.get_type(py).name().map(|n| n.to_string()).unwrap_or_else(|_| "Failed".into());
+            rep.exconly = format!("{name}: {message}");
             state.record_failure();
             return;
         }
@@ -617,7 +635,7 @@ fn fail_report(
 fn finish_with_error(
     py: Python<'_>,
     worker: &Arc<Worker>,
-    _item: &Arc<Item>,
+    next: Option<&Arc<Item>>,
     rep: TestReport,
     e: PyErr,
     when: When,
@@ -626,7 +644,7 @@ fn finish_with_error(
     t_start: Instant,
 ) -> TestReport {
     let out = fail_report(py, rep, &e, when, style, state, t_start);
-    let _ = worker.exit_item(py);
+    let _ = worker.exit_item(py, next);
     out
 }
 

@@ -96,7 +96,19 @@ pub struct Collector<'a> {
     ignore: Vec<PathBuf>,
     /// Cache of `dir -> is package`.
     pkg_cache: FxHashMap<PathBuf, bool>,
+    /// `unittest.TestCase`, refreshed after each test module import — like
+    /// pytest we never import `unittest` ourselves, we only notice when the
+    /// suite has.
+    unittest_case: Option<Py<PyAny>>,
     marker: std::marker::PhantomData<&'a ()>,
+}
+
+/// What a class-shaped module attribute turned out to be.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ClassKind {
+    None,
+    Plain,
+    UnitTest,
 }
 
 /// A single node-id selector from the command line.
@@ -148,8 +160,23 @@ impl<'a> Collector<'a> {
             norecursedirs,
             ignore,
             pkg_cache: FxHashMap::default(),
+            unittest_case: None,
             marker: std::marker::PhantomData,
         }
+    }
+
+    /// Pick up `unittest.TestCase` if the suite has imported `unittest`.
+    fn refresh_unittest(&mut self, py: Python<'_>) {
+        if self.unittest_case.is_some() {
+            return;
+        }
+        self.unittest_case = py
+            .import("sys")
+            .and_then(|s| s.getattr("modules"))
+            .and_then(|m| m.get_item("unittest"))
+            .and_then(|m| m.getattr("TestCase"))
+            .map(|c| c.unbind())
+            .ok();
     }
 
     fn relpath(&self, p: &Path) -> String {
@@ -427,6 +454,10 @@ impl<'a> Collector<'a> {
         };
         let bound = module.bind(py);
         let rel = self.relpath(path);
+        self.refresh_unittest(py);
+        // xunit-style module setup is injected before the module's own
+        // fixtures so that it sorts ahead of them, as in pytest.
+        self.inject_module_xunit(bound, &rel);
         // Module-level fixtures.
         scan_namespace(py, &mut self.registry, bound, &rel, &rel, false).map_err(Error::Py)?;
         let module_marks = marks::own_marks(py, bound).unwrap_or_default();
@@ -454,28 +485,116 @@ impl<'a> Collector<'a> {
             }
             let Ok(obj) = bound.getattr(name.as_str()) else { continue };
             // Only consider objects defined in (or re-exported into) this module.
-            if self.is_test_class(&name, &obj) {
+            let kind = self.class_kind(&obj, &name);
+            if kind != ClassKind::None {
                 let cls_parts = vec![name.clone()];
-                self.collect_class(py, &mut ctx, &obj, &cls_parts, parts)?;
+                self.collect_class(py, &mut ctx, &obj, &cls_parts, parts, kind)?;
             } else if self.is_test_function(&name, &obj) {
                 if !parts.is_empty() && !selector_matches(parts, &[name.clone()]) {
                     continue;
                 }
-                self.make_items(py, &mut ctx, None, &[], &name, &obj, parts)?;
+                self.make_items(py, &mut ctx, None, &[], &name, &obj, parts, false)?;
             }
         }
         Ok(())
     }
 
-    fn is_test_class(&self, name: &str, obj: &Bound<'_, PyAny>) -> bool {
+    /// `setup_module`/`teardown_module` and `setup_function`/`teardown_function`
+    /// become autouse fixtures, but only for modules that define them.
+    fn inject_module_xunit(&mut self, module: &Bound<'_, PyAny>, rel: &str) {
+        let stem = rel.rsplit('/').next().unwrap_or(rel).replace('.', "_");
+        if defines_any(module, &["setUpModule", "setup_module", "tearDownModule", "teardown_module"]) {
+            crate::fixtures::insert_xunit(
+                &mut self.registry,
+                format!("_xunit_setup_module_fixture_{stem}"),
+                crate::fixtures::Scope::Module,
+                rel,
+                crate::fixtures::Builtin::XunitModule,
+                format!("{rel}::setup_module"),
+            );
+        }
+        if defines_any(module, &["setup_function", "teardown_function"]) {
+            crate::fixtures::insert_xunit(
+                &mut self.registry,
+                format!("_xunit_setup_function_fixture_{stem}"),
+                crate::fixtures::Scope::Function,
+                rel,
+                crate::fixtures::Builtin::XunitFunction,
+                format!("{rel}::setup_function"),
+            );
+        }
+    }
+
+    /// The class-level half: `setUpClass`/`tearDownClass` for unittest,
+    /// `setup_class`/`teardown_class` and `setup_method`/`teardown_method` for
+    /// any test class.
+    fn inject_class_xunit(&mut self, cls: &Bound<'_, PyAny>, baseid: &str, kind: ClassKind) {
+        let tail = baseid.rsplit("::").next().unwrap_or(baseid).to_string();
+        if kind == ClassKind::UnitTest && self.overrides_unittest_hooks(cls) {
+            crate::fixtures::insert_xunit(
+                &mut self.registry,
+                format!("_unittest_setUpClass_fixture_{tail}"),
+                crate::fixtures::Scope::Class,
+                baseid,
+                crate::fixtures::Builtin::UnittestClass,
+                format!("{baseid}::setUpClass"),
+            );
+        }
+        if defines_any(cls, &["setup_class", "teardown_class"]) {
+            crate::fixtures::insert_xunit(
+                &mut self.registry,
+                format!("_xunit_setup_class_fixture_{tail}"),
+                crate::fixtures::Scope::Class,
+                baseid,
+                crate::fixtures::Builtin::XunitClass,
+                format!("{baseid}::setup_class"),
+            );
+        }
+        if defines_any(cls, &["setup_method", "teardown_method"]) {
+            crate::fixtures::insert_xunit(
+                &mut self.registry,
+                format!("_xunit_setup_method_fixture_{tail}"),
+                crate::fixtures::Scope::Function,
+                baseid,
+                crate::fixtures::Builtin::XunitMethod,
+                format!("{baseid}::setup_method"),
+            );
+        }
+    }
+
+    /// Every `TestCase` inherits a no-op `setUpClass`, so asking whether the
+    /// attribute exists would put every unittest class into its own serial
+    /// group for nothing.  Only a real override counts.
+    fn overrides_unittest_hooks(&self, cls: &Bound<'_, PyAny>) -> bool {
+        let Some(base) = &self.unittest_case else { return false };
+        let base = base.bind(cls.py());
+        ["setUpClass", "tearDownClass"].iter().any(|name| {
+            let (Ok(own), Ok(inherited)) = (cls.getattr(*name), base.getattr(*name)) else {
+                return false;
+            };
+            let own = own.getattr("__func__").unwrap_or(own);
+            let inherited = inherited.getattr("__func__").unwrap_or(inherited);
+            !own.is(&inherited)
+        })
+    }
+
+    fn class_kind(&self, obj: &Bound<'_, PyAny>, name: &str) -> ClassKind {
         if !obj.is_instance_of::<PyType>() {
-            return false;
+            return ClassKind::None;
+        }
+        // `unittest.TestCase` subclasses are collected whatever they are called
+        // and despite having a constructor, exactly as pytest does.
+        if let Some(base) = &self.unittest_case {
+            if crate::raises::is_subclass_of(obj, base.bind(obj.py())).unwrap_or(false) {
+                return ClassKind::UnitTest;
+            }
         }
         if !self.python_classes.iter().any(|p| starts_or_matches(p, name)) {
-            return false;
+            return ClassKind::None;
         }
         // pytest refuses to collect classes with an __init__ constructor.
-        obj.getattr("__init__")
+        let plain_init = obj
+            .getattr("__init__")
             .map(|i| {
                 i.getattr("__objclass__")
                     .map(|c| c.is(&obj.py().get_type::<pyo3::types::PyAny>()))
@@ -485,7 +604,11 @@ impl<'a> Collector<'a> {
                         .map(|q| q == "object.__init__")
                         .unwrap_or(false)
             })
-            .unwrap_or(true)
+            .unwrap_or(true);
+        match plain_init {
+            true => ClassKind::Plain,
+            false => ClassKind::None,
+        }
     }
 
     fn is_test_function(&self, name: &str, obj: &Bound<'_, PyAny>) -> bool {
@@ -502,6 +625,7 @@ impl<'a> Collector<'a> {
         cls: &Bound<'_, PyAny>,
         cls_parts: &[String],
         selector: &[String],
+        kind: ClassKind,
     ) -> Result<()> {
         if !selector.is_empty() {
             let depth = cls_parts.len().min(selector.len());
@@ -509,8 +633,20 @@ impl<'a> Collector<'a> {
                 return Ok(());
             }
         }
+        // pytest honours `__test__ = False` on a class by not collecting it.
+        if cls
+            .getattr("__test__")
+            .map(|v| !v.is_truthy().unwrap_or(true))
+            .unwrap_or(false)
+        {
+            return Ok(());
+        }
         let baseid = format!("{}::{}", ctx.relpath, cls_parts.join("::"));
+        self.inject_class_xunit(cls, &baseid, kind);
         scan_namespace(py, &mut self.registry, cls, &baseid, &baseid, true).map_err(Error::Py)?;
+        if kind == ClassKind::UnitTest {
+            return self.collect_unittest_methods(py, ctx, cls, cls_parts, selector, &baseid);
+        }
         let names: Vec<String> = match cls.getattr("__dict__") {
             Ok(d) => {
                 let keys = d.call_method0("keys").map_err(Error::Py)?;
@@ -550,10 +686,11 @@ impl<'a> Collector<'a> {
                 continue;
             }
             let Ok(obj) = cls.getattr(name.as_str()) else { continue };
-            if self.is_test_class(&name, &obj) {
+            let nested_kind = self.class_kind(&obj, &name);
+            if nested_kind != ClassKind::None {
                 let mut nested = cls_parts.to_vec();
                 nested.push(name.clone());
-                self.collect_class(py, ctx, &obj, &nested, selector)?;
+                self.collect_class(py, ctx, &obj, &nested, selector, nested_kind)?;
             } else if self.is_test_function(&name, &obj) {
                 if !selector.is_empty() {
                     let mut full = cls_parts.to_vec();
@@ -562,8 +699,51 @@ impl<'a> Collector<'a> {
                         continue;
                     }
                 }
-                self.make_items(py, ctx, Some(cls), cls_parts, &name, &obj, selector)?;
+                self.make_items(py, ctx, Some(cls), cls_parts, &name, &obj, selector, false)?;
             }
+        }
+        Ok(())
+    }
+
+    /// Method discovery for a `unittest.TestCase`.
+    ///
+    /// unittest, not `python_functions`, decides what a test is here: names
+    /// starting with `test`, in alphabetical order rather than definition
+    /// order.  Deferring to `TestLoader` keeps both rules in one place and
+    /// picks up a subclass that changed `testMethodPrefix`.
+    fn collect_unittest_methods(
+        &mut self,
+        py: Python<'_>,
+        ctx: &mut ModuleCtx,
+        cls: &Bound<'_, PyAny>,
+        cls_parts: &[String],
+        selector: &[String],
+        _baseid: &str,
+    ) -> Result<()> {
+        let loader = py
+            .import("unittest")
+            .and_then(|m| m.getattr("TestLoader"))
+            .and_then(|t| t.call0())
+            .map_err(Error::Py)?;
+        let names = loader.call_method1("getTestCaseNames", (cls,)).map_err(Error::Py)?;
+        let names: Vec<String> = names
+            .try_iter()
+            .map_err(Error::Py)?
+            .filter_map(|n| n.ok().and_then(|n| n.extract::<String>().ok()))
+            .collect();
+        for name in names {
+            let Ok(obj) = cls.getattr(name.as_str()) else { continue };
+            if obj.getattr("__test__").map(|v| !v.is_truthy().unwrap_or(true)).unwrap_or(false) {
+                continue;
+            }
+            if !selector.is_empty() {
+                let mut full = cls_parts.to_vec();
+                full.push(name.clone());
+                if !selector_matches(selector, &full) {
+                    continue;
+                }
+            }
+            self.make_items(py, ctx, Some(cls), cls_parts, &name, &obj, selector, true)?;
         }
         Ok(())
     }
@@ -579,6 +759,7 @@ impl<'a> Collector<'a> {
         name: &str,
         func: &Bound<'_, PyAny>,
         selector: &[String],
+        unittest: bool,
     ) -> Result<()> {
         let in_class = cls.is_some();
         let mut own = marks::own_marks(py, func).unwrap_or_default();
@@ -649,7 +830,7 @@ impl<'a> Collector<'a> {
             .unwrap_or(None)
             .map(|n| format!("references {n:?}"));
 
-        let line = func
+        let line = unwrap_func(func)
             .getattr("__code__")
             .and_then(|c| c.getattr("co_firstlineno"))
             .and_then(|l| l.extract::<usize>())
@@ -743,6 +924,7 @@ impl<'a> Collector<'a> {
                 thread_hostile: hostile,
                 hostile_reason,
                 in_class,
+                unittest,
                 keywords,
                 filter_specs,
             }));
@@ -982,6 +1164,33 @@ fn non_empty(v: Vec<String>, fallback: Vec<String>) -> Vec<String> {
     } else {
         v
     }
+}
+
+/// Follow `functools.wraps` chains, as pytest's `get_real_func` does, so that a
+/// decorated test reports where it was written rather than where the decorator
+/// was.  `@unittest.skip` is the case that makes this visible: it replaces the
+/// method with a wrapper defined in `unittest/case.py`.
+fn unwrap_func<'py>(func: &Bound<'py, PyAny>) -> Bound<'py, PyAny> {
+    let mut cur = func.clone();
+    for _ in 0..100 {
+        match cur.getattr("__wrapped__") {
+            Ok(next) if next.is_callable() => cur = next,
+            _ => return cur,
+        }
+    }
+    cur
+}
+
+/// Whether a module or class provides any of these as a plain callable.  A
+/// `@pytest.fixture` that happens to share the name is a fixture, not an xunit
+/// function, and pytest skips it here too.
+fn defines_any(holder: &Bound<'_, PyAny>, names: &[&str]) -> bool {
+    names.iter().any(|name| {
+        holder
+            .getattr(*name)
+            .map(|f| f.is_callable() && f.getattr("_pytestfixturefunction").is_err())
+            .unwrap_or(false)
+    })
 }
 
 /// `python_classes = Test` matches by prefix; a pattern with glob characters

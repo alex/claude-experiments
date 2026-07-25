@@ -29,6 +29,7 @@ pub mod session;
 pub mod shuffle;
 pub mod threadsafety;
 pub mod traceback;
+pub mod unittest;
 pub mod warnings;
 
 use crate::config::{split_ini, IniType, Parser, Value, INI_SPECS};

@@ -1,5 +1,7 @@
 /target/
 /dist/
+# `maturin develop` drops the extension next to the Python package.
+*.so
 __pycache__/
 *.pyc
 .pytest_cache/

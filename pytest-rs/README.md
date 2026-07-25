@@ -94,6 +94,9 @@ the pool instead of fighting it.
 
 ## Status
 
+`unittest.TestCase` classes are collected and run through unittest's own
+protocol, and the xunit-style `setup_module`/`setup_class`/`setup_method`
+functions work; `doctest` collection and `--pdb` do not.
 [docs/COMPATIBILITY.md](docs/COMPATIBILITY.md) has the supported surface and the
 deliberate omissions; [docs/BENCHMARKS.md](docs/BENCHMARKS.md) has measurements,
 including where the remaining time on cryptography actually goes.

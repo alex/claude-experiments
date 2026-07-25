@@ -124,6 +124,8 @@ pub struct Item {
     pub hostile_reason: Option<String>,
     /// Whether the test function takes `self`.
     pub in_class: bool,
+    /// Set for methods of a `unittest.TestCase`, which unittest itself runs.
+    pub unittest: bool,
     /// Keywords used by `-k` matching.
     pub keywords: Vec<String>,
     /// Specs contributed by `@pytest.mark.filterwarnings`, resolved once.
@@ -170,6 +172,30 @@ impl Item {
                 None => self.relpath.clone(),
             },
             Scope::Function => self.nodeid.clone(),
+        }
+    }
+
+    /// `self.scope_key(scope) == key`, without building the key.
+    ///
+    /// Every test compares its scope chain against the open frames twice, so
+    /// the five allocations `scope_key` would make are worth avoiding on a path
+    /// that runs a few million times over a large suite.
+    pub fn scope_key_is(&self, scope: Scope, key: &str) -> bool {
+        match scope {
+            Scope::Session => key.is_empty(),
+            Scope::Package => match self.path.parent() {
+                Some(p) => p == std::path::Path::new(key),
+                None => key.is_empty(),
+            },
+            Scope::Module => self.relpath == key,
+            Scope::Class => match &self.cls_name {
+                Some(c) => match key.strip_prefix(self.relpath.as_str()) {
+                    Some(rest) => rest.strip_prefix("::") == Some(c.as_str()),
+                    None => false,
+                },
+                None => self.relpath == key,
+            },
+            Scope::Function => self.nodeid == key,
         }
     }
 }

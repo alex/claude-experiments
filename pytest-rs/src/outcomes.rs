@@ -101,12 +101,17 @@ impl FailCallable {
 #[pyclass(module = "pytest", name = "_XfailCallable", frozen)]
 pub struct XfailCallable;
 
+/// Build the `XFailed` exception `pytest.xfail()` raises.
+pub fn xfail_error(py: Python<'_>, reason: &str) -> PyErr {
+    let err = XFailed::new_err(reason.to_string());
+    raise_with_attrs(py, err, &[(ATTR_MSG, reason.into_pyobject(py).unwrap().into_any().unbind())])
+}
+
 #[pymethods]
 impl XfailCallable {
     #[pyo3(signature = (reason=""))]
     fn __call__(&self, py: Python<'_>, reason: &str) -> PyResult<()> {
-        let err = XFailed::new_err(reason.to_string());
-        Err(raise_with_attrs(py, err, &[(ATTR_MSG, reason.into_pyobject(py).unwrap().into_any().unbind())]))
+        Err(xfail_error(py, reason))
     }
 
     #[getter(Exception)]

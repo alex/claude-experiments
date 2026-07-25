@@ -259,7 +259,12 @@ fn collect_entries(
             .and_then(|c| c.getattr("co_filename").ok())
             .and_then(|f| f.extract().ok())
             .unwrap_or_default();
-        let hide = truthy_var(&frame, "f_globals", "__tracebackhide__") || truthy_var(&frame, "f_locals", "__tracebackhide__");
+        // `__unittest` is set at module level throughout the stdlib's unittest
+        // package; hiding those frames is what keeps a failing `assertEqual`
+        // pointing at the test rather than at `case.py`.
+        let hide = truthy_var(&frame, "f_globals", "__tracebackhide__")
+            || truthy_var(&frame, "f_locals", "__tracebackhide__")
+            || truthy_var(&frame, "f_globals", "__unittest");
         let internal = filename.starts_with('<');
         if !hide && !internal {
             let (source, marked) = if want_source {
