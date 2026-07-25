@@ -5,10 +5,12 @@ suite at `50.0.0-dev1` — 4662 collected tests, of which 4015 run and 647 skip 
 this machine (OpenSSL 3.0.13, no wycheproof or x509-limbo vectors present).
 
 Machine: 4 vCPU, 15 GiB RAM, Linux 6.18. Stock pytest is 9.1.1 with pytest-xdist
-3.8.0. All runs use `-p no:randomly` so ordering matches. Timings are best-of-2
+3.8.0. All runs use `-p no:randomly` so ordering matches. Timings are best-of-3
 wall clock with warm `__pycache__` — measuring pytest against a cold assertion
 rewrite cache would flatter us (its first collection takes 4.0 s rather than
-1.3 s).
+1.1 s). Every number below comes from one uninterrupted run of
+`tools/benchmark.py`, so the columns are comparable with each other even though
+absolute numbers move with machine load.
 
 Reproduce with `python tools/benchmark.py /path/to/cryptography --repeat 3`.
 
@@ -16,25 +18,25 @@ Reproduce with `python tools/benchmark.py /path/to/cryptography --repeat 3`.
 
 | | 3.11 (GIL) | 3.14t (free-threaded) |
 | --- | --- | --- |
-| pytest, serial | 27.92 s | 27.26 s |
-| pytest + xdist `-n 4` | 10.39 s | 11.45 s |
-| pytest-rs, serial | 22.55 s | 23.16 s |
-| pytest-rs `-n 4` | 17.23 s | **8.34 s** |
+| pytest, serial | 25.43 s | 26.08 s |
+| pytest + xdist `-n 4` | 10.11 s | 11.22 s |
+| pytest-rs, serial | 20.95 s | 22.16 s |
+| pytest-rs `-n 4` | 16.11 s | **7.48 s** |
 
 On a free-threaded interpreter the thread pool beats four xdist processes
-(8.34 s vs 11.45 s) and stock pytest by 3.3×, while staying in one process — no
+(7.48 s vs 11.22 s) and stock pytest by 3.5×, while staying in one process — no
 `execnet`, no report pickling, and session fixtures genuinely built once rather
 than once per worker.
 
-On a GIL build threads still help this suite (17.23 s vs 22.55 s serial), since
+On a GIL build threads still help this suite (16.11 s vs 20.95 s serial), since
 much of its time is inside GIL-releasing native code, but processes win.
 
 ## Collection
 
 | | pytest | pytest-rs | |
 | --- | --- | --- | --- |
-| 3.11 | 1.26 s | 0.26 s | 4.8× |
-| 3.14t | 1.35 s | 0.30 s | 4.5× |
+| 3.11 | 1.14 s | 0.26 s | 4.4× |
+| 3.14t | 1.24 s | 0.32 s | 3.9× |
 
 Both produce the same 4662 node ids, byte for byte. The gap comes from not
 rewriting any module's AST, not building a Python object per collected node, and
@@ -70,14 +72,22 @@ many workers a suite can use. On cryptography, free-threaded 3.14:
 
 | Workers | Wall | Observed parallelism | CPU |
 | --- | --- | --- | --- |
-| 1 | 22.2 s | 0.86× | 19.0 s |
-| 2 | 11.6 s | 1.71× | 19.8 s |
-| 4 | 9.1 s | 2.46× | 22.3 s |
-| 8 | 9.5 s | 2.57× | 24.3 s |
+| 1 | 21.4 s | 0.85× | 18.2 s |
+| 2 | 11.4 s | 1.70× | 19.4 s |
+| 4 | 8.9 s | 2.45× | 21.7 s |
+| 8 | 7.5 s | 2.77× | 20.8 s |
 
-Past four workers the wall time stops improving and CPU keeps climbing: that is
-contention, not work. (The 0.86× at one worker is time blocked reading test
-vectors off disk, which `time.process_time()` correctly does not count.)
+Observed parallelism plateaus around 2.5–2.8× on four cores, well short of the
+worker count: the tests are waiting on something, not computing. (The 0.85× at
+one worker is time blocked reading test vectors off disk, which
+`time.process_time()` correctly does not count.)
+
+Note that eight workers beat four here, on a four-core machine. That is a
+signature of lock-bound rather than CPU-bound work: when a worker is parked
+inside libcrypto, an extra runnable thread has a core to use. `-n auto` picks the
+core count, which is right for suites that are actually CPU-bound; if `-v` shows
+observed parallelism well under the worker count, oversubscribing is worth
+trying.
 
 ## Why threads stop where they do
 

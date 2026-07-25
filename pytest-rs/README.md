@@ -83,7 +83,7 @@ disabled, take cryptography's serialised set from 228 tests to 15; see
 [docs/BENCHMARKS.md](docs/BENCHMARKS.md) for the breakdown.
 
 On a free-threaded interpreter this produces real parallelism: cryptography's
-suite runs in 8.3 s against stock pytest's 27.3 s and xdist's 11.5 s on four
+suite runs in 7.5 s against stock pytest's 26.1 s and xdist's 11.2 s on four
 cores. On a GIL build threads only overlap GIL-releasing native code and I/O —
 a help for suites like that one, a 20% loss for pure-Python suites — so
 `-n auto` resolves to one worker there; pass `-n N` explicitly to override.
