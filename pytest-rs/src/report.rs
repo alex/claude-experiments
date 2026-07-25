@@ -1,0 +1,280 @@
+//! Terminal reporting.
+
+use std::io::Write;
+
+use crate::outcomes::Outcome;
+use crate::session::ConfigData;
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum When {
+    Setup,
+    Call,
+    Teardown,
+}
+
+impl When {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            When::Setup => "setup",
+            When::Call => "call",
+            When::Teardown => "teardown",
+        }
+    }
+}
+
+#[derive(Clone)]
+pub struct TestReport {
+    pub index: usize,
+    pub nodeid: String,
+    pub relpath: String,
+    pub outcome: Outcome,
+    pub when: When,
+    pub duration: f64,
+    pub setup_duration: f64,
+    pub teardown_duration: f64,
+    pub longrepr: String,
+    pub reason: String,
+    /// `path:line` used by the `-r s` summary.
+    pub location: String,
+    pub bench: Option<crate::bench::BenchResult>,
+    pub worker: usize,
+}
+
+pub struct Colors {
+    pub enabled: bool,
+}
+
+impl Colors {
+    pub fn wrap(&self, code: &str, text: &str) -> String {
+        if !self.enabled {
+            return text.to_string();
+        }
+        format!("\x1b[{code}m{text}\x1b[0m")
+    }
+    pub fn green(&self, t: &str) -> String {
+        self.wrap("32", t)
+    }
+    pub fn red(&self, t: &str) -> String {
+        self.wrap("31", t)
+    }
+    pub fn yellow(&self, t: &str) -> String {
+        self.wrap("33", t)
+    }
+    pub fn bold(&self, t: &str) -> String {
+        self.wrap("1", t)
+    }
+}
+
+pub struct Terminal {
+    pub width: usize,
+    pub colors: Colors,
+    pub verbosity: i64,
+    pub show_progress: bool,
+    /// Characters written on the current line.
+    col: usize,
+    written: usize,
+    total: usize,
+    out: std::io::Stdout,
+    /// Current file prefix in serial mode.
+    current_file: Option<String>,
+    parallel: bool,
+}
+
+pub fn terminal_width() -> usize {
+    if let Ok(cols) = std::env::var("COLUMNS") {
+        if let Ok(n) = cols.parse::<usize>() {
+            return n;
+        }
+    }
+    #[cfg(unix)]
+    {
+        // TIOCGWINSZ via an ioctl would need libc; fall back to a sane default.
+    }
+    80
+}
+
+impl Terminal {
+    pub fn new(cfg: &ConfigData, total: usize, parallel: bool) -> Self {
+        let color_opt = cfg.str_opt("color");
+        let is_tty = unsafe { libc_isatty() };
+        let enabled = match color_opt.as_str() {
+            "yes" | "always" => true,
+            "no" | "never" => false,
+            _ => is_tty && std::env::var("NO_COLOR").is_err(),
+        };
+        let style = cfg.ini_str("console_output_style");
+        let show_progress = style.starts_with("progress") || style.is_empty();
+        Terminal {
+            width: terminal_width(),
+            colors: Colors { enabled },
+            verbosity: cfg.verbosity(),
+            show_progress,
+            col: 0,
+            written: 0,
+            total,
+            out: std::io::stdout(),
+            current_file: None,
+            parallel,
+        }
+    }
+
+    pub fn write(&mut self, s: &str) {
+        let _ = self.out.write_all(s.as_bytes());
+        if let Some(pos) = s.rfind('\n') {
+            self.col = s.len() - pos - 1;
+        } else {
+            self.col += s.len();
+        }
+    }
+
+    pub fn line(&mut self, s: &str) {
+        if self.col > 0 {
+            self.write("\n");
+        }
+        self.write(s);
+        self.write("\n");
+    }
+
+    pub fn flush(&mut self) {
+        let _ = self.out.flush();
+    }
+
+    /// `====== title ======` centred to the terminal width.
+    pub fn section(&mut self, title: &str, sep: char, bold: bool) {
+        let text = if title.is_empty() {
+            sep.to_string().repeat(self.width)
+        } else {
+            let deco = format!(" {title} ");
+            let n = self.width.saturating_sub(deco.len());
+            let left = n / 2;
+            let right = n - left;
+            format!("{}{}{}", sep.to_string().repeat(left), deco, sep.to_string().repeat(right))
+        };
+        let text = if bold { self.colors.bold(&text) } else { text };
+        self.line(&text);
+    }
+
+    fn progress_suffix(&self) -> String {
+        if self.total == 0 {
+            return String::new();
+        }
+        let pct = self.written * 100 / self.total;
+        format!(" [{pct:>3}%]")
+    }
+
+    /// Emit the per-test progress indicator.
+    pub fn report(&mut self, r: &TestReport) {
+        self.written += 1;
+        if self.verbosity >= 1 {
+            let word = match r.outcome {
+                Outcome::Passed => self.colors.green(r.outcome.word()),
+                Outcome::Failed | Outcome::Error => self.colors.red(r.outcome.word()),
+                _ => self.colors.yellow(r.outcome.word()),
+            };
+            let suffix = if self.show_progress { self.progress_suffix() } else { String::new() };
+            let text = format!("{} {}{}", r.nodeid, word, suffix);
+            self.line(&text);
+            return;
+        }
+        // Compact mode: one character per test.
+        if !self.parallel && self.current_file.as_deref() != Some(r.relpath.as_str()) {
+            if self.col > 0 {
+                let pad = self.width.saturating_sub(self.col + 6);
+                let suffix = if self.show_progress { self.progress_suffix() } else { String::new() };
+                self.write(&" ".repeat(pad.min(self.width)));
+                self.write(&suffix);
+                self.write("\n");
+            }
+            self.current_file = Some(r.relpath.clone());
+            self.write(&format!("{} ", r.relpath));
+        }
+        let ch = r.outcome.letter().to_string();
+        let ch = match r.outcome {
+            Outcome::Passed => self.colors.green(&ch),
+            Outcome::Failed | Outcome::Error => self.colors.red(&ch),
+            _ => self.colors.yellow(&ch),
+        };
+        self.write(&ch);
+        let limit = self.width.saturating_sub(8);
+        if self.col >= limit {
+            let suffix = if self.show_progress { self.progress_suffix() } else { String::new() };
+            self.write(&suffix);
+            self.write("\n");
+            if !self.parallel {
+                if let Some(f) = &self.current_file {
+                    let f = f.clone();
+                    let _ = f;
+                }
+            }
+        }
+    }
+
+    pub fn finish_progress(&mut self) {
+        if self.col > 0 {
+            let pad = self.width.saturating_sub(self.col + 6);
+            let suffix = if self.show_progress { self.progress_suffix() } else { String::new() };
+            self.write(&" ".repeat(pad.min(self.width)));
+            self.write(&suffix);
+            self.write("\n");
+        }
+    }
+}
+
+#[cfg(unix)]
+unsafe fn libc_isatty() -> bool {
+    extern "C" {
+        fn isatty(fd: i32) -> i32;
+    }
+    isatty(1) == 1
+}
+
+#[cfg(not(unix))]
+unsafe fn libc_isatty() -> bool {
+    false
+}
+
+/// Format a duration the way pytest does in the final line.
+pub fn format_duration(secs: f64) -> String {
+    if secs < 60.0 {
+        format!("{secs:.2}s")
+    } else {
+        let mins = (secs / 60.0).floor();
+        let rem = secs - mins * 60.0;
+        format!("{mins:.0}:{rem:05.2}")
+    }
+}
+
+/// Build the `4015 passed, 647 skipped` fragment.
+pub fn outcome_summary(counts: &[(Outcome, usize)]) -> Vec<(String, Outcome)> {
+    let order = [
+        Outcome::Failed,
+        Outcome::Error,
+        Outcome::Passed,
+        Outcome::Skipped,
+        Outcome::XFailed,
+        Outcome::XPassed,
+    ];
+    let mut parts = Vec::new();
+    for o in order {
+        let n: usize = counts.iter().filter(|(x, _)| *x == o).map(|(_, c)| *c).sum();
+        if n == 0 {
+            continue;
+        }
+        let word = match o {
+            Outcome::Passed => "passed",
+            Outcome::Failed => "failed",
+            Outcome::Skipped => "skipped",
+            Outcome::XFailed => "xfailed",
+            Outcome::XPassed => "xpassed",
+            Outcome::Error => {
+                if n == 1 {
+                    "error"
+                } else {
+                    "errors"
+                }
+            }
+        };
+        parts.push((format!("{n} {word}"), o));
+    }
+    parts
+}

@@ -1,0 +1,555 @@
+//! Scheduling and execution.
+//!
+//! Work is split into two phases:
+//!
+//! * a **parallel phase**, where items are partitioned into serial groups —
+//!   any two tests that would share a non-session scoped fixture instance land
+//!   in the same group — and groups are handed to a pool of worker threads;
+//! * a **serial phase**, holding the tests that the thread-safety analysis
+//!   flagged as touching process-global state (and benchmarks, which want a
+//!   quiet machine).
+//!
+//! Within a group, items execute in order on one thread, so scope frames and
+//! finalisation behave exactly as they do under stock pytest.
+
+use pyo3::prelude::*;
+use pyo3::types::{PyDict, PyTuple};
+use rustc_hash::FxHashMap;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{mpsc, Arc, Mutex};
+use std::time::Instant;
+
+use crate::fixtures::Scope;
+use crate::marks::{evaluate_skip, evaluate_xfail, SkipDecision};
+use crate::outcomes::{outcome_message, Exit, Failed, Outcome, Skipped, XFailed};
+use crate::report::{TestReport, When};
+use crate::runtime::{install_worker, SessionCache, Worker};
+use crate::session::{ConfigData, Item, PyItem, Session};
+
+/// Call a hook implementation, passing only the arguments it declares.
+pub fn call_hook<'py>(
+    py: Python<'py>,
+    func: &Bound<'py, PyAny>,
+    available: &[(&str, Bound<'py, PyAny>)],
+) -> PyResult<Bound<'py, PyAny>> {
+    let kwargs = PyDict::new(py);
+    if let Ok(code) = func.getattr("__code__") {
+        let argcount: usize = code.getattr("co_argcount")?.extract()?;
+        let varnames = code.getattr("co_varnames")?;
+        let t = varnames.cast::<PyTuple>()?;
+        for i in 0..argcount {
+            let n: String = t.get_item(i)?.extract()?;
+            if let Some((_, v)) = available.iter().find(|(k, _)| *k == n) {
+                kwargs.set_item(&n, v)?;
+            }
+        }
+    } else {
+        for (k, v) in available {
+            kwargs.set_item(*k, v)?;
+        }
+    }
+    func.call((), Some(&kwargs))
+}
+
+/// Union-find over item indices.
+struct Dsu {
+    parent: Vec<usize>,
+}
+
+impl Dsu {
+    fn new(n: usize) -> Self {
+        Dsu { parent: (0..n).collect() }
+    }
+    fn find(&mut self, mut x: usize) -> usize {
+        while self.parent[x] != x {
+            self.parent[x] = self.parent[self.parent[x]];
+            x = self.parent[x];
+        }
+        x
+    }
+    fn union(&mut self, a: usize, b: usize) {
+        let (ra, rb) = (self.find(a), self.find(b));
+        if ra != rb {
+            self.parent[rb] = ra;
+        }
+    }
+}
+
+pub struct Plan {
+    /// Groups of item indices that can run concurrently with each other.
+    pub groups: Vec<Vec<usize>>,
+    /// Items that must run alone, in order.
+    pub serial: Vec<usize>,
+}
+
+/// Partition items into serial groups.
+pub fn plan(session: &Session, parallel: bool) -> Plan {
+    let items = &session.items;
+    if !parallel {
+        return Plan { groups: Vec::new(), serial: (0..items.len()).collect() };
+    }
+    let mut dsu = Dsu::new(items.len());
+    let mut first_for_key: FxHashMap<String, usize> = FxHashMap::default();
+    let mut serial: Vec<usize> = Vec::new();
+
+    for (i, item) in items.iter().enumerate() {
+        if item.thread_hostile {
+            serial.push(i);
+            continue;
+        }
+        for def in &item.closure.order {
+            let shares = match def.scope {
+                Scope::Function => false,
+                Scope::Session => def.thread_hostile,
+                _ => true,
+            };
+            if !shares || def.builtin.is_some() {
+                continue;
+            }
+            let param_index = item.callspec.indices.get(&def.argname).copied().unwrap_or(0);
+            let key = format!("{}#{}#{}", def.uid, param_index, item.scope_key(def.scope));
+            match first_for_key.get(&key) {
+                Some(&j) => dsu.union(j, i),
+                None => {
+                    first_for_key.insert(key, i);
+                }
+            }
+        }
+    }
+
+    let mut buckets: FxHashMap<usize, Vec<usize>> = FxHashMap::default();
+    let mut order: Vec<usize> = Vec::new();
+    for (i, item) in items.iter().enumerate() {
+        if item.thread_hostile {
+            continue;
+        }
+        let root = dsu.find(i);
+        if !buckets.contains_key(&root) {
+            order.push(root);
+        }
+        buckets.entry(root).or_default().push(i);
+    }
+    let mut groups: Vec<Vec<usize>> = order.into_iter().filter_map(|r| buckets.remove(&r)).collect();
+    // Longest-first keeps the tail of the run from being one slow group.
+    groups.sort_by_key(|g| std::cmp::Reverse(g.len()));
+    Plan { groups, serial }
+}
+
+/// Shared mutable run state.
+pub struct RunState {
+    pub failures: AtomicUsize,
+    pub stop: AtomicBool,
+    pub maxfail: usize,
+    pub exit_message: Mutex<Option<String>>,
+}
+
+impl RunState {
+    pub fn should_stop(&self) -> bool {
+        self.stop.load(Ordering::Relaxed)
+    }
+
+    pub fn record_failure(&self) {
+        let n = self.failures.fetch_add(1, Ordering::Relaxed) + 1;
+        if self.maxfail > 0 && n >= self.maxfail {
+            self.stop.store(true, Ordering::Relaxed);
+        }
+    }
+}
+
+/// Execute the whole session, sending reports through `tx`.
+pub fn execute(
+    session: Arc<Session>,
+    session_cache: Arc<SessionCache>,
+    plan: Plan,
+    state: Arc<RunState>,
+    tx: mpsc::Sender<TestReport>,
+    workers: usize,
+) {
+    let queue = Arc::new(Mutex::new(plan.groups));
+    let mut handles = Vec::new();
+    if workers > 1 {
+        for wid in 1..workers {
+            let session = session.clone();
+            let session_cache = session_cache.clone();
+            let queue = queue.clone();
+            let state = state.clone();
+            let tx = tx.clone();
+            handles.push(std::thread::spawn(move || {
+                worker_loop(session, session_cache, queue, state, tx, wid);
+            }));
+        }
+    }
+    // The invoking thread participates too.
+    worker_loop(session.clone(), session_cache.clone(), queue, state.clone(), tx.clone(), 0);
+    for h in handles {
+        let _ = h.join();
+    }
+
+    // Serial phase: thread-hostile items, one at a time.
+    if !plan.serial.is_empty() && !state.should_stop() {
+        let worker = Arc::new(Worker::new(session.clone(), session_cache.clone()));
+        install_worker(worker.clone());
+        Python::attach(|py| {
+            for &idx in &plan.serial {
+                if state.should_stop() {
+                    break;
+                }
+                let item = session.items[idx].clone();
+                let rep = run_one(py, &worker, &item, &state, 0);
+                let _ = tx.send(rep);
+            }
+            worker.drain(py);
+        });
+        crate::runtime::clear_worker();
+    }
+}
+
+fn worker_loop(
+    session: Arc<Session>,
+    session_cache: Arc<SessionCache>,
+    queue: Arc<Mutex<Vec<Vec<usize>>>>,
+    state: Arc<RunState>,
+    tx: mpsc::Sender<TestReport>,
+    wid: usize,
+) {
+    let worker = Arc::new(Worker::new(session.clone(), session_cache));
+    install_worker(worker.clone());
+    loop {
+        if state.should_stop() {
+            break;
+        }
+        let group = {
+            let mut q = queue.lock().unwrap();
+            q.pop()
+        };
+        let Some(group) = group else { break };
+        Python::attach(|py| {
+            for idx in group {
+                if state.should_stop() {
+                    break;
+                }
+                let item = session.items[idx].clone();
+                let rep = run_one(py, &worker, &item, &state, wid);
+                let _ = tx.send(rep);
+            }
+            for e in worker.drain(py) {
+                eprintln!("pytest-rs: error during teardown: {e}");
+            }
+        });
+    }
+    crate::runtime::clear_worker();
+}
+
+/// Run a single test through setup / call / teardown.
+pub fn run_one(py: Python<'_>, worker: &Arc<Worker>, item: &Arc<Item>, state: &RunState, wid: usize) -> TestReport {
+    let cfg: &ConfigData = &worker.session.cfg;
+    let tb_style = cfg.str_opt("tbstyle");
+    let showlocals = cfg.flag("showlocals");
+    let rootdir = cfg.rootdir.clone();
+    let mut rep = TestReport {
+        index: item.index,
+        nodeid: item.nodeid.clone(),
+        relpath: item.relpath.clone(),
+        outcome: Outcome::Passed,
+        when: When::Call,
+        duration: 0.0,
+        setup_duration: 0.0,
+        teardown_duration: 0.0,
+        longrepr: String::new(),
+        reason: String::new(),
+        location: item.location(),
+        bench: None,
+        worker: wid,
+    };
+    let t_start = Instant::now();
+    let marks = item.all_marks(true);
+    let globals = item
+        .module
+        .bind(py)
+        .getattr("__dict__")
+        .ok()
+        .and_then(|d| d.cast_into::<PyDict>().ok());
+
+    // --- skip / xfail markers -------------------------------------------
+    match evaluate_skip(py, &marks, globals.as_ref()) {
+        Ok(SkipDecision::Skip(reason)) => {
+            rep.outcome = Outcome::Skipped;
+            rep.when = When::Setup;
+            rep.reason = reason;
+            rep.duration = t_start.elapsed().as_secs_f64();
+            return rep;
+        }
+        Ok(SkipDecision::Run) => {}
+        Err(e) => return fail_report(py, rep, &e, When::Setup, &tb_style, &rootdir, showlocals, state, t_start),
+    }
+    let xfail_strict = cfg.ini_value("xfail_strict").as_bool();
+    let xfail = match evaluate_xfail(py, &marks, globals.as_ref(), xfail_strict) {
+        Ok(x) => x,
+        Err(e) => return fail_report(py, rep, &e, When::Setup, &tb_style, &rootdir, showlocals, state, t_start),
+    };
+    if let Some(spec) = &xfail {
+        if !spec.run {
+            rep.outcome = Outcome::XFailed;
+            rep.when = When::Setup;
+            rep.reason = format!("[NOTRUN] {}", spec.reason);
+            rep.duration = t_start.elapsed().as_secs_f64();
+            return rep;
+        }
+    }
+
+    // --- setup ------------------------------------------------------------
+    let py_item = match Py::new(py, PyItem { item: item.clone(), cfg: worker.session.cfg.clone() }) {
+        Ok(v) => v.into_bound(py).into_any(),
+        Err(e) => return fail_report(py, rep, &e, When::Setup, &tb_style, &rootdir, showlocals, state, t_start),
+    };
+    for hook in &worker.session.hooks.runtest_setup {
+        if let Err(e) = call_hook(py, hook.bind(py), &[("item", py_item.clone())]) {
+            return finish_with_error(py, worker, item, rep, e, When::Setup, &tb_style, &rootdir, showlocals, state, t_start);
+        }
+    }
+    worker.enter_item(py, item);
+    // The test class instance must exist before fixtures run: class level
+    // fixtures are bound to it, and `request.instance` exposes it.
+    if let Some(cls) = &item.cls {
+        match cls.bind(py).call0() {
+            Ok(inst) => *worker.instance.lock().unwrap() = Some(inst.unbind()),
+            Err(e) => {
+                return finish_with_error(py, worker, item, rep, e, When::Setup, &tb_style, &rootdir, showlocals, state, t_start)
+            }
+        }
+    }
+    let kwargs = match worker.fill_arguments(py, item) {
+        Ok(k) => k,
+        Err(e) => {
+            return finish_with_error(py, worker, item, rep, e, When::Setup, &tb_style, &rootdir, showlocals, state, t_start)
+        }
+    };
+    rep.setup_duration = t_start.elapsed().as_secs_f64();
+
+    // --- call --------------------------------------------------------------
+    let t_call = Instant::now();
+    let call_result = invoke(py, worker, item, kwargs.bind(py));
+    let call_elapsed = t_call.elapsed().as_secs_f64();
+
+    match call_result {
+        Ok(_) => {
+            if let Some(spec) = &xfail {
+                if spec.strict {
+                    rep.outcome = Outcome::Failed;
+                    rep.longrepr = format!("[XPASS(strict)] {}", spec.reason);
+                    state.record_failure();
+                } else {
+                    rep.outcome = Outcome::XPassed;
+                    rep.reason = spec.reason.clone();
+                }
+            }
+        }
+        Err(e) => {
+            classify(py, &mut rep, &e, xfail.as_ref(), &tb_style, &rootdir, showlocals, state);
+        }
+    }
+    rep.duration = call_elapsed;
+
+    // --- teardown -----------------------------------------------------------
+    let t_teardown = Instant::now();
+    for hook in &worker.session.hooks.runtest_teardown {
+        if let Err(e) = call_hook(py, hook.bind(py), &[("item", py_item.clone())]) {
+            if rep.outcome == Outcome::Passed {
+                rep.outcome = Outcome::Error;
+                rep.when = When::Teardown;
+                rep.longrepr = crate::traceback::format_failure(py, &e, &tb_style, &rootdir, showlocals);
+                state.record_failure();
+            }
+        }
+    }
+    let errors = worker.exit_item(py);
+    if !errors.is_empty() && rep.outcome == Outcome::Passed {
+        rep.outcome = Outcome::Error;
+        rep.when = When::Teardown;
+        rep.longrepr = errors.join("\n");
+        state.record_failure();
+    }
+    *worker.instance.lock().unwrap() = None;
+    rep.teardown_duration = t_teardown.elapsed().as_secs_f64();
+    if let Some(b) = take_bench_result(worker, &item.name) {
+        rep.bench = Some(b);
+    }
+    rep
+}
+
+fn take_bench_result(worker: &Arc<Worker>, name: &str) -> Option<crate::bench::BenchResult> {
+    let store = worker.session.bench_store.results.lock().unwrap();
+    store.iter().rev().find(|r| r.name == name).cloned()
+}
+
+/// Invoke the test callable with the resolved arguments.
+fn invoke<'py>(
+    py: Python<'py>,
+    worker: &Arc<Worker>,
+    item: &Arc<Item>,
+    kwargs: &Bound<'py, PyDict>,
+) -> PyResult<Bound<'py, PyAny>> {
+    if item.cls.is_none() {
+        return item.func.bind(py).call((), Some(kwargs));
+    }
+    let instance = worker
+        .instance
+        .lock()
+        .unwrap()
+        .as_ref()
+        .map(|i| i.clone_ref(py))
+        .ok_or_else(|| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>("missing test instance"))?;
+    let instance = instance.bind(py);
+    // xunit-style per-method setup, if present.
+    if let Ok(setup) = instance.getattr("setup_method") {
+        if setup.is_callable() {
+            setup.call1((item.func.bind(py),))?;
+        }
+    }
+    let bound = instance.getattr(item.originalname.as_str())?;
+    let result = bound.call((), Some(kwargs));
+    if let Ok(teardown) = instance.getattr("teardown_method") {
+        if teardown.is_callable() {
+            teardown.call1((item.func.bind(py),))?;
+        }
+    }
+    result
+}
+
+#[allow(clippy::too_many_arguments)]
+fn classify(
+    py: Python<'_>,
+    rep: &mut TestReport,
+    e: &PyErr,
+    xfail: Option<&crate::marks::XfailSpec>,
+    tb_style: &str,
+    rootdir: &std::path::Path,
+    showlocals: bool,
+    state: &RunState,
+) {
+    if e.is_instance_of::<Skipped>(py) {
+        rep.outcome = Outcome::Skipped;
+        rep.reason = outcome_message(py, e);
+        if let Some(loc) = raising_location(py, e, rootdir) {
+            rep.location = loc;
+        }
+        return;
+    }
+    if e.is_instance_of::<XFailed>(py) {
+        rep.outcome = Outcome::XFailed;
+        rep.reason = outcome_message(py, e);
+        return;
+    }
+    if e.is_instance_of::<Exit>(py) {
+        rep.outcome = Outcome::Failed;
+        rep.longrepr = outcome_message(py, e);
+        state.stop.store(true, Ordering::Relaxed);
+        *state.exit_message.lock().unwrap() = Some(outcome_message(py, e));
+        return;
+    }
+    if let Some(spec) = xfail {
+        let matches = match &spec.raises {
+            None => true,
+            Some(r) => e.value(py).is_instance(r.bind(py)).unwrap_or(false),
+        };
+        if matches {
+            rep.outcome = Outcome::XFailed;
+            rep.reason = spec.reason.clone();
+            return;
+        }
+    }
+    rep.outcome = Outcome::Failed;
+    if e.is_instance_of::<Failed>(py) {
+        let pytrace = e
+            .value(py)
+            .getattr(crate::outcomes::ATTR_PYTRACE)
+            .ok()
+            .map(|v| v.is_truthy().unwrap_or(true))
+            .unwrap_or(true);
+        if !pytrace {
+            rep.longrepr = outcome_message(py, e);
+            state.record_failure();
+            return;
+        }
+    }
+    rep.longrepr = crate::traceback::format_failure(py, e, tb_style, rootdir, showlocals);
+    state.record_failure();
+}
+
+/// Where a `pytest.skip()` call happened, for the `-r s` summary.
+fn raising_location(py: Python<'_>, e: &PyErr, rootdir: &std::path::Path) -> Option<String> {
+    let mut tb = e.traceback(py)?.into_any();
+    let mut best: Option<(String, usize)> = None;
+    loop {
+        let frame = tb.getattr("tb_frame").ok()?;
+        let lineno: usize = tb.getattr("tb_lineno").ok()?.extract().ok()?;
+        let filename: String = frame
+            .getattr("f_code")
+            .ok()?
+            .getattr("co_filename")
+            .ok()?
+            .extract()
+            .ok()?;
+        if !filename.starts_with('<') {
+            best = Some((filename, lineno));
+        }
+        match tb.getattr("tb_next") {
+            Ok(n) if !n.is_none() => tb = n,
+            _ => break,
+        }
+    }
+    let (f, l) = best?;
+    let display = std::path::Path::new(&f)
+        .strip_prefix(rootdir)
+        .map(|p| p.to_string_lossy().to_string())
+        .unwrap_or(f);
+    Some(format!("{display}:{l}"))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn fail_report(
+    py: Python<'_>,
+    mut rep: TestReport,
+    e: &PyErr,
+    when: When,
+    tb_style: &str,
+    rootdir: &std::path::Path,
+    showlocals: bool,
+    state: &RunState,
+    t_start: Instant,
+) -> TestReport {
+    rep.when = when;
+    if e.is_instance_of::<Skipped>(py) {
+        rep.outcome = Outcome::Skipped;
+        rep.reason = outcome_message(py, e);
+        if let Some(loc) = raising_location(py, e, rootdir) {
+            rep.location = loc;
+        }
+    } else {
+        rep.outcome = Outcome::Error;
+        rep.longrepr = crate::traceback::format_failure(py, e, tb_style, rootdir, showlocals);
+        state.record_failure();
+    }
+    rep.duration = t_start.elapsed().as_secs_f64();
+    rep
+}
+
+/// Setup failed: make sure whatever was already built gets torn down.
+#[allow(clippy::too_many_arguments)]
+fn finish_with_error(
+    py: Python<'_>,
+    worker: &Arc<Worker>,
+    _item: &Arc<Item>,
+    rep: TestReport,
+    e: PyErr,
+    when: When,
+    tb_style: &str,
+    rootdir: &std::path::Path,
+    showlocals: bool,
+    state: &RunState,
+    t_start: Instant,
+) -> TestReport {
+    let out = fail_report(py, rep, &e, when, tb_style, rootdir, showlocals, state, t_start);
+    let _ = worker.exit_item(py);
+    out
+}
