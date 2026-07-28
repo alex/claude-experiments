@@ -95,8 +95,8 @@ fn into_owner_after_mutation() {
     let payload: u32 = kani::any();
 
     let mut cell = Cell::new(Owner::new(payload), |owner| Dependent::build(owner));
-    cell.with_dependent_mut(|owner, dependent| {
-        dependent.derived = Dependent::expected(owner.payload);
+    cell.with_dependent_mut(|_owner, dependent| {
+        dependent.scratch = dependent.scratch.wrapping_add(1);
     });
 
     let owner = cell.into_owner();

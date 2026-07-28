@@ -81,7 +81,11 @@ impl Drop for Owner {
 #[derive(Debug)]
 pub struct Dependent<'a> {
     pub owner: &'a Owner,
+    /// Function of `owner.payload`; the destructor re-checks it, so this field
+    /// must be left consistent.
     pub derived: u32,
+    /// Free real estate for harnesses that just want to write somewhere.
+    pub scratch: u32,
 }
 
 impl<'a> Dependent<'a> {
@@ -89,6 +93,7 @@ impl<'a> Dependent<'a> {
         Self {
             owner,
             derived: owner.payload.wrapping_mul(3).wrapping_add(1),
+            scratch: 0,
         }
     }
 

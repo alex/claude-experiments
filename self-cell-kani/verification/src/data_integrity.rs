@@ -58,26 +58,22 @@ fn with_dependent_mut_writes_are_observable() {
 
     let returned = cell.with_dependent_mut(|owner, dependent| {
         assert_eq!(owner.payload, payload);
-        let previous = dependent.derived;
-        dependent.derived = replacement;
+        assert_eq!(dependent.derived, Dependent::expected(payload));
+        let previous = dependent.scratch;
+        dependent.scratch = replacement;
         previous
     });
 
-    assert_eq!(returned, Dependent::expected(payload));
+    assert_eq!(returned, 0);
 
     // The write went to the heap allocation, not to a temporary.
-    assert_eq!(cell.borrow_dependent().derived, replacement);
-    cell.with_dependent(|_, dependent| assert_eq!(dependent.derived, replacement));
+    assert_eq!(cell.borrow_dependent().scratch, replacement);
+    cell.with_dependent(|_, dependent| assert_eq!(dependent.scratch, replacement));
 
-    // ... and it did not disturb the owner.
+    // ... and it did not disturb the owner or the rest of the dependent.
     assert_eq!(cell.borrow_owner().payload, payload);
     assert!(cell.borrow_owner().is_alive());
-
-    // `Dependent::drop` asserts the invariant `derived == expected(payload)`,
-    // so restore it before the cell goes out of scope.
-    cell.with_dependent_mut(|owner, dependent| {
-        dependent.derived = Dependent::expected(owner.payload);
-    });
+    assert_eq!(cell.borrow_dependent().derived, Dependent::expected(payload));
 }
 
 /// `with_dependent_mut` hands out `&Owner` and `&mut Dependent` derived from
@@ -101,7 +97,7 @@ fn owner_and_dependent_do_not_overlap() {
 
         // Writing through the unique reference must not be visible in the
         // owner.
-        dependent.derived = Dependent::expected(owner.payload);
+        dependent.scratch = 0xabcd_ef01;
         assert_eq!(owner.payload, payload);
         assert!(owner.is_alive());
     });

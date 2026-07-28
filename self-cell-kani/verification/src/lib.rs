@@ -17,9 +17,13 @@
 mod tracking;
 
 #[cfg(kani)]
+mod async_builder;
+#[cfg(kani)]
 mod construct_drop;
 #[cfg(kani)]
 mod data_integrity;
+#[cfg(kani)]
+mod drop_guard;
 #[cfg(kani)]
 mod fallible;
 #[cfg(kani)]
@@ -27,4 +31,10 @@ mod into_owner;
 #[cfg(kani)]
 mod mut_borrow;
 #[cfg(kani)]
+mod op_sequence;
+#[cfg(kani)]
+mod owner_immutability;
+#[cfg(kani)]
 mod pointer_stability;
+#[cfg(kani)]
+mod shapes;

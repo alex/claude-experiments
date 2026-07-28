@@ -23,7 +23,8 @@ cargo kani setup
 ```
 
 The harnesses live in a separate crate so that `../src` stays byte-for-byte
-identical to upstream.
+identical to upstream. A full run is about four minutes; the `async_builder`
+harnesses dominate it.
 
 ## What is checked
 
@@ -39,6 +40,11 @@ On top of those, the harnesses assert the crate's own invariants.
 | `fallible` | `try_new` drops the owner exactly once on failure; `try_new_or_recover` hands the owner back live and un-dropped; both free the allocation exactly once; a recovered owner can be reused to build a working cell |
 | `mut_borrow` | `MutBorrow`'s lock is one-way, so a second `borrow_mut` panics rather than aliasing — including via `borrow_owner` on an already-built cell; the `&mut` round trip through a cell preserves writes |
 | `pointer_stability` | addresses survive moves through stack, `Box` and tuple; both fields land aligned and disjoint inside one allocation, for a high-alignment owner and for a high-alignment dependent; the generated struct is pointer-sized with its `NonNull` niche intact |
+| `owner_immutability` | invariant 2 — "owner is NEVER changed again" — over a fully symbolic byte array, across every operation the public API allows; and the ordering claim behind *"Must not read before dropping dependent!!"*, observed through an owner with interior mutability that the dependent's destructor writes to |
+| `drop_guard` | `OwnerAndCellDropGuard` destroys the owner exactly once and frees the whole `JoinedCell`, not just the owner's share of it; `mem::forget`ing it hands responsibility back intact |
+| `shapes` | zero-sized owner, zero-sized dependent, an owner holding its own `Box`, an owner that is itself a borrow (the macro's optional owner lifetime), and a cell where neither side has a destructor |
+| `op_sequence` | bounded-length *arbitrary* sequences of public calls, with the invariants re-checked after every step and a nondeterministic choice of `Drop` or `into_owner` at the end |
+| `async_builder` | the `async_builder` constructors, including cancellation — dropping the future mid-`await`, which is the one path that reaches the drop guard through the public API without unwinding |
 
 The instrumented owner in `tracking.rs` writes a poison canary in its
 destructor, and the dependent's destructor reads the owner through the
@@ -51,7 +57,7 @@ reading a destroyed-but-not-freed owner trips the canary.
 A proof suite that passes is only worth something if it would have failed on a
 broken implementation. `mutants/` holds patches that each introduce one classic
 bug into `self_cell`; `mutants/run.sh` applies each to a throwaway copy and
-re-runs the suite. All five are detected:
+re-runs the suite. All eight are detected:
 
 | Mutant | Injected bug | Detected as |
 | --- | --- | --- |
@@ -60,6 +66,9 @@ re-runs the suite. All five are detected:
 | `m3_double_free` | `try_new_or_recover`'s error path leaves the drop guard armed | *double free*, plus the recovered owner having been dropped |
 | `m4_leak` | `drop_joined` disarms its guard, leaking the owner and the allocation | drop-count assertions |
 | `m5_alloc_leak` | destructors still run but the memory is never freed | *dynamically allocated memory never freed* |
+| `m6_read_before_drop` | `into_owner` `ptr::read`s the owner out before running the dependent's destructor | the destructor's write-back missing from the recovered owner |
+| `m7_ok_path_guard` | `try_new`'s *success* path leaves the drop guard armed | owner destroyed while the cell is still live |
+| `m8_wrong_dealloc_layout` | `into_owner` frees with `Layout::new::<Owner>()` instead of the whole cell's | *rust_dealloc must be called on an object whose allocated size matches its layout* |
 
 `m5` is the reason `verify.sh` passes `--cbmc-args --memory-leak-check`: without
 it, an allocation that is simply never released verifies clean.
@@ -72,9 +81,12 @@ Worth stating plainly, since "formally verified" invites over-reading.
   the class of bug Miri finds — are outside its model. Upstream runs Miri in CI,
   so the two are complementary rather than redundant.
 * **No unwinding.** Kani compiles with `panic=abort`, so a panic is a verification
-  failure rather than something that unwinds. The `OwnerAndCellDropGuard` paths
-  that exist to survive a panicking dependent builder therefore cannot be reached
-  by letting a builder panic.
+  failure rather than something that unwinds. A *panicking* dependent builder
+  therefore cannot be used to reach `OwnerAndCellDropGuard`. Two harnesses cover
+  it another way: `async_builder::cancelling_construction_cleans_up` drops the
+  constructor's future mid-`await`, which reaches the armed guard through the
+  public API with no unwinding involved, and `drop_guard` reproduces the state a
+  panicking builder leaves behind and runs the guard against it directly.
 * **No concurrency.** Kani treats atomics as sequential operations. The `Send`
   and `Sync` reasoning for `UnsafeSelfCell`, `SendMutPtr` and `MutBorrow` is
   type-level and outside what Kani checks.
@@ -89,3 +101,8 @@ Worth stating plainly, since "formally verified" invites over-reading.
   precisely the sanctioned idiom, and a standalone snippet using it with no
   `self_cell` involved is flagged the same way. `-Z uninit-checks` currently
   crashes the Kani compiler on this crate.
+* **Async builders are written around two Kani bugs.** Kani 0.67 cannot lower
+  `async` closures at all (`not yet implemented: FIXME(async_closures): Lower
+  these to SMIR`), so the builders in `async_builder` are free `async fn` items
+  with their would-be captures passed through statics. `kani::block_on` also
+  does not converge here, so the futures are polled by hand.
