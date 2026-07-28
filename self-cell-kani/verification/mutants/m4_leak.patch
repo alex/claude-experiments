@@ -1,6 +1,6 @@
 --- a/src/unsafe_self_cell.rs
 +++ b/src/unsafe_self_cell.rs
-@@ -92,9 +92,8 @@
+@@ -150,9 +150,8 @@
          // So we drop the struct, field by field manually.
          drop_in_place(&mut (*joined_ptr.as_ptr()).dependent);
  

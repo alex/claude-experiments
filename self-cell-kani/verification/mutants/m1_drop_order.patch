@@ -1,6 +1,6 @@
 --- a/src/unsafe_self_cell.rs
 +++ b/src/unsafe_self_cell.rs
-@@ -84,13 +84,10 @@
+@@ -142,13 +142,10 @@
      pub unsafe fn drop_joined<Dependent>(&mut self) {
          let joined_ptr = self.joined_void_ptr.cast::<JoinedCell<Owner, Dependent>>();
  

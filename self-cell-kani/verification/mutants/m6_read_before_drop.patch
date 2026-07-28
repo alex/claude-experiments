@@ -1,6 +1,6 @@
 --- a/src/unsafe_self_cell.rs
 +++ b/src/unsafe_self_cell.rs
-@@ -103,17 +103,14 @@
+@@ -161,17 +161,14 @@
          // In case drop_in_place(...dependent) fails
          let drop_guard = OwnerAndCellDropGuard::new(joined_ptr);
  

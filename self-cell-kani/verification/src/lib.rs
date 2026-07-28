@@ -23,6 +23,8 @@ mod async_builder;
 #[cfg(kani)]
 mod construct_drop;
 #[cfg(kani)]
+mod contracts;
+#[cfg(kani)]
 mod data_integrity;
 #[cfg(kani)]
 mod drop_guard;

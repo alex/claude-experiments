@@ -27,9 +27,12 @@ cargo kani setup
 ./mutants/run.sh                              # check the suite isn't vacuous
 ```
 
-The harnesses live in a separate crate so that `../src` stays byte-for-byte
-identical to upstream. A full run is about four minutes; the `async_builder`
-harnesses dominate it.
+The behavioural harnesses live in a separate crate. The crate itself carries
+Kani *function contracts* — see below — which are the only edits to upstream:
+116 added lines, nothing modified or removed, every one of them behind
+`#[cfg_attr(kani, ...)]` so ordinary builds and `cargo test` are unaffected.
+
+A full run is about two minutes.
 
 ## What is checked
 
@@ -51,12 +54,56 @@ On top of those, the harnesses assert the crate's own invariants.
 | `op_sequence` | bounded-length *arbitrary* sequences of public calls, with the invariants re-checked after every step and a nondeterministic choice of `Drop` or `into_owner` at the end |
 | `async_builder` | the `async_builder` constructors, including cancellation — dropping the future mid-`await`, which is the one path that reaches the drop guard through the public API without unwinding |
 | `arbitrary_callbacks` | the same properties over *symbolic* builders and visitors rather than one hand-written closure each — see below |
+| `contracts` | discharges the function contracts written on the crate itself, against arbitrary inputs satisfying each precondition — see below |
 
 The instrumented owner in `tracking.rs` writes a poison canary in its
 destructor, and the dependent's destructor reads the owner through the
 self-reference. That is what makes wrong *ordering* observable and not merely
 wrong drop counts: reading a freed allocation is a Kani pointer failure, and
 reading a destroyed-but-not-freed owner trips the canary.
+
+## Contracts on the crate itself
+
+A harness proves things about the call sequences it happens to write. A contract
+states the obligation on the *function*, and `#[kani::proof_for_contract]`
+discharges it against an arbitrary input satisfying the precondition — so what
+is proved stops depending on how the function was reached.
+
+Two kinds of claim are new here, and neither can be expressed by a harness at
+all:
+
+**Frame conditions.** `#[kani::modifies()]` with no targets says a function
+writes to *nothing*. On `borrow_owner`, `borrow_dependent` and `borrow_mut`
+that is the machine-checked form of invariant 4 — "the only access to owner and
+dependent is as immutable reference". No amount of checking return values can
+establish "and it wrote nowhere else".
+
+**Layout obligations, stated once at the source.** `JoinedCell::_field_pointers`
+is what every other unsafe function is built on. Its contract says the two
+pointers land in the allocation, are aligned for the type each will hold, and
+never overlap — so writing the dependent cannot disturb the owner the dependent
+borrows. Five `proof_for_contract` harnesses monomorphise it across the shapes
+that could plausibly break the arithmetic, including a zero-sized field on
+either side.
+
+The rest: `UnsafeSelfCell::new` stores the pointer it was given,
+`SendMutPtr::into_non_null` is `Some` exactly when the pointer is non-null, and
+`MutBorrow::borrow_mut` — given an unlocked cell — leaves it locked and returns
+a reference to the wrapped value itself. That last contract describes only the
+non-panicking path; that the *locked* path panics rather than aliasing is proved
+separately by the `should_panic` harnesses in `mut_borrow`.
+
+`verify.sh` passes `-Z function-contracts`, which asserts contracts at call
+sites as well. So the `modifies()` clauses are checked in all 71 harnesses, not
+only in the eleven that target the contracts directly.
+
+One precondition is weaker than it should be, for a Kani reason worth recording.
+The natural predicate for the accessors is `can_dereference` — the bytes are
+allocated, aligned, *and* form a valid `JoinedCell`. Kani cannot check validity
+of a type containing an enum, and a user's `Dependent` is allowed to contain
+one, so the preconditions use `can_write` (allocated, aligned, right size)
+instead. Being weaker, it makes the contract harder to satisfy rather than
+easier — the function must be correct for more states, not fewer.
 
 ## Quantifying over the callbacks
 
@@ -98,8 +145,9 @@ the quantification is over the values of a fixed type, not over the type.
 
 A proof suite that passes is only worth something if it would have failed on a
 broken implementation. `mutants/` holds patches that each introduce one classic
-bug into `self_cell`; `mutants/run.sh` applies each to a throwaway copy and
-re-runs the suite. All eight are detected:
+bug into `self_cell`. `mutants/generate.py` turns them into patches against the
+current source, and `mutants/run.sh` applies each to a throwaway copy and
+re-runs the suite. All eleven are detected:
 
 | Mutant | Injected bug | Detected as |
 | --- | --- | --- |
@@ -111,6 +159,9 @@ re-runs the suite. All eight are detected:
 | `m6_read_before_drop` | `into_owner` `ptr::read`s the owner out before running the dependent's destructor | the destructor's write-back missing from the recovered owner |
 | `m7_ok_path_guard` | `try_new`'s *success* path leaves the drop guard armed | owner destroyed while the cell is still live |
 | `m8_wrong_dealloc_layout` | `into_owner` frees with `Layout::new::<Owner>()` instead of the whole cell's | *rust_dealloc must be called on an object whose allocated size matches its layout* |
+| `m9_accessor_writes` | `borrow_owner` writes a byte back to the cell | the `modifies()` frame condition — **nothing else in the suite sees this** |
+| `m10_overlapping_fields` | `_field_pointers` carves both fields out of the same bytes | the disjointness clause of the `_field_pointers` contract |
+| `m11_lock_not_taken` | `MutBorrow::borrow_mut` reads the flag instead of swapping it, so the lock never latches | the `borrow_mut` contract's postcondition |
 
 `m5` is the reason `verify.sh` passes `--cbmc-args --memory-leak-check`: without
 it, an allocation that is simply never released verifies clean. `m6` is caught

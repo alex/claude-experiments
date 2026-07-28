@@ -1,0 +1,13 @@
+--- a/src/unsafe_self_cell.rs
++++ b/src/unsafe_self_cell.rs
+@@ -79,6 +79,10 @@
+     pub unsafe fn borrow_owner<'a, Dependent>(&'a self) -> &'a Owner {
+         let joined_ptr = self.joined_void_ptr.cast::<JoinedCell<Owner, Dependent>>();
+ 
++        // MUTATION M9: a read-only accessor that writes. Violates modifies().
++        let scribble = self.joined_void_ptr.as_ptr();
++        scribble.write_volatile(scribble.read_volatile());
++
+         &(*joined_ptr.as_ptr()).owner
+     }
+ 

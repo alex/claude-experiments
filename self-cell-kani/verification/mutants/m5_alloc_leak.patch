@@ -1,6 +1,6 @@
 --- a/src/unsafe_self_cell.rs
 +++ b/src/unsafe_self_cell.rs
-@@ -203,7 +203,8 @@
+@@ -263,7 +263,8 @@
          }
          impl Drop for DeallocGuard {
              fn drop(&mut self) {

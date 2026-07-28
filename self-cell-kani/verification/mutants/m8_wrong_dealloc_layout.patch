@@ -1,6 +1,6 @@
 --- a/src/unsafe_self_cell.rs
 +++ b/src/unsafe_self_cell.rs
-@@ -114,8 +114,8 @@
+@@ -172,8 +172,8 @@
          // Must not read before dropping dependent!! (Which happened above.)
          let owner = read(owner_ptr);
  

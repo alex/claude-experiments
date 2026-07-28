@@ -45,6 +45,7 @@ pub struct UnsafeSelfCell<ContainedIn, Owner, DependentStatic: 'static> {
 }
 
 impl<ContainedIn, Owner, DependentStatic> UnsafeSelfCell<ContainedIn, Owner, DependentStatic> {
+    #[cfg_attr(kani, kani::ensures(|result| result.joined_void_ptr == joined_void_ptr))]
     pub unsafe fn new(joined_void_ptr: NonNull<u8>) -> Self {
         Self {
             joined_void_ptr,
@@ -56,18 +57,75 @@ impl<ContainedIn, Owner, DependentStatic> UnsafeSelfCell<ContainedIn, Owner, Dep
 
     // Calling any of these *unsafe* functions with the wrong Dependent type is UB.
 
+    // The `modifies()` clause below is the machine-checked form of invariant 4:
+    // reading the cell writes to nothing at all.
+    // `can_write` is the allocation-level predicate: non-null, aligned, and
+    // backed by `size_of::<JoinedCell<Owner, Dependent>>()` bytes. The stronger
+    // `can_dereference`, which would also demand the bytes form a *valid*
+    // `JoinedCell`, is unusable here -- Kani cannot check validity of a type
+    // containing an enum, and a `Dependent` is allowed to contain one. Being
+    // the weaker precondition, it makes the contract harder to satisfy, not
+    // easier.
+    #[cfg_attr(kani, kani::requires(
+        kani::mem::can_write(
+            self.joined_void_ptr.as_ptr().cast::<JoinedCell<Owner, Dependent>>()
+        )
+    ))]
+    #[cfg_attr(kani, kani::modifies())]
+    #[cfg_attr(kani, kani::ensures(|result| core::ptr::eq(
+        *result,
+        &(*self.joined_void_ptr.as_ptr().cast::<JoinedCell<Owner, Dependent>>()).owner
+    )))]
     pub unsafe fn borrow_owner<'a, Dependent>(&'a self) -> &'a Owner {
         let joined_ptr = self.joined_void_ptr.cast::<JoinedCell<Owner, Dependent>>();
 
         &(*joined_ptr.as_ptr()).owner
     }
 
+    // `can_write` is the allocation-level predicate: non-null, aligned, and
+    // backed by `size_of::<JoinedCell<Owner, Dependent>>()` bytes. The stronger
+    // `can_dereference`, which would also demand the bytes form a *valid*
+    // `JoinedCell`, is unusable here -- Kani cannot check validity of a type
+    // containing an enum, and a `Dependent` is allowed to contain one. Being
+    // the weaker precondition, it makes the contract harder to satisfy, not
+    // easier.
+    #[cfg_attr(kani, kani::requires(
+        kani::mem::can_write(
+            self.joined_void_ptr.as_ptr().cast::<JoinedCell<Owner, Dependent>>()
+        )
+    ))]
+    #[cfg_attr(kani, kani::modifies())]
+    #[cfg_attr(kani, kani::ensures(|result| core::ptr::eq(
+        *result,
+        &(*self.joined_void_ptr.as_ptr().cast::<JoinedCell<Owner, Dependent>>()).dependent
+    )))]
     pub unsafe fn borrow_dependent<'a, Dependent>(&'a self) -> &'a Dependent {
         let joined_ptr = self.joined_void_ptr.cast::<JoinedCell<Owner, Dependent>>();
 
         &(*joined_ptr.as_ptr()).dependent
     }
 
+    // Handing out `&Owner` and `&mut Dependent` at once is only sound if they
+    // address disjoint bytes, and if obtaining them writes nothing -- in
+    // particular nothing to the owner, which the dependent still points at.
+    // `can_write` is the allocation-level predicate: non-null, aligned, and
+    // backed by `size_of::<JoinedCell<Owner, Dependent>>()` bytes. The stronger
+    // `can_dereference`, which would also demand the bytes form a *valid*
+    // `JoinedCell`, is unusable here -- Kani cannot check validity of a type
+    // containing an enum, and a `Dependent` is allowed to contain one. Being
+    // the weaker precondition, it makes the contract harder to satisfy, not
+    // easier.
+    #[cfg_attr(kani, kani::requires(
+        kani::mem::can_write(
+            self.joined_void_ptr.as_ptr().cast::<JoinedCell<Owner, Dependent>>()
+        )
+    ))]
+    #[cfg_attr(kani, kani::modifies())]
+    #[cfg_attr(kani, kani::ensures(|result| {
+        let joined = self.joined_void_ptr.as_ptr().cast::<JoinedCell<Owner, Dependent>>();
+        core::ptr::eq(result.0, &(*joined).owner)
+            && core::ptr::eq(result.1 as *const Dependent, &(*joined).dependent)
+    }))]
     pub unsafe fn borrow_mut<'a, Dependent>(&'a mut self) -> (&'a Owner, &'a mut Dependent) {
         let joined_ptr = self.joined_void_ptr.cast::<JoinedCell<Owner, Dependent>>();
 
@@ -171,6 +229,8 @@ impl<T> SendMutPtr<T> {
         dealloc(self.0 as *mut u8, layout);
     }
 
+    #[cfg_attr(kani, kani::modifies())]
+    #[cfg_attr(kani, kani::ensures(|result| result.is_some() == !self.0.is_null()))]
     #[inline]
     pub fn into_non_null(self) -> Option<NonNull<T>> {
         NonNull::new(self.0)
@@ -241,6 +301,25 @@ unsafe impl<Owner: Send, Dependent> Send for OwnerAndCellDropGuard<Owner, Depend
 impl<Owner, Dependent> JoinedCell<Owner, Dependent> {
     #[doc(hidden)]
     #[cfg(not(feature = "old_rust"))]
+    // Everything else in this file is built on these two pointers, so this is
+    // where the layout obligations are stated: both land inside the allocation
+    // `this` points at, both are aligned for the type they will hold, and they
+    // never overlap -- so writing the dependent cannot disturb the owner the
+    // dependent borrows. `modifies()` records that handing out the pointers
+    // writes nothing; the memory is still uninitialised at this point.
+    #[cfg_attr(kani, kani::requires(kani::mem::can_write(this)))]
+    #[cfg_attr(kani, kani::modifies())]
+    #[cfg_attr(kani, kani::ensures(|result| {
+        let (owner_ptr, dependent_ptr) = *result;
+        kani::mem::same_allocation(this as *const u8, owner_ptr as *const u8)
+            && kani::mem::same_allocation(this as *const u8, dependent_ptr as *const u8)
+            && (owner_ptr as usize) % core::mem::align_of::<Owner>() == 0
+            && (dependent_ptr as usize) % core::mem::align_of::<Dependent>() == 0
+            && ((owner_ptr as usize).wrapping_add(core::mem::size_of::<Owner>())
+                    <= (dependent_ptr as usize)
+                || (dependent_ptr as usize).wrapping_add(core::mem::size_of::<Dependent>())
+                    <= (owner_ptr as usize))
+    }))]
     pub unsafe fn _field_pointers(this: *mut Self) -> (*mut Owner, *mut Dependent) {
         let owner_ptr = core::ptr::addr_of_mut!((*this).owner);
         let dependent_ptr = core::ptr::addr_of_mut!((*this).dependent);
@@ -251,6 +330,25 @@ impl<Owner, Dependent> JoinedCell<Owner, Dependent> {
     #[doc(hidden)]
     #[cfg(feature = "old_rust")]
     #[rustversion::since(1.51)]
+    // Everything else in this file is built on these two pointers, so this is
+    // where the layout obligations are stated: both land inside the allocation
+    // `this` points at, both are aligned for the type they will hold, and they
+    // never overlap -- so writing the dependent cannot disturb the owner the
+    // dependent borrows. `modifies()` records that handing out the pointers
+    // writes nothing; the memory is still uninitialised at this point.
+    #[cfg_attr(kani, kani::requires(kani::mem::can_write(this)))]
+    #[cfg_attr(kani, kani::modifies())]
+    #[cfg_attr(kani, kani::ensures(|result| {
+        let (owner_ptr, dependent_ptr) = *result;
+        kani::mem::same_allocation(this as *const u8, owner_ptr as *const u8)
+            && kani::mem::same_allocation(this as *const u8, dependent_ptr as *const u8)
+            && (owner_ptr as usize) % core::mem::align_of::<Owner>() == 0
+            && (dependent_ptr as usize) % core::mem::align_of::<Dependent>() == 0
+            && ((owner_ptr as usize).wrapping_add(core::mem::size_of::<Owner>())
+                    <= (dependent_ptr as usize)
+                || (dependent_ptr as usize).wrapping_add(core::mem::size_of::<Dependent>())
+                    <= (owner_ptr as usize))
+    }))]
     pub unsafe fn _field_pointers(this: *mut Self) -> (*mut Owner, *mut Dependent) {
         let owner_ptr = core::ptr::addr_of_mut!((*this).owner);
         let dependent_ptr = core::ptr::addr_of_mut!((*this).dependent);
@@ -324,6 +422,16 @@ impl<T> MutBorrow<T> {
     ///
     /// Will panic if called anywhere but in the dependent constructor. Will also panic if called
     /// more than once.
+    // The contract describes the non-panicking path: given an unlocked
+    // `MutBorrow`, the call leaves it locked -- forever, since nothing ever
+    // clears the flag -- and returns a reference to the wrapped value itself.
+    // That the *locked* path panics rather than handing out a second reference
+    // is proved separately, by the `should_panic` harnesses in the
+    // `mut_borrow` module of the verification crate.
+    #[cfg_attr(kani, kani::requires(!self.is_locked.load(Ordering::Relaxed)))]
+    #[cfg_attr(kani, kani::modifies(&self.is_locked))]
+    #[cfg_attr(kani, kani::ensures(|result| self.is_locked.load(Ordering::Relaxed)
+        && core::ptr::eq(*result as *const T, self.value.get() as *const T)))]
     #[allow(clippy::mut_from_ref)]
     pub fn borrow_mut(&self) -> &mut T {
         // Ensure this function can only be called once.
