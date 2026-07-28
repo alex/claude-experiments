@@ -50,12 +50,49 @@ On top of those, the harnesses assert the crate's own invariants.
 | `shapes` | zero-sized owner, zero-sized dependent, an owner holding its own `Box`, an owner that is itself a borrow (the macro's optional owner lifetime), and a cell where neither side has a destructor |
 | `op_sequence` | bounded-length *arbitrary* sequences of public calls, with the invariants re-checked after every step and a nondeterministic choice of `Drop` or `into_owner` at the end |
 | `async_builder` | the `async_builder` constructors, including cancellation — dropping the future mid-`await`, which is the one path that reaches the drop guard through the public API without unwinding |
+| `arbitrary_callbacks` | the same properties over *symbolic* builders and visitors rather than one hand-written closure each — see below |
 
 The instrumented owner in `tracking.rs` writes a poison canary in its
 destructor, and the dependent's destructor reads the owner through the
 self-reference. That is what makes wrong *ordering* observable and not merely
 wrong drop counts: reading a freed allocation is a Kani pointer failure, and
 reading a destroyed-but-not-freed owner trips the canary.
+
+## Quantifying over the callbacks
+
+Every entry point takes a user callback. A harness that passes one concrete
+closure proves the property for that closure, which is a weak reading of "the
+crate is correct".
+
+Kani cannot quantify over code — it model-checks one monomorphic program. But
+the quantification can be pushed down to values, because `self_cell` never
+inspects the callback: it calls it, and does the same thing with whatever comes
+back. So "for all builders" reduces to "for all things a builder could return,
+and all the ways it could get there", and that part *is* symbolic.
+`arbitrary_callbacks` makes each of those choices a `kani::any()`:
+
+* **The return value.** The dependent's scalar fields are nondeterministic.
+* **The self-reference.** A builder cannot conjure a `&'a Owner`; the only one
+  in scope is its argument. So the reachable choices are exactly three — ignore
+  the owner, keep the whole owner, keep a reference into it — and the `Anchor`
+  enum enumerates them with a symbolic choice.
+* **Control flow.** Whether a fallible builder returns `Ok` or `Err`, and which
+  error, is symbolic.
+* **Side effects.** The only state a builder can touch is the owner it was
+  handed, and only through interior mutability. How many times it writes is
+  symbolic.
+* **Visitors.** Whether `with_dependent_mut` leaves the dependent alone, edits
+  it, or replaces it wholesale — which runs the old dependent's destructor
+  inside a live cell — is symbolic, as is what it replaces it with.
+
+`every_builder_outcome_is_reachable` backs that up with `kani::cover!`: all nine
+outcomes come back SATISFIED, so no stray `assume` has quietly pruned a branch
+and left the other harnesses passing for the wrong reason.
+
+Two things stay outside even this. A callback that *panics* — no unwinding under
+Kani, so that path is covered instead by `drop_guard` and
+`async_builder::cancelling_construction_cleans_up`. And other dependent *types*:
+the quantification is over the values of a fixed type, not over the type.
 
 ## Verification is not vacuous
 

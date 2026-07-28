@@ -36,6 +36,13 @@ pub fn dependent_dropped_at() -> usize {
     DEPENDENT_DROP_AT.load(Ordering::Relaxed)
 }
 
+/// Lets dependent types defined outside this module record their destruction
+/// the same way `Dependent` does.
+pub fn note_dependent_drop() {
+    DEPENDENT_DROP_COUNT.fetch_add(1, Ordering::Relaxed);
+    DEPENDENT_DROP_AT.store(tick(), Ordering::Relaxed);
+}
+
 /// Written into `Owner::canary` on construction.
 const ALIVE: u64 = 0x5e1f_ce11_a11e_0000;
 /// Written into `Owner::canary` by `Owner::drop`.

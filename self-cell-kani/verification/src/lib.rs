@@ -17,6 +17,8 @@
 mod tracking;
 
 #[cfg(kani)]
+mod arbitrary_callbacks;
+#[cfg(kani)]
 mod async_builder;
 #[cfg(kani)]
 mod construct_drop;
