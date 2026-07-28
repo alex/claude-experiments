@@ -14,6 +14,8 @@ things exactly once on every path.
 
 ## Running
 
+Verified with Kani 0.67.0 (which pins its own `nightly-2025-11-21` toolchain).
+
 ```sh
 cargo install --locked kani-verifier
 cargo kani setup
