@@ -1,6 +1,6 @@
 --- a/src/unsafe_self_cell.rs
 +++ b/src/unsafe_self_cell.rs
-@@ -437,7 +437,9 @@
+@@ -441,7 +441,9 @@
          // Ensure this function can only be called once.
          // Relaxed should be fine, because only one thread could ever read `false` anyway,
          // so further synchronization is pointless.

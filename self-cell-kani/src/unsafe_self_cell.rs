@@ -422,13 +422,17 @@ impl<T> MutBorrow<T> {
     ///
     /// Will panic if called anywhere but in the dependent constructor. Will also panic if called
     /// more than once.
-    // The contract describes the non-panicking path: given an unlocked
-    // `MutBorrow`, the call leaves it locked -- forever, since nothing ever
-    // clears the flag -- and returns a reference to the wrapped value itself.
-    // That the *locked* path panics rather than handing out a second reference
-    // is proved separately, by the `should_panic` harnesses in the
-    // `mut_borrow` module of the verification crate.
-    #[cfg_attr(kani, kani::requires(!self.is_locked.load(Ordering::Relaxed)))]
+    // The contract covers the returning path: if the call returns at all, it
+    // has left the `MutBorrow` locked -- forever, since nothing ever clears the
+    // flag -- and the reference it hands back is to the wrapped value itself.
+    //
+    // Deliberately no `requires(!is_locked)`. Kani asserts preconditions at
+    // call sites, so requiring an unlocked cell would fire at exactly the call
+    // sites that exist to check the locked case: the `should_panic` harnesses
+    // in the verification crate's `mut_borrow` module would then pass on a
+    // precondition violation instead of on the panic they are there to prove.
+    // Without it, a locked call simply panics and never reaches `ensures`, so
+    // the two proofs stay separate and each proves its own half.
     #[cfg_attr(kani, kani::modifies(&self.is_locked))]
     #[cfg_attr(kani, kani::ensures(|result| self.is_locked.load(Ordering::Relaxed)
         && core::ptr::eq(*result as *const T, self.value.get() as *const T)))]

@@ -88,10 +88,18 @@ either side.
 
 The rest: `UnsafeSelfCell::new` stores the pointer it was given,
 `SendMutPtr::into_non_null` is `Some` exactly when the pointer is non-null, and
-`MutBorrow::borrow_mut` — given an unlocked cell — leaves it locked and returns
-a reference to the wrapped value itself. That last contract describes only the
-non-panicking path; that the *locked* path panics rather than aliasing is proved
-separately by the `should_panic` harnesses in `mut_borrow`.
+`MutBorrow::borrow_mut` — if it returns at all — has left the cell locked and
+hands back a reference to the wrapped value itself.
+
+That last one deliberately has *no* `requires(!is_locked)`, and the reason is a
+trap worth recording. Kani asserts preconditions at call sites, so requiring an
+unlocked cell fires at exactly the call sites that exist to check the locked
+case: the `should_panic` harnesses in `mut_borrow` then pass on a precondition
+violation instead of on the panic they are there to prove. Adding that
+precondition silently hollowed out four existing proofs, and the only visible
+symptom was which check name appeared in the output. Without it, a locked call
+panics and never reaches `ensures`, so the two proofs stay separate and each
+proves its own half.
 
 `verify.sh` passes `-Z function-contracts`, which asserts contracts at call
 sites as well. So the `modifies()` clauses are checked in all 71 harnesses, not
