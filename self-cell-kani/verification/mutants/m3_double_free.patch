@@ -1,0 +1,13 @@
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -760,9 +760,7 @@
+                 // And err can't return a reference to owner.
+                 let owner_on_err = owner_ptr_send.read();
+ 
+-                // Allowing drop_guard to finish would let it double free owner.
+-                // So we dealloc the JoinedCell here manually.
+-                ::core::mem::forget(drop_guard);
++                // MUTATION M3: the drop guard is left armed.
+ 
+                 // SAFETY: This is a kind of write to the pointer, which is Send because we are the
+                 // only ones with access to it.

@@ -1,0 +1,20 @@
+--- a/src/unsafe_self_cell.rs
++++ b/src/unsafe_self_cell.rs
+@@ -103,11 +103,13 @@
+         // In case drop_in_place(...dependent) fails
+         let drop_guard = OwnerAndCellDropGuard::new(joined_ptr);
+ 
+-        // Drop dependent
+-        drop_in_place(&mut (*joined_ptr.as_ptr()).dependent);
+-
++        // MUTATION M2: free the allocation before running the dependent's dtor.
+         mem::forget(drop_guard);
+-
++        let owner = read(&(*joined_ptr.as_ptr()).owner as *const Owner);
++        dealloc(self.joined_void_ptr.as_ptr(), Layout::new::<JoinedCell<Owner, Dependent>>());
++        drop_in_place(&mut (*joined_ptr.as_ptr()).dependent);
++        return owner;
++        #[allow(unreachable_code)]
+         let owner_ptr: *const Owner = &(*joined_ptr.as_ptr()).owner;
+ 
+         // Move owner out so it can be returned.
