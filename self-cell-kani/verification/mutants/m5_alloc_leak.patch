@@ -1,0 +1,12 @@
+--- a/src/unsafe_self_cell.rs
++++ b/src/unsafe_self_cell.rs
+@@ -263,7 +263,8 @@
+         }
+         impl Drop for DeallocGuard {
+             fn drop(&mut self) {
+-                unsafe { dealloc(self.ptr, self.layout) }
++                // MUTATION M5: destructors still run, the memory is never freed.
++                let _ = (self.ptr, self.layout);
+             }
+         }
+ 

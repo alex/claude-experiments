@@ -1,0 +1,19 @@
+--- a/src/unsafe_self_cell.rs
++++ b/src/unsafe_self_cell.rs
+@@ -142,13 +142,10 @@
+     pub unsafe fn drop_joined<Dependent>(&mut self) {
+         let joined_ptr = self.joined_void_ptr.cast::<JoinedCell<Owner, Dependent>>();
+ 
+-        // Also used in case drop_in_place(...dependent) fails
+-        let _guard = OwnerAndCellDropGuard { joined_ptr };
+-
+-        // IMPORTANT dependent must be dropped before owner.
+-        // We don't want to rely on an implicit order of struct fields.
+-        // So we drop the struct, field by field manually.
++        // MUTATION M1: owner dropped before dependent.
++        drop_in_place(&mut (*joined_ptr.as_ptr()).owner);
+         drop_in_place(&mut (*joined_ptr.as_ptr()).dependent);
++        dealloc(joined_ptr.as_ptr() as *mut u8, Layout::new::<JoinedCell<Owner, Dependent>>());
+ 
+         // Dropping owner
+         // and deallocating

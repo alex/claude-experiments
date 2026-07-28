@@ -1,0 +1,11 @@
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -653,7 +653,7 @@
+             ::core::result::Result::Ok(dependent) => {
+                 dependent_ptr_send.write(dependent);
+ 
+-                ::core::mem::forget(drop_guard);
++                // MUTATION M7: the guard is left armed on the success path.
+ 
+                 ::core::result::Result::Ok(Self {
+                     unsafe_self_cell: $crate::unsafe_self_cell::UnsafeSelfCell::new(

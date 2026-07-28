@@ -1,0 +1,14 @@
+[package]
+name = "self_cell_verification"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# Kani proof harnesses for the `self_cell` crate. Kept in a separate crate so
+# that the imported `self_cell` source stays byte-for-byte identical to
+# upstream.
+
+[dependencies]
+self_cell = { path = ".." }
+
+[workspace]

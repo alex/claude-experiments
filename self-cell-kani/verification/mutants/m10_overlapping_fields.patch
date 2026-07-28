@@ -1,0 +1,13 @@
+--- a/src/unsafe_self_cell.rs
++++ b/src/unsafe_self_cell.rs
+@@ -322,7 +322,9 @@
+     }))]
+     pub unsafe fn _field_pointers(this: *mut Self) -> (*mut Owner, *mut Dependent) {
+         let owner_ptr = core::ptr::addr_of_mut!((*this).owner);
+-        let dependent_ptr = core::ptr::addr_of_mut!((*this).dependent);
++
++        // MUTATION M10: both fields carved out of the same bytes.
++        let dependent_ptr = owner_ptr as *mut Dependent;
+ 
+         (owner_ptr, dependent_ptr)
+     }
