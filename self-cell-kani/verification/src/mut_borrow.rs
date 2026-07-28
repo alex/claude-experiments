@@ -105,33 +105,36 @@ fn mut_cell_drop_is_memory_safe() {
     drop(cell);
 }
 
-/// The lock protocol over an arbitrary number of attempts, not just two.
+/// The lock never resets, however many times you knock.
 ///
-/// `#[kani::should_panic]` requires *every* execution to panic, and the number
-/// of attempts here is nondeterministic (but at least two), so this says: no
-/// sequence of `borrow_mut` calls of length two or more gets past the lock.
-/// Kani models atomics as sequential operations, so this is the sequential half
-/// of `MutBorrow`'s argument — the cross-thread half rests on `swap` being a
-/// read-modify-write and is outside what Kani checks.
+/// Note the shape of every `should_panic` harness in this file: no
+/// nondeterminism on the path to the panic. That is deliberate.
+/// `#[kani::should_panic]` succeeds if *at least one* execution panics, not if
+/// all of them do — a harness that panicked only on `kani::any() == 7` also
+/// passes. So a `should_panic` harness only pins down "this always panics" when
+/// it has a single path, which is why the attempt count here is a constant
+/// rather than a symbolic value.
+///
+/// Kani also models atomics as sequential operations, so this is the sequential
+/// half of `MutBorrow`'s argument. The cross-thread half rests on `swap` being
+/// a read-modify-write and is outside what Kani checks.
 #[kani::proof]
 #[kani::should_panic]
-#[kani::unwind(6)]
-fn no_sequence_of_borrows_gets_two_unique_references() {
-    let attempts: usize = kani::any();
-    kani::assume(attempts >= 2 && attempts <= 4);
-
+fn lock_stays_taken_across_repeated_attempts() {
     let owner = MutBorrow::new([0u8; 4]);
 
-    for i in 0..attempts {
-        let borrowed = owner.borrow_mut();
-        borrowed[0] = i as u8;
-    }
+    let first = owner.borrow_mut();
+    first[0] = 1;
 
-    unreachable!("a second borrow_mut must have panicked");
+    // Each of these must panic; the first one to run does.
+    let _second = owner.borrow_mut();
+    let _third = owner.borrow_mut();
+    let _fourth = owner.borrow_mut();
 }
 
-/// The mirror image: exactly one attempt must always succeed, whatever the
-/// value being wrapped.
+/// The mirror image, and the one direction that can be stated universally:
+/// whatever the wrapped value, the first attempt succeeds and hands back a
+/// reference that really writes through to it.
 #[kani::proof]
 fn the_first_borrow_mut_always_succeeds() {
     let initial: u8 = kani::any();

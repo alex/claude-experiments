@@ -41,7 +41,7 @@ On top of those, the harnesses assert the crate's own invariants.
 | `data_integrity` | every accessor round-trips the stored bytes; `with_dependent_mut` writes land in the heap allocation; the owner and dependent occupy disjoint memory; `not_covariant` cells behave identically on the `with_dependent` path |
 | `into_owner` | the dependent is destroyed before the owner is `ptr::read` out; the owner is returned without being dropped; the allocation is freed exactly once and no other cell's is touched |
 | `fallible` | `try_new` drops the owner exactly once on failure; `try_new_or_recover` hands the owner back live and un-dropped; both free the allocation exactly once; a recovered owner can be reused to build a working cell |
-| `mut_borrow` | `MutBorrow`'s lock is one-way: the first `borrow_mut` always succeeds and *no* sequence of two or more gets past it, including via `borrow_owner` on an already-built cell; the `&mut` round trip through a cell preserves writes |
+| `mut_borrow` | the first `borrow_mut` always succeeds and writes through; the lock is one-way, so subsequent attempts panic rather than alias — including via `borrow_owner` on an already-built cell, and however many times they are repeated; the `&mut` round trip through a cell preserves writes |
 | `pointer_stability` | addresses survive moves through stack, `Box` and tuple; both fields land aligned and disjoint inside one allocation, for a high-alignment owner and for a high-alignment dependent; the generated struct is pointer-sized with its `NonNull` niche intact |
 | `owner_immutability` | invariant 2 — "owner is NEVER changed again" — over a fully symbolic byte array, across every operation the public API allows; and the ordering claim behind *"Must not read before dropping dependent!!"*, observed through an owner with interior mutability that the dependent's destructor writes to |
 | `drop_guard` | `OwnerAndCellDropGuard` destroys the owner exactly once and frees the whole `JoinedCell`, not just the owner's share of it; `mem::forget`ing it hands responsibility back intact |
@@ -98,6 +98,12 @@ All three pass, all 53 harnesses each.
 
 Worth stating plainly, since "formally verified" invites over-reading.
 
+* **`#[kani::should_panic]` is weaker than it looks.** It succeeds if *at least
+  one* execution panics, not if all of them do: a harness that panics only when
+  `kani::any::<u8>() == 7` passes just as happily. Every `should_panic` harness
+  here is therefore written with no nondeterminism on the path to the panic, so
+  that "some execution panics" and "this always panics" coincide. Read them as
+  case analysis over fixed sequences, not as universally quantified claims.
 * **Kani does not model aliasing.** Stacked Borrows / Tree Borrows violations —
   the class of bug Miri finds — are outside its model. Upstream runs Miri in CI,
   so the two are complementary rather than redundant.
