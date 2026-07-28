@@ -20,8 +20,8 @@ Verified with Kani 0.67.0 (which pins its own `nightly-2025-11-21` toolchain).
 cargo install --locked kani-verifier
 cargo kani setup
 
-./verify.sh                                   # everything
-./verify.sh --harness into_owner              # a subset
+./verify.sh                                   # everything (two passes)
+./verify.sh --harness into_owner              # a subset (pass 1 only)
 ./verify.sh --randomize-layout=42             # see "Layout independence"
 
 ./mutants/run.sh                              # check the suite isn't vacuous
@@ -196,12 +196,19 @@ All three pass, all 53 harnesses each.
 
 Worth stating plainly, since "formally verified" invites over-reading.
 
-* **`#[kani::should_panic]` is weaker than it looks.** It succeeds if *at least
-  one* execution panics, not if all of them do: a harness that panics only when
-  `kani::any::<u8>() == 7` passes just as happily. Every `should_panic` harness
-  here is therefore written with no nondeterminism on the path to the panic, so
-  that "some execution panics" and "this always panics" coincide. Read them as
-  case analysis over fixed sequences, not as universally quantified claims.
+* **`#[kani::should_panic]` is weaker than it looks, twice over.** First, it
+  succeeds if *at least one* execution panics, not if all of them do: a harness
+  that panics only when `kani::any::<u8>() == 7` passes just as happily. Every
+  `should_panic` harness here is therefore written with no nondeterminism on the
+  path to the panic, so that "some execution panics" and "this always panics"
+  coincide. Read them as case analysis over fixed sequences, not as universally
+  quantified claims. Second, Kani implements an asserted contract as an ordinary
+  assertion — a panic — so under `-Z function-contracts` a *violated contract*
+  is indistinguishable from the panic the harness exists to prove. That is why
+  `verify.sh` has a second pass: the five `should_panic` harnesses are re-run
+  with `--no-assert-contracts`, leaving the real panic as their only available
+  one. Without that pass, `m11` is caught by other harnesses but is invisible to
+  the ones written for it.
 * **Kani does not model aliasing.** Stacked Borrows / Tree Borrows violations —
   the class of bug Miri finds — are outside its model. Upstream runs Miri in CI,
   so the two are complementary rather than redundant.

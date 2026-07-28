@@ -33,9 +33,9 @@ for patch in "$here"/*.patch; do
     continue
   fi
 
-  output="$("$work/$name/verification/verify.sh" 2>&1)"
-  # Anchored on the commas: a bare '0 failures' would also match '10 failures'.
-  if grep -q ', 0 failures,' <<<"$output"; then
+  # verify.sh runs more than one pass, so trust its exit status rather than
+  # trying to parse a summary line out of the output.
+  if output="$("$work/$name/verification/verify.sh" 2>&1)"; then
     echo "MUTANT $name: SURVIVED  <-- the suite does not detect this bug"
     status=1
   else
