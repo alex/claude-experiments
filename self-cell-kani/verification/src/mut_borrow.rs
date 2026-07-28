@@ -104,3 +104,43 @@ fn mut_cell_drop_is_memory_safe() {
     let cell = MutCell::new(MutBorrow::new([initial; 4]), |owner| owner.borrow_mut());
     drop(cell);
 }
+
+/// The lock protocol over an arbitrary number of attempts, not just two.
+///
+/// `#[kani::should_panic]` requires *every* execution to panic, and the number
+/// of attempts here is nondeterministic (but at least two), so this says: no
+/// sequence of `borrow_mut` calls of length two or more gets past the lock.
+/// Kani models atomics as sequential operations, so this is the sequential half
+/// of `MutBorrow`'s argument — the cross-thread half rests on `swap` being a
+/// read-modify-write and is outside what Kani checks.
+#[kani::proof]
+#[kani::should_panic]
+#[kani::unwind(6)]
+fn no_sequence_of_borrows_gets_two_unique_references() {
+    let attempts: usize = kani::any();
+    kani::assume(attempts >= 2 && attempts <= 4);
+
+    let owner = MutBorrow::new([0u8; 4]);
+
+    for i in 0..attempts {
+        let borrowed = owner.borrow_mut();
+        borrowed[0] = i as u8;
+    }
+
+    unreachable!("a second borrow_mut must have panicked");
+}
+
+/// The mirror image: exactly one attempt must always succeed, whatever the
+/// value being wrapped.
+#[kani::proof]
+fn the_first_borrow_mut_always_succeeds() {
+    let initial: u8 = kani::any();
+    let written: u8 = kani::any();
+
+    let owner = MutBorrow::new([initial; 4]);
+    owner.borrow_mut()[0] = written;
+
+    let recovered = owner.into_inner();
+    assert_eq!(recovered[0], written);
+    assert_eq!(recovered[1], initial);
+}

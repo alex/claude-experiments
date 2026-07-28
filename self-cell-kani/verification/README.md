@@ -20,6 +20,9 @@ cargo kani setup
 
 ./verify.sh                                   # everything
 ./verify.sh --harness into_owner              # a subset
+./verify.sh --randomize-layout=42             # see "Layout independence"
+
+./mutants/run.sh                              # check the suite isn't vacuous
 ```
 
 The harnesses live in a separate crate so that `../src` stays byte-for-byte
@@ -38,7 +41,7 @@ On top of those, the harnesses assert the crate's own invariants.
 | `data_integrity` | every accessor round-trips the stored bytes; `with_dependent_mut` writes land in the heap allocation; the owner and dependent occupy disjoint memory; `not_covariant` cells behave identically on the `with_dependent` path |
 | `into_owner` | the dependent is destroyed before the owner is `ptr::read` out; the owner is returned without being dropped; the allocation is freed exactly once and no other cell's is touched |
 | `fallible` | `try_new` drops the owner exactly once on failure; `try_new_or_recover` hands the owner back live and un-dropped; both free the allocation exactly once; a recovered owner can be reused to build a working cell |
-| `mut_borrow` | `MutBorrow`'s lock is one-way, so a second `borrow_mut` panics rather than aliasing — including via `borrow_owner` on an already-built cell; the `&mut` round trip through a cell preserves writes |
+| `mut_borrow` | `MutBorrow`'s lock is one-way: the first `borrow_mut` always succeeds and *no* sequence of two or more gets past it, including via `borrow_owner` on an already-built cell; the `&mut` round trip through a cell preserves writes |
 | `pointer_stability` | addresses survive moves through stack, `Box` and tuple; both fields land aligned and disjoint inside one allocation, for a high-alignment owner and for a high-alignment dependent; the generated struct is pointer-sized with its `NonNull` niche intact |
 | `owner_immutability` | invariant 2 — "owner is NEVER changed again" — over a fully symbolic byte array, across every operation the public API allows; and the ordering claim behind *"Must not read before dropping dependent!!"*, observed through an owner with interior mutability that the dependent's destructor writes to |
 | `drop_guard` | `OwnerAndCellDropGuard` destroys the owner exactly once and frees the whole `JoinedCell`, not just the owner's share of it; `mem::forget`ing it hands responsibility back intact |
@@ -71,7 +74,25 @@ re-runs the suite. All eight are detected:
 | `m8_wrong_dealloc_layout` | `into_owner` frees with `Layout::new::<Owner>()` instead of the whole cell's | *rust_dealloc must be called on an object whose allocated size matches its layout* |
 
 `m5` is the reason `verify.sh` passes `--cbmc-args --memory-leak-check`: without
-it, an allocation that is simply never released verifies clean.
+it, an allocation that is simply never released verifies clean. `m6` is caught
+by exactly one harness, `owner_immutability::into_owner_sees_the_dependents_writeback`
+— nothing else in the suite can see the difference.
+
+## Layout independence
+
+`JoinedCell<Owner, Dependent>` is `repr(Rust)`, so the compiler is free to order
+its two fields however it likes, and the crate is only correct if it never
+assumes an order — which is why it carves out field pointers with `addr_of_mut!`
+rather than by offset. `--randomize-layout=<seed>` makes rustc actually shuffle
+struct layouts, so it turns that "never assumes" into something checkable:
+
+```sh
+./verify.sh --randomize-layout=1
+./verify.sh --randomize-layout=7
+./verify.sh --randomize-layout=42
+```
+
+All three pass, all 53 harnesses each.
 
 ## Limits of this verification
 

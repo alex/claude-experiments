@@ -274,3 +274,47 @@ fn cell_without_destructors() {
 
     drop(cell);
 }
+
+// --- A dependent that owns its own allocation. ------------------------------
+
+#[derive(Debug)]
+pub struct BoxedDependent<'a> {
+    pub owner: &'a Owner,
+    pub scratch: Box<u32>,
+}
+
+self_cell!(
+    struct BoxedDependentCell {
+        owner: Owner,
+
+        #[covariant]
+        dependent: BoxedDependent,
+    }
+);
+
+/// The dependent's own heap allocation has to be released exactly once, by its
+/// destructor, before the `JoinedCell` that holds it is freed — on both the
+/// `Drop` path and the `into_owner` path.
+#[kani::proof]
+fn dependent_with_its_own_allocation() {
+    let payload: u32 = kani::any();
+    let consume: bool = kani::any();
+
+    let cell = BoxedDependentCell::new(Owner::new(payload), |owner| BoxedDependent {
+        owner,
+        scratch: Box::new(owner.payload),
+    });
+
+    assert_eq!(*cell.borrow_dependent().scratch, payload);
+
+    if consume {
+        let owner = cell.into_owner();
+        assert_eq!(owner.payload, payload);
+        assert!(owner.is_alive());
+        drop(owner);
+    } else {
+        drop(cell);
+    }
+
+    assert_eq!(tracking::owner_drop_count(), 1);
+}
