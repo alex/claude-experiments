@@ -1,0 +1,28 @@
+[build-system]
+requires = ["maturin>=1.7,<2"]
+build-backend = "maturin"
+
+[project]
+name = "pytest-rs"
+version = "0.1.0"
+description = "A pytest-compatible test runner implemented in Rust with pyo3"
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "Apache-2.0 OR BSD-3-Clause" }
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Framework :: Pytest",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Rust",
+    "Programming Language :: Python :: Free Threading :: 2 - Beta",
+    "Topic :: Software Development :: Testing",
+]
+
+[project.scripts]
+pytest-rs = "pytest_rs.__main__:main"
+
+[tool.maturin]
+features = ["pyo3/extension-module"]
+module-name = "pytest_rs._pytest_rs"
+python-source = "python"
+manifest-path = "Cargo.toml"
