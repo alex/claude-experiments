@@ -108,17 +108,25 @@ impl LockLatch {
 
     /// Block until the latch is set.
     ///
+    /// `spin` enables a bounded spin phase before blocking: worth a
+    /// futex round trip (~10us) of latency for short operations, but
+    /// actively harmful for long ones -- a spinning external thread is
+    /// an extra runnable thread competing with the pool's workers for
+    /// cores exactly while they ramp up. Callers pass a hint based on
+    /// how long recent operations took.
+    ///
     /// Every exit path ends by observing `core`, which is the setter's
     /// *final* memory access: once we return (and possibly destroy the
     /// latch) the setter is provably done touching it.
-    pub(crate) fn wait(&self) {
-        // Bounded spin: worth ~a syscall of latency on small operations.
-        for i in 0..2048u32 {
-            if self.core.load(Ordering::Acquire) {
-                return;
-            }
-            for _ in 0..(i / 64 + 1) {
-                std::hint::spin_loop();
+    pub(crate) fn wait(&self, spin: bool) {
+        if spin {
+            for i in 0..2048u32 {
+                if self.core.load(Ordering::Acquire) {
+                    return;
+                }
+                for _ in 0..(i / 64 + 1) {
+                    std::hint::spin_loop();
+                }
             }
         }
         {
@@ -215,7 +223,7 @@ impl CountLockLatch {
     }
 
     pub(crate) fn wait(&self) {
-        self.latch.wait();
+        self.latch.wait(true);
     }
 
     #[inline]

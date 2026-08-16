@@ -6,15 +6,16 @@
 //!   push/pop at one end (depth-first execution, hot caches), steals at the
 //!   other end (breadth-first stealing, coarse-grained tasks get stolen).
 //!
-//! * The hot path -- `WorkerThread::push` in `join` -- costs one deque push,
-//!   one fence, and one load of the sleeper count. No locks, no allocation.
+//! * The hot path -- `WorkerThread::push` in `join` -- costs one deque
+//!   emptiness check and one push. No fences, locks, or allocation.
 //!
-//! * Idle workers spin over all victim deques a few times, then park via a
-//!   Dekker-style handshake: register as sleepy (SeqCst RMW on the sleeper
-//!   count + per-worker state), re-scan every queue, and only then park.
-//!   Job publishers issue a `SeqCst` fence after pushing and check the
-//!   sleeper count (a single load when nobody sleeps), which closes the
-//!   store->load race in both directions.
+//! * Idle workers degrade gracefully: pause-spin sweeps, then ~100us of
+//!   yield rounds (so back-to-back operations reuse hot workers), then
+//!   bounded timed parks. Wakeups are deliberately best-effort -- pushers
+//!   only check for sleepers when their deque transitions to non-empty,
+//!   and successful thieves pay the signal forward -- with park timeouts
+//!   as the backstop, so the join hot path stays free of fences and
+//!   shared-counter traffic.
 
 use std::cell::Cell;
 use std::mem;
@@ -78,6 +79,11 @@ pub(crate) struct Registry {
     sleepers: CachePadded<AtomicUsize>,
     /// Set when the owning `ThreadPool` is dropped.
     terminating: AtomicBool,
+    /// Duration (ns) of the most recent externally-injected operation;
+    /// used to decide whether the *next* external caller should
+    /// spin-wait (short ops) or block immediately (long ops, where a
+    /// spinning caller would compete with workers for cores).
+    last_external_ns: AtomicUsize,
 }
 
 /// The terminator "latch": workers run their main loop until this probes
@@ -151,6 +157,7 @@ impl Registry {
             injected: Injector::new(),
             sleepers: CachePadded::new(AtomicUsize::new(0)),
             terminating: AtomicBool::new(false),
+            last_external_ns: AtomicUsize::new(0),
         });
 
         for (index, worker) in workers.into_iter().enumerate() {
@@ -269,6 +276,11 @@ impl Registry {
         OP: FnOnce(&WorkerThread, bool) -> R + Send,
         R: Send,
     {
+        /// Below this, recent operations count as "short": the caller
+        /// spin-waits, saving a futex round trip that would otherwise
+        /// dominate the operation's latency.
+        const SPIN_WORTHY_NS: usize = 200_000;
+
         let job = StackJob::new(
             |_| {
                 let worker_thread = WorkerThread::current();
@@ -277,8 +289,12 @@ impl Registry {
             },
             LockLatch::new(),
         );
+        let spin = self.last_external_ns.load(Ordering::Relaxed) < SPIN_WORTHY_NS;
+        let start = std::time::Instant::now();
         self.inject(job.as_job_ref());
-        job.latch.wait();
+        job.latch.wait(spin);
+        let elapsed_ns = start.elapsed().as_nanos().min(usize::MAX as u128) as usize;
+        self.last_external_ns.store(elapsed_ns, Ordering::Relaxed);
         job.into_result()
     }
 
@@ -297,6 +313,8 @@ pub(crate) struct WorkerThread {
     registry: Arc<Registry>,
     /// xorshift RNG state for selecting steal victims.
     rng: Cell<u64>,
+    /// Pushes since we last checked for sleepers (see `push`).
+    pushes_since_notify: Cell<u32>,
 }
 
 thread_local! {
@@ -340,10 +358,26 @@ impl WorkerThread {
     }
 
     /// Pushes a job onto our local deque and wakes a sleeper if needed.
+    ///
+    /// The sleeper check reads a shared counter that idle workers write,
+    /// so doing it on *every* push makes that cache line ping-pong with
+    /// the busiest loops in the system (a `join` per recursion level).
+    /// We only check when this push made the deque non-empty -- the only
+    /// moment new stealable work "appears" from a sleeper's perspective
+    /// -- plus every 64th push as a latency bound. Sleepers additionally
+    /// park with bounded timeouts, so a delayed wakeup costs at most a
+    /// short stall, never a hang.
     #[inline]
     pub(crate) unsafe fn push(&self, job: JobRef) {
+        let was_empty = self.worker.is_empty();
         self.worker.push(job);
-        self.registry.notify_work_published();
+        let pushes = self.pushes_since_notify.get() + 1;
+        if was_empty || pushes >= 64 {
+            self.pushes_since_notify.set(0);
+            self.registry.notify_work_published();
+        } else {
+            self.pushes_since_notify.set(pushes);
+        }
     }
 
     /// Pops a job off the local deque (LIFO end -- most recently pushed).
@@ -371,14 +405,28 @@ impl WorkerThread {
     /// Try to steal a job: sweep other workers' deques starting from a
     /// random victim, then the injector. Retries while any queue reports
     /// a racy `Retry`.
-    fn steal_work(&self) -> Option<JobRef> {
+    ///
+    /// **Wake cascade**: pushers only signal sleepers when their deque
+    /// *becomes* non-empty (see `push`), so thieves carry the cascade
+    /// onward: on a successful steal from a victim that still has more
+    /// work, wake another sleeper to come share it. This costs one
+    /// read-only check per successful steal (rare) instead of a shared
+    /// counter read per push (constant).
+    /// `thorough` sweeps every victim (fast response right after running
+    /// out of work); the throttled form probes a single random victim,
+    /// because a *sustained* full-speed sweep from every idle worker
+    /// bombards the busy workers' deque cache lines and measurably slows
+    /// their push/pop hot paths (each sweep read forces the owner's next
+    /// index write to re-acquire the line exclusively).
+    fn steal_work(&self, thorough: bool) -> Option<JobRef> {
         let registry = &*self.registry;
         let num_threads = registry.thread_infos.len();
         loop {
             let mut retry = false;
             if num_threads > 1 {
                 let start = (self.next_rand() >> 32) as usize % num_threads;
-                for i in 0..num_threads {
+                let attempts = if thorough { num_threads } else { 1 };
+                for i in 0..attempts {
                     let victim = start + i;
                     let victim = if victim >= num_threads {
                         victim - num_threads
@@ -388,15 +436,26 @@ impl WorkerThread {
                     if victim == self.index {
                         continue;
                     }
-                    match registry.thread_infos[victim].stealer.steal() {
-                        Steal::Success(job) => return Some(job),
+                    let stealer = &registry.thread_infos[victim].stealer;
+                    match stealer.steal() {
+                        Steal::Success(job) => {
+                            if !stealer.is_empty() {
+                                registry.notify_work_published();
+                            }
+                            return Some(job);
+                        }
                         Steal::Retry => retry = true,
                         Steal::Empty => {}
                     }
                 }
             }
             match registry.injected.steal() {
-                Steal::Success(job) => return Some(job),
+                Steal::Success(job) => {
+                    if !registry.injected.is_empty() {
+                        registry.notify_work_published();
+                    }
+                    return Some(job);
+                }
                 Steal::Retry => retry = true,
                 Steal::Empty => {}
             }
@@ -416,12 +475,20 @@ impl WorkerThread {
     pub(crate) unsafe fn wait_until<L: Probe>(&self, latch: &L) {
         let mut idle = 0u32;
         while !latch.probe() {
-            if let Some(job) = self.take_local_job().or_else(|| self.steal_work()) {
+            let job = self
+                .take_local_job()
+                .or_else(|| self.steal_work(idle < 4));
+            if let Some(job) = job {
                 self.execute(job);
                 idle = 0;
             } else {
                 idle += 1;
-                self.back_off(latch, idle);
+                if !self.back_off(latch, idle) {
+                    // Sleep aborted because work looked available: go back
+                    // to spinning for it rather than re-running the
+                    // (shared-counter RMW) sleep protocol every round.
+                    idle = Self::SPIN_ROUNDS / 2;
+                }
             }
         }
     }
@@ -429,19 +496,32 @@ impl WorkerThread {
     /// Rounds of busy-spinning (each round is a full failed steal sweep)
     /// before we start yielding the CPU.
     const SPIN_ROUNDS: u32 = 32;
-    /// Rounds of `yield_now` after spinning, before we park.
-    const YIELD_ROUNDS: u32 = 4;
+    /// Rounds of `yield_now` after spinning, before we park. Sized so the
+    /// total awake-idle window is ~100us: parallel operations issued
+    /// back-to-back (the common pattern in a parallel section of a real
+    /// program) then reuse still-hot workers instead of paying a futex
+    /// wake chain per operation.
+    const YIELD_ROUNDS: u32 = 64;
 
+    /// Returns false if a sleep attempt was aborted because work appears
+    /// to be available (caller should resume spinning).
     #[inline]
-    fn back_off<L: Probe>(&self, latch: &L, idle: u32) {
+    fn back_off<L: Probe>(&self, latch: &L, idle: u32) -> bool {
         if idle <= Self::SPIN_ROUNDS {
+            // Brief pause-spin: lowest-latency response to work appearing
+            // in the first microseconds.
             for _ in 0..(idle * 4) {
                 std::hint::spin_loop();
             }
+            true
         } else if idle <= Self::SPIN_ROUNDS + Self::YIELD_ROUNDS {
+            // Cooperative phase: yields keep us schedulable-hot for
+            // ~100us without fighting busy threads (or, on shared/virtual
+            // CPUs, the hypervisor) the way sustained pause-spinning does.
             thread::yield_now();
+            true
         } else {
-            self.sleep(latch, idle);
+            self.sleep(latch, idle)
         }
     }
 
@@ -454,10 +534,17 @@ impl WorkerThread {
     ///    why the timeout: publishers don't fence, so a wakeup can be
     ///    lost in a narrow store-buffer race; the timeout re-scan makes
     ///    that harmless).
+    /// Returns false if the sleep was aborted because work (or the latch)
+    /// became visible.
     #[cold]
-    fn sleep<L: Probe>(&self, latch: &L, idle: u32) {
+    fn sleep<L: Probe>(&self, latch: &L, idle: u32) -> bool {
         let info = self.thread_info();
         let registry = &*self.registry;
+
+        // Cheap pre-check before touching any shared-writable state.
+        if latch.probe() || self.has_local_work() || registry.any_work_visible() {
+            return false;
+        }
 
         let prev = info.swap_state(WorkerState::Sleepy, Ordering::SeqCst);
         debug_assert_eq!(prev, WorkerState::Awake);
@@ -468,7 +555,7 @@ impl WorkerThread {
             || registry.any_work_visible()
         {
             self.wake_self();
-            return;
+            return false;
         }
 
         // Commit to sleeping. A concurrent waker may have already swapped
@@ -484,20 +571,22 @@ impl WorkerThread {
             )
             .is_err()
         {
-            return;
+            return true;
         }
 
-        // First parks use a short timeout (fast recovery if a wakeup was
-        // lost while work exists); once persistently idle, back off to a
-        // long timeout -- a parked worker re-scanning every ~10ms is
-        // undetectable in CPU terms but bounds every possible race.
+        // Parks always use a bounded timeout: wakeups are best-effort by
+        // design (publishers elide notifications for cheapness), so the
+        // timeout is the backstop for any missed signal. Short at first
+        // for fast recovery, then 1ms -- a parked worker re-scanning 1000
+        // times a second is undetectable in CPU terms.
         let timeout = if idle < Self::SPIN_ROUNDS + Self::YIELD_ROUNDS + 4 {
             std::time::Duration::from_micros(50)
         } else {
-            std::time::Duration::from_millis(10)
+            std::time::Duration::from_millis(1)
         };
         thread::park_timeout(timeout);
         self.wake_self();
+        true
     }
 
     /// Transition back to Awake, decrementing the sleeper count if we were
@@ -523,6 +612,7 @@ unsafe fn main_loop(worker: Worker<JobRef>, registry: Arc<Registry>, index: usiz
         index,
         registry: Arc::clone(&registry),
         rng: Cell::new(0x9E37_79B9_7F4A_7C15_u64 ^ ((index as u64 + 1) << 32) ^ (index as u64)),
+        pushes_since_notify: Cell::new(0),
     };
     WorkerThread::set_current(&worker_thread);
 

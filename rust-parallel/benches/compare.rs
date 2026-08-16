@@ -12,22 +12,56 @@ use std::time::Instant;
 // ---------------------------------------------------------------------
 // Timing harness
 
-const TARGET_SAMPLE_MS: f64 = 25.0;
-const SAMPLES: usize = 15;
+const TARGET_SAMPLE_MS: f64 = 20.0;
+const ROUNDS: usize = 9;
 
-/// Measure median ns/iteration of `f`.
+/// Measure median ns/iteration of two competing implementations with
+/// *interleaved* sample batches (ABAB...), so drift in machine load
+/// (shared vCPUs, frequency scaling) hits both sides equally instead of
+/// whichever ran second.
+fn measure_pair<RA, RB>(mut fa: impl FnMut() -> RA, mut fb: impl FnMut() -> RB) -> (f64, f64) {
+    fn calibrate<R>(f: &mut impl FnMut() -> R) -> u64 {
+        let mut iters_done = 0u64;
+        let start = Instant::now();
+        while start.elapsed().as_millis() < 60 || iters_done < 3 {
+            black_box(f());
+            iters_done += 1;
+        }
+        let mean_ns = start.elapsed().as_nanos() as f64 / iters_done as f64;
+        ((TARGET_SAMPLE_MS * 1e6 / mean_ns).ceil() as u64).max(1)
+    }
+    fn sample<R>(f: &mut impl FnMut() -> R, inner: u64) -> f64 {
+        let t = Instant::now();
+        for _ in 0..inner {
+            black_box(f());
+        }
+        t.elapsed().as_nanos() as f64 / inner as f64
+    }
+
+    let inner_a = calibrate(&mut fa);
+    let inner_b = calibrate(&mut fb);
+    let mut samples_a = Vec::with_capacity(ROUNDS);
+    let mut samples_b = Vec::with_capacity(ROUNDS);
+    for _ in 0..ROUNDS {
+        samples_a.push(sample(&mut fa, inner_a));
+        samples_b.push(sample(&mut fb, inner_b));
+    }
+    samples_a.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    samples_b.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    (samples_a[ROUNDS / 2], samples_b[ROUNDS / 2])
+}
+
+/// Single-implementation measurement (sequential baselines).
 fn measure<R>(mut f: impl FnMut() -> R) -> f64 {
-    // Warmup + calibration: run until we've spent ~100ms, tracking mean.
     let mut iters_done = 0u64;
     let start = Instant::now();
-    while start.elapsed().as_millis() < 100 || iters_done < 3 {
+    while start.elapsed().as_millis() < 60 || iters_done < 3 {
         black_box(f());
         iters_done += 1;
     }
     let mean_ns = start.elapsed().as_nanos() as f64 / iters_done as f64;
     let inner = ((TARGET_SAMPLE_MS * 1e6 / mean_ns).ceil() as u64).max(1);
-
-    let mut samples: Vec<f64> = (0..SAMPLES)
+    let mut samples: Vec<f64> = (0..ROUNDS)
         .map(|_| {
             let t = Instant::now();
             for _ in 0..inner {
@@ -37,7 +71,7 @@ fn measure<R>(mut f: impl FnMut() -> R) -> f64 {
         })
         .collect();
     samples.sort_by(|a, b| a.partial_cmp(b).unwrap());
-    samples[SAMPLES / 2]
+    samples[ROUNDS / 2]
 }
 
 struct Row {
@@ -85,8 +119,7 @@ fn main() {
         ($name:literal, seq $seq:expr, fil $fil:expr, ray $ray:expr) => {
             if $name.contains(&filter) {
                 eprintln!("running: {}", $name);
-                let fil = measure(|| $fil);
-                let ray = measure(|| $ray);
+                let (fil, ray) = measure_pair(|| $fil, || $ray);
                 let seq = Some(measure(|| $seq));
                 rows.push(Row {
                     name: $name,
@@ -99,8 +132,7 @@ fn main() {
         ($name:literal, fil $fil:expr, ray $ray:expr) => {
             if $name.contains(&filter) {
                 eprintln!("running: {}", $name);
-                let fil = measure(|| $fil);
-                let ray = measure(|| $ray);
+                let (fil, ray) = measure_pair(|| $fil, || $ray);
                 rows.push(Row {
                     name: $name,
                     seq_ns: None,
