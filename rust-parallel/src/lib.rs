@@ -20,6 +20,7 @@ mod join;
 mod latch;
 mod registry;
 mod scope;
+mod sort;
 mod thread_pool;
 mod unwind;
 

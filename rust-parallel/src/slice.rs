@@ -68,6 +68,59 @@ pub trait ParallelSliceMut<T: Send> {
         }
     }
 
+    /// Sorts the slice in parallel, stably. Parallel merge sort with
+    /// parallel merges; allocates one scratch buffer of the slice's
+    /// size.
+    fn par_sort(&mut self)
+    where
+        T: Ord,
+    {
+        crate::sort::par_mergesort(self.as_parallel_slice_mut(), T::cmp);
+    }
+
+    /// Stable parallel sort with a comparator.
+    fn par_sort_by<F>(&mut self, compare: F)
+    where
+        F: Fn(&T, &T) -> std::cmp::Ordering + Sync,
+    {
+        crate::sort::par_mergesort(self.as_parallel_slice_mut(), compare);
+    }
+
+    /// Stable parallel sort by key.
+    fn par_sort_by_key<K, F>(&mut self, f: F)
+    where
+        K: Ord,
+        F: Fn(&T) -> K + Sync,
+    {
+        crate::sort::par_mergesort(self.as_parallel_slice_mut(), |a, b| f(a).cmp(&f(b)));
+    }
+
+    /// Sorts the slice in parallel, but not stably (equal elements may
+    /// be reordered). Parallel three-way quicksort with std's pdqsort
+    /// at the leaves.
+    fn par_sort_unstable(&mut self)
+    where
+        T: Ord,
+    {
+        crate::sort::par_quicksort(self.as_parallel_slice_mut(), T::cmp);
+    }
+
+    /// Unstable parallel sort with a comparator.
+    fn par_sort_unstable_by<F>(&mut self, compare: F)
+    where
+        F: Fn(&T, &T) -> std::cmp::Ordering + Sync,
+    {
+        crate::sort::par_quicksort(self.as_parallel_slice_mut(), compare);
+    }
+
+    /// Unstable parallel sort by key.
+    fn par_sort_unstable_by_key<K, F>(&mut self, f: F)
+    where
+        K: Ord,
+        F: Fn(&T) -> K + Sync,
+    {
+        crate::sort::par_quicksort(self.as_parallel_slice_mut(), |a, b| f(a).cmp(&f(b)));
+    }
 }
 
 impl<T: Send> ParallelSliceMut<T> for [T] {

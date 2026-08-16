@@ -350,6 +350,163 @@ fn main() {
             });
     }
 
+    // --- filter + sum (unindexed consumer path) ---
+    {
+        let v: Vec<u64> = (0..10_000_000).collect();
+        let vr = &v;
+        bench!("filter_sum_10M",
+            seq vr.iter().filter(|&&x| x % 3 == 0).sum::<u64>(),
+            fil {
+                use filament::prelude::*;
+                vr.par_iter().filter(|&&x| x % 3 == 0).sum::<u64>()
+            },
+            ray {
+                use rayon::prelude::*;
+                vr.par_iter().filter(|&&x| x % 3 == 0).sum::<u64>()
+            });
+    }
+
+    // --- filter + collect (unindexed collect: per-leaf vecs + gather) ---
+    {
+        let v: Vec<u64> = (0..2_000_000).collect();
+        let vr = &v;
+        bench!("filter_collect_2M",
+            seq vr.iter().copied().filter(|&x| x % 3 == 0).collect::<Vec<_>>(),
+            fil {
+                use filament::prelude::*;
+                vr.par_iter().copied().filter(|&x| x % 3 == 0).collect::<Vec<_>>()
+            },
+            ray {
+                use rayon::prelude::*;
+                vr.par_iter().copied().filter(|&x| x % 3 == 0).collect::<Vec<_>>()
+            });
+    }
+
+    // --- zip: dot product ---
+    {
+        let a: Vec<f64> = (0..10_000_000).map(|i| (i as f64) * 0.5).collect();
+        let b: Vec<f64> = (0..10_000_000).map(|i| (i as f64) * 0.25).collect();
+        let (ar, br) = (&a, &b);
+        bench!("dot_product_10M_f64",
+            seq ar.iter().zip(br.iter()).map(|(x, y)| x * y).sum::<f64>(),
+            fil {
+                use filament::prelude::*;
+                ar.par_iter().zip(br.par_iter()).map(|(x, y)| x * y).sum::<f64>()
+            },
+            ray {
+                use rayon::prelude::*;
+                ar.par_iter().zip(br.par_iter()).map(|(x, y)| x * y).sum::<f64>()
+            });
+    }
+
+    // --- fold: byte histogram ---
+    {
+        let data: Vec<u8> = (0..16_000_000usize).map(|i| (i.wrapping_mul(2654435761) >> 13) as u8).collect();
+        let dr = &data;
+        bench!("histogram_16M_bytes",
+            seq {
+                let mut h = [0u32; 256];
+                for &b in dr.iter() { h[b as usize] += 1; }
+                h[0]
+            },
+            fil {
+                use filament::prelude::*;
+                let h = dr.par_iter().fold(|| vec![0u32; 256], |mut h, &b| { h[b as usize] += 1; h })
+                    .reduce(|| vec![0u32; 256], |mut a, b| { for i in 0..256 { a[i] += b[i]; } a });
+                h[0]
+            },
+            ray {
+                use rayon::prelude::*;
+                let h = dr.par_iter().fold(|| vec![0u32; 256], |mut h, &b| { h[b as usize] += 1; h })
+                    .reduce(|| vec![0u32; 256], |mut a, b| { for i in 0..256 { a[i] += b[i]; } a });
+                h[0]
+            });
+    }
+
+    // --- find_any: needle midway ---
+    {
+        let v: Vec<u64> = (0..10_000_000).collect();
+        let vr = &v;
+        bench!("find_any_10M_mid",
+            seq vr.iter().find(|&&x| x == 5_000_000).copied(),
+            fil {
+                use filament::prelude::*;
+                vr.par_iter().find_any(|&&x| x == 5_000_000).copied()
+            },
+            ray {
+                use rayon::prelude::*;
+                vr.par_iter().find_any(|&&x| x == 5_000_000).copied()
+            });
+    }
+
+    // --- sorts ---
+    {
+        fn lcg_vec(n: usize, m: u64) -> Vec<u64> {
+            let mut s = 0x243F6A8885A308D3u64;
+            (0..n).map(|_| {
+                s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                (s >> 33) % m
+            }).collect()
+        }
+        let base = lcg_vec(5_000_000, u64::MAX);
+        {
+            let mut vs = base.clone(); let mut vf = base.clone(); let mut vr2 = base.clone();
+            bench!("par_sort_unstable_5M",
+                seq { vs.copy_from_slice(&base); vs.sort_unstable(); vs[0] },
+                fil {
+                    use filament::prelude::*;
+                    vf.copy_from_slice(&base); vf.par_sort_unstable(); vf[0]
+                },
+                ray {
+                    use rayon::prelude::*;
+                    vr2.copy_from_slice(&base); vr2.par_sort_unstable(); vr2[0]
+                });
+        }
+        {
+            let mut vs = base.clone(); let mut vf = base.clone(); let mut vr2 = base.clone();
+            bench!("par_sort_stable_5M",
+                seq { vs.copy_from_slice(&base); vs.sort(); vs[0] },
+                fil {
+                    use filament::prelude::*;
+                    vf.copy_from_slice(&base); vf.par_sort(); vf[0]
+                },
+                ray {
+                    use rayon::prelude::*;
+                    vr2.copy_from_slice(&base); vr2.par_sort(); vr2[0]
+                });
+        }
+        {
+            let dups = lcg_vec(5_000_000, 100);
+            let mut vs = dups.clone(); let mut vf = dups.clone(); let mut vr2 = dups.clone();
+            bench!("par_sort_unstable_5M_dups100",
+                seq { vs.copy_from_slice(&dups); vs.sort_unstable(); vs[0] },
+                fil {
+                    use filament::prelude::*;
+                    vf.copy_from_slice(&dups); vf.par_sort_unstable(); vf[0]
+                },
+                ray {
+                    use rayon::prelude::*;
+                    vr2.copy_from_slice(&dups); vr2.par_sort_unstable(); vr2[0]
+                });
+        }
+    }
+
+    // --- strings: char count over multibyte text ---
+    {
+        let text: String = "the quick brown fox jümps over the lazy dög 漢字テキスト🦀 ".repeat(200_000);
+        let tr: &str = &text;
+        bench!("count_chars_11M",
+            seq tr.chars().count(),
+            fil {
+                use filament::prelude::*;
+                tr.par_chars().count()
+            },
+            ray {
+                use rayon::prelude::*;
+                tr.par_chars().count()
+            });
+    }
+
     // ---------------------------------------------------------------
     // Report
 
