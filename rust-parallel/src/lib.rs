@@ -22,6 +22,12 @@ mod registry;
 mod thread_pool;
 mod unwind;
 
+pub mod iter;
+pub mod prelude;
+pub mod range;
+pub mod slice;
+pub mod vec;
+
 pub use join::{join, join_context, FnContext};
 pub use registry::current_num_threads;
 pub use thread_pool::{ThreadPool, ThreadPoolBuildError, ThreadPoolBuilder};
