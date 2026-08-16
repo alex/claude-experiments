@@ -19,7 +19,7 @@
 use std::cell::Cell;
 use std::mem;
 use std::ptr;
-use std::sync::atomic::{fence, AtomicBool, AtomicU8, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::thread;
 
@@ -189,15 +189,16 @@ impl Registry {
 
     /// Signal that new work is available; wake a sleeping worker if any.
     ///
-    /// The caller must have already made the work visible (pushed to a
-    /// deque or the injector). The `SeqCst` fence orders that push before
-    /// our load of `sleepers`, pairing with the sleeper's SeqCst RMW on
-    /// `sleepers` before its final queue re-scan: at least one side must
-    /// see the other, so no job can be published while a worker parks
-    /// without either the sleeper seeing the job or us seeing the sleeper.
+    /// **Hot path**: one relaxed load and a predictable branch when the
+    /// pool is saturated (no sleepers). We deliberately do *not* fence
+    /// here: a publisher whose deque push is still in its store buffer
+    /// can miss a concurrently-registering sleeper (and vice versa), a
+    /// classic Dekker store->load race. Instead of taxing every push
+    /// with a `SeqCst` fence, sleepers park with a bounded timeout and
+    /// re-scan, so the worst case for that (extremely rare) race is a
+    /// short delay rather than a lost wakeup.
     #[inline]
     pub(crate) fn notify_work_published(&self) {
-        fence(Ordering::SeqCst);
         if self.sleepers.load(Ordering::Relaxed) > 0 {
             self.wake_any_sleeper();
         }
@@ -407,30 +408,54 @@ impl WorkerThread {
     }
 
     /// Central wait loop: run jobs (local first, then stolen) until
-    /// `latch` probes true, parking when the pool runs dry.
+    /// `latch` probes true. An idle worker degrades gracefully: spin
+    /// (with a full steal sweep per round), then yield, then park with a
+    /// bounded timeout. Parking after a *single* failed sweep would cause
+    /// futex ping-pong inside every medium-sized parallel operation.
     #[inline]
     pub(crate) unsafe fn wait_until<L: Probe>(&self, latch: &L) {
+        let mut idle = 0u32;
         while !latch.probe() {
             if let Some(job) = self.take_local_job().or_else(|| self.steal_work()) {
                 self.execute(job);
+                idle = 0;
             } else {
-                self.sleep(latch);
+                idle += 1;
+                self.back_off(latch, idle);
             }
         }
     }
 
-    /// The sleep protocol. Called when a full scan found no work.
+    /// Rounds of busy-spinning (each round is a full failed steal sweep)
+    /// before we start yielding the CPU.
+    const SPIN_ROUNDS: u32 = 32;
+    /// Rounds of `yield_now` after spinning, before we park.
+    const YIELD_ROUNDS: u32 = 4;
+
+    #[inline]
+    fn back_off<L: Probe>(&self, latch: &L, idle: u32) {
+        if idle <= Self::SPIN_ROUNDS {
+            for _ in 0..(idle * 4) {
+                std::hint::spin_loop();
+            }
+        } else if idle <= Self::SPIN_ROUNDS + Self::YIELD_ROUNDS {
+            thread::yield_now();
+        } else {
+            self.sleep(latch, idle);
+        }
+    }
+
+    /// The sleep protocol. Called when repeated scans found no work.
     ///
     /// 1. Register as a sleeper (SeqCst RMWs on per-worker state and the
     ///    global count).
     /// 2. Re-check the latch and re-scan every queue.
-    /// 3. Park (unless someone already woke us).
-    ///
-    /// Publishers do: push job; SeqCst fence; check sleeper count. In any
-    /// interleaving either our re-scan (after our RMW) sees their job, or
-    /// their count-load (after their fence) sees us and they unpark us.
+    /// 3. Park with a bounded timeout (see `notify_work_published` for
+    ///    why the timeout: publishers don't fence, so a wakeup can be
+    ///    lost in a narrow store-buffer race; the timeout re-scan makes
+    ///    that harmless).
     #[cold]
-    fn sleep<L: Probe>(&self, latch: &L) {
+    fn sleep<L: Probe>(&self, latch: &L, idle: u32) {
         let info = self.thread_info();
         let registry = &*self.registry;
 
@@ -462,7 +487,16 @@ impl WorkerThread {
             return;
         }
 
-        thread::park();
+        // First parks use a short timeout (fast recovery if a wakeup was
+        // lost while work exists); once persistently idle, back off to a
+        // long timeout -- a parked worker re-scanning every ~10ms is
+        // undetectable in CPU terms but bounds every possible race.
+        let timeout = if idle < Self::SPIN_ROUNDS + Self::YIELD_ROUNDS + 4 {
+            std::time::Duration::from_micros(50)
+        } else {
+            std::time::Duration::from_millis(10)
+        };
+        thread::park_timeout(timeout);
         self.wake_self();
     }
 

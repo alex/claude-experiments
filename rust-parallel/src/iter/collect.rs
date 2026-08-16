@@ -186,6 +186,55 @@ impl<'c, T: Send + 'c> Folder<T> for CollectResult<'c, T> {
         self
     }
 
+    #[inline]
+    fn consume_iter<I>(mut self, iter: I) -> Self
+    where
+        I: IntoIterator<Item = T>,
+    {
+        /// Tracks how many items were written so they are dropped if the
+        /// source iterator panics mid-write. For non-panicking sources
+        /// LLVM sees `count` is only read on unwind paths and keeps the
+        /// hot loop's cursor in a register (this is what lets plain
+        /// `map+collect` leaves vectorize).
+        struct WriteGuard<T> {
+            start: *mut T,
+            count: usize,
+        }
+        impl<T> Drop for WriteGuard<T> {
+            fn drop(&mut self) {
+                unsafe {
+                    ptr::drop_in_place(ptr::slice_from_raw_parts_mut(self.start, self.count));
+                }
+            }
+        }
+
+        let mut iter = iter.into_iter();
+        let remaining = self.total_len - self.len;
+        unsafe {
+            let start = self.start.add(self.len).0;
+            let mut guard = WriteGuard { start, count: 0 };
+            while guard.count < remaining {
+                match iter.next() {
+                    Some(item) => {
+                        start.add(guard.count).write(item);
+                        guard.count += 1;
+                    }
+                    None => break,
+                }
+            }
+            self.len += guard.count;
+            mem::forget(guard);
+        }
+        // Anything left over would overflow our range: mirror `consume`'s
+        // bounds panic.
+        assert!(
+            iter.next().is_none(),
+            "too many values pushed to consumer; expected {}",
+            self.total_len
+        );
+        self
+    }
+
     fn complete(self) -> Self::Result {
         // NB: we don't check that the entire range was written here;
         // the reducer and the final length check catch shortfalls.

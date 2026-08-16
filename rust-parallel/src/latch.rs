@@ -84,9 +84,14 @@ impl<'r> Latch for SpinLatch<'r> {
     }
 }
 
-/// A latch for signalling an external (non-worker) thread. Purely
-/// blocking: the external thread has nothing useful to do anyway.
+/// A latch for signalling an external (non-worker) thread.
+///
+/// A fast-path atomic flag is checked with a short bounded spin before
+/// falling back to a mutex+condvar block: small parallel operations
+/// complete in a few microseconds, and eating a futex sleep+wake on
+/// every one of them would dominate their latency.
 pub(crate) struct LockLatch {
+    core: AtomicBool,
     m: Mutex<bool>,
     v: Condvar,
 }
@@ -95,29 +100,53 @@ impl LockLatch {
     #[inline]
     pub(crate) fn new() -> LockLatch {
         LockLatch {
+            core: AtomicBool::new(false),
             m: Mutex::new(false),
             v: Condvar::new(),
         }
     }
 
     /// Block until the latch is set.
+    ///
+    /// Every exit path ends by observing `core`, which is the setter's
+    /// *final* memory access: once we return (and possibly destroy the
+    /// latch) the setter is provably done touching it.
     pub(crate) fn wait(&self) {
-        let mut guard = self.m.lock().unwrap();
-        while !*guard {
-            guard = self.v.wait(guard).unwrap();
+        // Bounded spin: worth ~a syscall of latency on small operations.
+        for i in 0..2048u32 {
+            if self.core.load(Ordering::Acquire) {
+                return;
+            }
+            for _ in 0..(i / 64 + 1) {
+                std::hint::spin_loop();
+            }
+        }
+        {
+            let mut guard = self.m.lock().unwrap();
+            while !*guard {
+                guard = self.v.wait(guard).unwrap();
+            }
+        }
+        // The mutex flag is set, so the setter is past the critical
+        // section; it stores `core` immediately after releasing the lock.
+        // Spin out those last few nanoseconds.
+        while !self.core.load(Ordering::Acquire) {
+            std::hint::spin_loop();
         }
     }
 }
 
 impl Latch for LockLatch {
     unsafe fn set(this: *const Self) {
-        // Signalling under the mutex: the waiting thread cannot return
-        // from `wait()` (and hence cannot invalidate `this`) until we
-        // release the lock, and we touch nothing after releasing it.
         let this = &*this;
-        let mut guard = this.m.lock().unwrap();
-        *guard = true;
-        this.v.notify_all();
+        {
+            let mut guard = this.m.lock().unwrap();
+            *guard = true;
+            this.v.notify_all();
+        }
+        // Final access: after this store any waiter (spinning or woken)
+        // may return and invalidate `this`.
+        this.core.store(true, Ordering::Release);
     }
 }
 
