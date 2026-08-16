@@ -1,0 +1,30 @@
+[package]
+name = "filament"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "High-performance data parallelism library with rayon-style parallel iterators"
+repository = "https://github.com/alex/claude-experiments"
+keywords = ["parallel", "iterator", "join", "concurrency", "performance"]
+categories = ["concurrency"]
+
+[dependencies]
+crossbeam-deque = "0.8"
+crossbeam-utils = "0.8"
+
+[dev-dependencies]
+rayon = "1.11"
+
+[[bench]]
+name = "compare"
+harness = false
+
+[profile.bench]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
