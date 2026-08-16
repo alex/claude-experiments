@@ -111,6 +111,15 @@ impl ThreadPool {
     {
         self.install(|| crate::join(oper_a, oper_b))
     }
+
+    /// Creates a fork-join scope within this pool.
+    pub fn scope<'scope, OP, R>(&self, op: OP) -> R
+    where
+        OP: FnOnce(&crate::Scope<'scope>) -> R + Send,
+        R: Send,
+    {
+        self.install(|| crate::scope(op))
+    }
 }
 
 impl Drop for ThreadPool {

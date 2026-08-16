@@ -280,9 +280,9 @@ impl<'c, T: Send + 'c> UnindexedConsumer<T> for CollectConsumer<'c, T> {
 // //////////////////////////////////////////////////////////////////////
 // Unindexed fallback: per-leaf vectors gathered at the end.
 
-pub(super) struct ListVecConsumer;
+pub(crate) struct ListVecConsumer;
 
-pub(super) struct ListVecFolder<T> {
+pub(crate) struct ListVecFolder<T> {
     vec: Vec<T>,
 }
 
@@ -345,7 +345,7 @@ impl<T: Send> Folder<T> for ListVecFolder<T> {
     }
 }
 
-pub(super) struct ListReducer;
+pub(crate) struct ListReducer;
 
 impl<T> Reducer<std::collections::LinkedList<T>> for ListReducer {
     fn reduce(

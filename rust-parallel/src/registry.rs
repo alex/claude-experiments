@@ -330,7 +330,7 @@ impl WorkerThread {
     }
 
     #[inline]
-    fn registry_ptr(&self) -> *const Registry {
+    pub(crate) fn registry_ptr(&self) -> *const Registry {
         &*self.registry
     }
 

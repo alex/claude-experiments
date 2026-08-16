@@ -19,17 +19,23 @@ mod job;
 mod join;
 mod latch;
 mod registry;
+mod scope;
 mod thread_pool;
 mod unwind;
 
+pub mod array;
+pub mod collections;
 pub mod iter;
+pub mod option;
 pub mod prelude;
 pub mod range;
 pub mod slice;
+pub mod string;
 pub mod vec;
 
 pub use join::{join, join_context, FnContext};
 pub use registry::current_num_threads;
+pub use scope::{scope, spawn, Scope};
 pub use thread_pool::{ThreadPool, ThreadPoolBuildError, ThreadPoolBuilder};
 
 #[cfg(test)]

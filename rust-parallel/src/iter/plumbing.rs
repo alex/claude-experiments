@@ -22,6 +22,9 @@
 use crate::join_context;
 use crate::registry::current_num_threads;
 
+/// Initial split budget multiplier (leaves ~= 2^ceil(log2(threads * this))).
+const SPLITS_PER_THREAD: usize = 2;
+
 /// The `ProducerCallback` trait is a kind of generic closure,
 /// analogous to `FnOnce`, that is called back with the producer built
 /// by [`IndexedParallelIterator::with_producer`]. This continuation style
@@ -172,7 +175,7 @@ impl Splitter {
     #[inline]
     fn new() -> Splitter {
         Splitter {
-            splits: current_num_threads(),
+            splits: current_num_threads() * SPLITS_PER_THREAD,
         }
     }
 

@@ -67,6 +67,7 @@ pub trait ParallelSliceMut<T: Send> {
             slice: self.as_parallel_slice_mut(),
         }
     }
+
 }
 
 impl<T: Send> ParallelSliceMut<T> for [T] {

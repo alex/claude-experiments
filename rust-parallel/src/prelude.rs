@@ -13,4 +13,5 @@ pub use crate::iter::IntoParallelRefMutIterator;
 pub use crate::iter::ParallelExtend;
 pub use crate::iter::ParallelIterator;
 pub use crate::slice::ParallelSlice;
+pub use crate::string::ParallelString;
 pub use crate::slice::ParallelSliceMut;
