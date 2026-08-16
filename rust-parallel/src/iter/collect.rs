@@ -20,6 +20,9 @@ use super::{IndexedParallelIterator, IntoParallelIterator, ParallelExtend, Paral
 struct SendPtr<T>(*mut T);
 
 unsafe impl<T: Send> Send for SendPtr<T> {}
+// Sharing the pointer across the gather's `for_each` closures is safe:
+// each closure writes a disjoint range.
+unsafe impl<T: Send> Sync for SendPtr<T> {}
 
 impl<T> SendPtr<T> {
     #[inline]
@@ -361,6 +364,10 @@ impl<T> Reducer<std::collections::LinkedList<T>> for ListReducer {
 // //////////////////////////////////////////////////////////////////////
 // Vec integration
 
+/// Below this many total items the final gather is a plain sequential
+/// append (the parallel dispatch wouldn't pay for itself).
+const PARALLEL_GATHER_MIN: usize = 1 << 16;
+
 impl<T: Send> ParallelExtend<T> for Vec<T> {
     fn par_extend<I>(&mut self, par_iter: I)
     where
@@ -373,11 +380,41 @@ impl<T: Send> ParallelExtend<T> for Vec<T> {
                 special_extend(par_iter, len, self);
             }
             None => {
-                // Fold into per-leaf vectors, then append them.
+                // Fold into per-leaf vectors; then gather. Once the fold
+                // is done every leaf's offset is known, so the gather
+                // itself can be a parallel move.
                 let list = par_iter.drive_unindexed(ListVecConsumer);
-                self.reserve(list.iter().map(Vec::len).sum());
-                for mut other in list {
-                    self.append(&mut other);
+                let total = list.iter().map(Vec::len).sum();
+                self.reserve(total);
+
+                if total < PARALLEL_GATHER_MIN {
+                    for mut other in list {
+                        self.append(&mut other);
+                    }
+                    return;
+                }
+
+                let start = self.len();
+                let base = SendPtr(unsafe { self.as_mut_ptr().add(start) });
+                let mut chunks: Vec<(usize, Vec<T>)> = Vec::new();
+                let mut offset = 0usize;
+                for vec in list {
+                    let o = offset;
+                    offset += vec.len();
+                    chunks.push((o, vec));
+                }
+                // Move each leaf vector's contents to its final position.
+                // The closure has no user code, so it cannot panic; even
+                // if the driver itself did, un-copied sources still own
+                // their items and copied duplicates are never dropped by
+                // the target (its len is only set after full completion).
+                chunks.into_par_iter().for_each(|(o, mut src)| unsafe {
+                    let n = src.len();
+                    ptr::copy_nonoverlapping(src.as_ptr(), base.add(o).0, n);
+                    src.set_len(0); // items moved out; Vec frees only its buffer
+                });
+                unsafe {
+                    self.set_len(start + total);
                 }
             }
         }

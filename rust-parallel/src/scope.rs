@@ -109,8 +109,7 @@ impl<'scope> Scope<'scope> {
         let job_ref = unsafe { job.into_job_ref() };
         unsafe {
             let worker = WorkerThread::current();
-            if !worker.is_null() && (*worker).registry_ptr() == &*self.registry as *const Registry
-            {
+            if !worker.is_null() && ptr::eq((*worker).registry_ptr(), &*self.registry) {
                 (*worker).push(job_ref);
             } else {
                 self.registry.inject(job_ref);

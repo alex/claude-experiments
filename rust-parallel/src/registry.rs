@@ -261,7 +261,7 @@ impl Registry {
             let worker_thread = WorkerThread::current();
             if worker_thread.is_null() {
                 self.in_worker_cold(op)
-            } else if (*worker_thread).registry_ptr() != self as *const Registry {
+            } else if !ptr::eq((*worker_thread).registry_ptr(), self) {
                 // Worker of a *different* pool: inject into ours and block.
                 self.in_worker_cold(op)
             } else {

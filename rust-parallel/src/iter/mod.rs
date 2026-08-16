@@ -426,7 +426,7 @@ pub trait ParallelIterator: Sized + Send {
     where
         P: Fn(Self::Item) -> bool + Sync + Send,
     {
-        !self.map(predicate).find_any(|&p| !p).is_some()
+        self.map(predicate).find_any(|&p| !p).is_none()
     }
 }
 

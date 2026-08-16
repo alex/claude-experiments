@@ -259,3 +259,51 @@ fn works_from_worker_thread_context() {
     assert_eq!(v.len(), 10_000);
     assert_eq!(v[100], 10_000);
 }
+
+#[test]
+fn unindexed_collect_parallel_gather_drop_safety() {
+    // >64k items so the parallel-gather path (not sequential append) runs;
+    // drop-sensitive type so any double-move or missed move is caught.
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    let drops = Arc::new(AtomicUsize::new(0));
+    struct D(u64, Arc<AtomicUsize>);
+    impl Drop for D {
+        fn drop(&mut self) {
+            self.1.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+    let n = 300_000u64;
+    {
+        let collected: Vec<D> = (0..n)
+            .into_par_iter()
+            .filter(|&x| x % 3 != 0)
+            .map(|x| D(x, drops.clone()))
+            .collect();
+        let expected = (0..n).filter(|&x| x % 3 != 0).count();
+        assert_eq!(collected.len(), expected);
+        // Values intact and unique.
+        let mut vals: Vec<u64> = collected.iter().map(|d| d.0).collect();
+        vals.sort_unstable();
+        vals.dedup();
+        assert_eq!(vals.len(), expected);
+        assert_eq!(drops.load(Ordering::Relaxed), 0, "premature drops");
+    }
+    let expected = (0..n).filter(|&x| x % 3 != 0).count();
+    assert_eq!(drops.load(Ordering::Relaxed), expected, "each item dropped exactly once");
+}
+
+#[test]
+fn unindexed_collect_string_gather() {
+    let v: Vec<String> = (0..200_000u32)
+        .into_par_iter()
+        .filter(|&x| x % 2 == 0)
+        .map(|x| x.to_string())
+        .collect();
+    assert_eq!(v.len(), 100_000);
+    let mut sorted_v: Vec<u32> = v.iter().map(|s| s.parse().unwrap()).collect();
+    sorted_v.sort_unstable();
+    for (i, x) in sorted_v.iter().enumerate() {
+        assert_eq!(*x, i as u32 * 2);
+    }
+}
