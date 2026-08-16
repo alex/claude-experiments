@@ -10,12 +10,17 @@
 //!   emptiness check and one push. No fences, locks, or allocation.
 //!
 //! * Idle workers degrade gracefully: pause-spin sweeps, then ~100us of
-//!   yield rounds (so back-to-back operations reuse hot workers), then
-//!   bounded timed parks. Wakeups are deliberately best-effort -- pushers
-//!   only check for sleepers when their deque transitions to non-empty,
-//!   and successful thieves pay the signal forward -- with park timeouts
-//!   as the backstop, so the join hot path stays free of fences and
-//!   shared-counter traffic.
+//!   yield rounds (so back-to-back operations reuse hot workers), then an
+//!   exponential park ladder (50us x4, 1ms..128ms) ending in an
+//!   *indefinite* park -- a long-idle pool costs zero CPU. Wakeups are
+//!   best-effort on the timed tiers -- pushers only check for sleepers
+//!   when their deque transitions to non-empty, and successful thieves
+//!   pay the signal forward -- keeping the join hot path free of fences
+//!   and shared-counter traffic; the indefinite tier closes the wakeup
+//!   race with a registered double-scan before committing (see `sleep`).
+//!   Workers whose previous idle episode ended parked skip the spin/yield
+//!   burn entirely (adaptive spinning), so intermittent light load doesn't
+//!   pay ~100us of busy-wait per operation per worker.
 
 use std::cell::Cell;
 use std::mem;
@@ -201,9 +206,9 @@ impl Registry {
     /// here: a publisher whose deque push is still in its store buffer
     /// can miss a concurrently-registering sleeper (and vice versa), a
     /// classic Dekker store->load race. Instead of taxing every push
-    /// with a `SeqCst` fence, sleepers park with a bounded timeout and
-    /// re-scan, so the worst case for that (extremely rare) race is a
-    /// short delay rather than a lost wakeup.
+    /// with a `SeqCst` fence, timed-tier sleepers re-scan on timeout (a
+    /// missed signal costs a short delay, never a hang) and the
+    /// indefinite tier double-scans while registered before parking.
     #[inline]
     pub(crate) fn notify_work_published(&self) {
         if self.sleepers.load(Ordering::Relaxed) > 0 {
@@ -315,6 +320,10 @@ pub(crate) struct WorkerThread {
     rng: Cell<u64>,
     /// Pushes since we last checked for sleepers (see `push`).
     pushes_since_notify: Cell<u32>,
+    /// Whether the previous idle episode found work before reaching the
+    /// park ladder (adaptive spinning: fruitless episodes skip the
+    /// spin/yield burn next time).
+    spin_worthwhile: Cell<bool>,
 }
 
 thread_local! {
@@ -468,9 +477,14 @@ impl WorkerThread {
 
     /// Central wait loop: run jobs (local first, then stolen) until
     /// `latch` probes true. An idle worker degrades gracefully: spin
-    /// (with a full steal sweep per round), then yield, then park with a
-    /// bounded timeout. Parking after a *single* failed sweep would cause
-    /// futex ping-pong inside every medium-sized parallel operation.
+    /// (with a full steal sweep per round), then yield, then park on an
+    /// exponential timeout ladder, and finally park *indefinitely* -- a
+    /// long-idle pool burns zero CPU. Parking after a single failed
+    /// sweep would cause futex ping-pong inside every medium-sized
+    /// parallel operation; conversely, spinning is skipped entirely when
+    /// the previous idle episode ended in parking anyway (adaptive
+    /// spinning: under intermittent load, wakeups come from the wake
+    /// protocol, not from polling, so the spin burn buys nothing).
     #[inline]
     pub(crate) unsafe fn wait_until<L: Probe>(&self, latch: &L) {
         let mut idle = 0u32;
@@ -479,10 +493,24 @@ impl WorkerThread {
                 .take_local_job()
                 .or_else(|| self.steal_work(idle < 4));
             if let Some(job) = job {
+                if idle > 0 {
+                    // Work arrived while we were still in the cheap
+                    // (pre-ladder) phase? Then staying hot paid off.
+                    self.spin_worthwhile
+                        .set(idle <= Self::SPIN_ROUNDS + Self::YIELD_ROUNDS + Self::SHORT_PARKS);
+                }
                 self.execute(job);
                 idle = 0;
             } else {
-                idle += 1;
+                if idle == 0 && !self.spin_worthwhile.get() {
+                    // Last episode ended parked: skip the spin/yield burn
+                    // *and* the 50us-park tier, straight to millisecond
+                    // parks. Cheap because parked workers are woken by
+                    // unpark, not by their timeouts -- the timeout is only
+                    // the missed-signal backstop.
+                    idle = Self::SPIN_ROUNDS + Self::YIELD_ROUNDS + Self::SHORT_PARKS;
+                }
+                idle = idle.saturating_add(1);
                 if !self.back_off(latch, idle) {
                     // Sleep aborted because work looked available: go back
                     // to spinning for it rather than re-running the
@@ -502,6 +530,12 @@ impl WorkerThread {
     /// program) then reuse still-hot workers instead of paying a futex
     /// wake chain per operation.
     const YIELD_ROUNDS: u32 = 64;
+    /// Number of 50us parks (fast recovery tier) before the exponential
+    /// ladder starts.
+    const SHORT_PARKS: u32 = 4;
+    /// Parks on the exponential ladder (1ms, 2ms, ... 128ms). Beyond the
+    /// ladder a worker parks indefinitely and costs nothing until woken.
+    const LADDER_PARKS: u32 = 8;
 
     /// Returns false if a sleep attempt was aborted because work appears
     /// to be available (caller should resume spinning).
@@ -536,6 +570,22 @@ impl WorkerThread {
     ///    that harmless).
     /// Returns false if the sleep was aborted because work (or the latch)
     /// became visible.
+    ///
+    /// Park ladder: 4 x 50us (fast recovery for briefly-idle pools), then
+    /// 1ms..128ms doubling (bounds the cost of any wakeup the best-effort
+    /// publishers elided), then **indefinite** -- a fully idle pool costs
+    /// zero CPU and zero wakeups until the wake protocol unparks it.
+    ///
+    /// The timed tiers are self-backstopping: a missed signal costs at
+    /// most the current timeout. The indefinite tier cannot rely on that,
+    /// so it closes the store->load race directly: after registering as
+    /// a sleeper (SeqCst RMW) we scan, wait ~10us -- orders of magnitude
+    /// longer than any store buffer takes to drain, which is the only
+    /// window in which a publisher can both miss our registration and
+    /// have its push invisible to us -- and scan again before committing
+    /// to the park. Any publisher that read a stale sleeper count issued
+    /// its push before our registration became visible, so the second
+    /// scan is guaranteed to see that push on real hardware.
     #[cold]
     fn sleep<L: Probe>(&self, latch: &L, idle: u32) -> bool {
         let info = self.thread_info();
@@ -558,6 +608,34 @@ impl WorkerThread {
             return false;
         }
 
+        // Which park tier are we on?
+        let parks = idle.saturating_sub(Self::SPIN_ROUNDS + Self::YIELD_ROUNDS);
+        let timeout = if parks <= Self::SHORT_PARKS {
+            Some(std::time::Duration::from_micros(50))
+        } else if parks <= Self::SHORT_PARKS + Self::LADDER_PARKS {
+            let exp = (parks - Self::SHORT_PARKS - 1).min(7);
+            Some(std::time::Duration::from_millis(1 << exp))
+        } else {
+            None
+        };
+
+        if timeout.is_none() {
+            // Deep-sleep grace: give any in-flight publisher store many
+            // orders of magnitude longer than a store buffer can hold it,
+            // then take one final registered look.
+            for _ in 0..4096 {
+                std::hint::spin_loop();
+            }
+            if latch.probe()
+                || registry.terminating.load(Ordering::Acquire)
+                || self.has_local_work()
+                || registry.any_work_visible()
+            {
+                self.wake_self();
+                return false;
+            }
+        }
+
         // Commit to sleeping. A concurrent waker may have already swapped
         // us back to Awake (and decremented the count) -- in that case just
         // return; the banked unpark permit is harmless.
@@ -574,17 +652,13 @@ impl WorkerThread {
             return true;
         }
 
-        // Parks always use a bounded timeout: wakeups are best-effort by
-        // design (publishers elide notifications for cheapness), so the
-        // timeout is the backstop for any missed signal. Short at first
-        // for fast recovery, then 1ms -- a parked worker re-scanning 1000
-        // times a second is undetectable in CPU terms.
-        let timeout = if idle < Self::SPIN_ROUNDS + Self::YIELD_ROUNDS + 4 {
-            std::time::Duration::from_micros(50)
-        } else {
-            std::time::Duration::from_millis(1)
-        };
-        thread::park_timeout(timeout);
+        match timeout {
+            Some(t) => thread::park_timeout(t),
+            // May return spuriously (std allows it); the wait loop simply
+            // re-scans and re-parks, so correctness never depends on how
+            // long a park lasts.
+            None => thread::park(),
+        }
         self.wake_self();
         true
     }
@@ -613,6 +687,7 @@ unsafe fn main_loop(worker: Worker<JobRef>, registry: Arc<Registry>, index: usiz
         registry: Arc::clone(&registry),
         rng: Cell::new(0x9E37_79B9_7F4A_7C15_u64 ^ ((index as u64 + 1) << 32) ^ (index as u64)),
         pushes_since_notify: Cell::new(0),
+        spin_worthwhile: Cell::new(true),
     };
     WorkerThread::set_current(&worker_thread);
 

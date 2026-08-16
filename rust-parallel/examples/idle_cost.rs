@@ -27,6 +27,7 @@ fn thread_stats(prefix: &str) -> (u64, u64) {
 }
 
 fn main() {
+    let mode = std::env::args().nth(2).unwrap_or_else(|| "idle".into());
     let which = std::env::args().nth(1).unwrap_or_else(|| "fil".into());
     let (prefix, op): (&str, Box<dyn Fn()>) = if which == "fil" {
         ("filament-worker", Box::new(|| { filament::join(|| (), || ()); }))
@@ -34,6 +35,30 @@ fn main() {
         ("idle_cost", Box::new(|| { rayon::join(|| (), || ()); })) // rayon threads inherit binary name
     };
     op(); // force pool creation + one op
+
+    if mode == "trickle" {
+        // Intermittent load: a small op every 10ms (the scenario from
+        // rayon PR #1314, where all idle workers spin per wakeup).
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        let (t0, s0) = thread_stats(prefix);
+        let window = std::time::Duration::from_secs(5);
+        let start = std::time::Instant::now();
+        let mut ops = 0u64;
+        while start.elapsed() < window {
+            op();
+            ops += 1;
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let (t1, s1) = thread_stats(prefix);
+        let cpu_ms = (t1 - t0) as f64 * 10.0;
+        println!(
+            "{which} trickle: {} tiny ops over {}s: {:.0}ms worker CPU ({:.2}% of one core), {} ctx switches ({:.0}/sec)",
+            ops, window.as_secs(), cpu_ms, 100.0 * cpu_ms / 1000.0 / window.as_secs_f64(),
+            s1 - s0, (s1 - s0) as f64 / window.as_secs_f64()
+        );
+        return;
+    }
+
     std::thread::sleep(std::time::Duration::from_millis(300)); // let workers settle
     let (t0, s0) = thread_stats(prefix);
     let quiet = std::time::Duration::from_secs(10);
