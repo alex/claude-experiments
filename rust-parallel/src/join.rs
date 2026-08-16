@@ -75,19 +75,70 @@ where
     RA: Send,
     RB: Send,
 {
+    /// Join depth beyond which the pending half is parked in the private
+    /// ring instead of the public deque. The first 8 levels of any
+    /// recursion (which includes every level of iterator-bridge
+    /// splitting) publish eagerly, exposing 2^8 stealable pieces --
+    /// plenty to saturate any pool immediately, and rayon-identical
+    /// semantics for shallow or coarse (e.g. blocking) join trees.
+    /// Deeper levels are provably fine-grained recursion, where a plain
+    /// `VecDeque` push/pop (no atomics, no pop fence) replaces ~80% of
+    /// the scheduling cost; promotion on block or on ~100us ticks bounds
+    /// how long that potential parallelism stays private.
+    const LAZY_DEPTH: u32 = 8;
+
     registry::in_worker(|worker_thread, injected| unsafe {
-        // Create the virtual wrapper for `oper_b` on our stack and push a
-        // type-erased reference onto our deque for thieves.
+        // Create the virtual wrapper for `oper_b` on our stack; a
+        // type-erased reference is published for thieves (eagerly or
+        // lazily, by depth).
         let job_b = StackJob::new(
             |migrated| oper_b(FnContext::new(migrated)),
             SpinLatch::new(worker_thread.registry(), worker_thread.index()),
         );
         let job_b_ref = job_b.as_job_ref();
         let job_b_id = job_b_ref.id();
-        worker_thread.push(job_b_ref);
+
+        // Track live join frames on this worker (panic-safely): the
+        // count decides eager vs lazy for nested joins.
+        struct DepthGuard<'a>(&'a std::cell::Cell<u32>);
+        impl<'a> Drop for DepthGuard<'a> {
+            fn drop(&mut self) {
+                self.0.set(self.0.get() - 1);
+            }
+        }
+        let depth = worker_thread.pending_joins();
+        let lazy = depth.get() >= LAZY_DEPTH;
+        depth.set(depth.get() + 1);
+        let _depth_guard = DepthGuard(depth);
+
+        if lazy {
+            worker_thread.push_private(job_b_ref);
+            worker_thread.maybe_promote_tick();
+        } else {
+            worker_thread.push(job_b_ref);
+        }
 
         // Execute `a` (while `b` is up for grabs).
         let status_a = unwind::halt_unwinding(|| oper_a(FnContext::new(injected)));
+
+        if lazy && worker_thread.pop_private_if(job_b_id) {
+            // `b` was never promoted: it existed only in this thread's
+            // private ring, so no other thread can have touched it. Run
+            // it inline -- the entire join cost was two ring operations.
+            match status_a {
+                Ok(result_a) => {
+                    let result_b = job_b.run_inline(injected);
+                    return (result_a, result_b);
+                }
+                Err(panic_a) => {
+                    drop(job_b);
+                    unwind::resume_unwinding(panic_a);
+                }
+            }
+        }
+        // Otherwise `b` is on the public deque (pushed eagerly, or
+        // promoted while `a` blocked or a tick fired): fall through to
+        // the pop-or-steal-wait protocol.
 
         // Now try to pop `b` back off our deque: in the common (unstolen)
         // case this succeeds and we run it inline with zero further

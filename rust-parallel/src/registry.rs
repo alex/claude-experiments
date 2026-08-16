@@ -22,9 +22,11 @@
 //!   burn entirely (adaptive spinning), so intermittent light load doesn't
 //!   pay ~100us of busy-wait per operation per worker.
 
-use std::cell::Cell;
+use std::cell::{Cell, UnsafeCell};
+use std::collections::VecDeque;
 use std::mem;
 use std::ptr;
+use std::time::{Duration, Instant};
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::thread;
@@ -324,6 +326,18 @@ pub(crate) struct WorkerThread {
     /// park ladder (adaptive spinning: fruitless episodes skip the
     /// spin/yield burn next time).
     spin_worthwhile: Cell<bool>,
+    /// Number of `join` frames currently on this worker's stack; used to
+    /// decide eager vs lazy publication (see `join_context`).
+    pending_joins: Cell<u32>,
+    /// Privately-held pending jobs from deep (lazy) joins: pushed and
+    /// popped with zero atomics, and only *promoted* to the public deque
+    /// when this worker blocks or a promotion tick fires. Owner-thread
+    /// access only.
+    private_jobs: UnsafeCell<VecDeque<JobRef>>,
+    /// Lazy joins since the last promotion-tick clock check.
+    joins_since_tick: Cell<u32>,
+    /// When the last promotion tick fired.
+    last_promotion: Cell<Instant>,
 }
 
 thread_local! {
@@ -393,6 +407,74 @@ impl WorkerThread {
     #[inline]
     pub(crate) fn take_local_job(&self) -> Option<JobRef> {
         self.worker.pop()
+    }
+
+    // ---- Lazy (private) job publication -------------------------------
+    //
+    // Deep joins park their pending half here instead of on the public
+    // deque: a plain VecDeque push/pop with no atomics. Everything in the
+    // ring is *potential* parallelism that other threads cannot yet see;
+    // the two promotion points below bound how long it can stay hidden.
+
+    #[inline]
+    pub(crate) fn pending_joins(&self) -> &Cell<u32> {
+        &self.pending_joins
+    }
+
+    /// Safety: owner thread only (guaranteed: `&self` methods of a
+    /// `WorkerThread` are only reachable from its own thread).
+    #[inline]
+    pub(crate) unsafe fn push_private(&self, job: JobRef) {
+        (*self.private_jobs.get()).push_back(job);
+    }
+
+    /// Pops the private ring's newest entry if it is `id`; returns
+    /// whether it was (false means the entry was promoted meanwhile).
+    #[inline]
+    pub(crate) unsafe fn pop_private_if(&self, id: *const ()) -> bool {
+        let ring = &mut *self.private_jobs.get();
+        if ring.back().map(JobRef::id) == Some(id) {
+            ring.pop_back();
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Publishes every privately-held job, oldest (coarsest) first.
+    /// Called whenever this worker is about to block: if we are stalled,
+    /// our pending work must become stealable.
+    pub(crate) unsafe fn promote_all_private(&self) {
+        while let Some(job) = (*self.private_jobs.get()).pop_front() {
+            self.push(job);
+        }
+    }
+
+    /// Cheap per-lazy-join promotion check: consults the clock only every
+    /// 64 lazy joins, and promotes (at most) the single oldest private
+    /// job per ~100us tick. This bounds how long fine-grained recursion
+    /// can hoard parallelism while staying invisible on the hot path.
+    #[inline]
+    pub(crate) unsafe fn maybe_promote_tick(&self) {
+        let n = self.joins_since_tick.get() + 1;
+        if n < 64 {
+            self.joins_since_tick.set(n);
+            return;
+        }
+        self.joins_since_tick.set(0);
+        self.promote_tick_cold();
+    }
+
+    #[cold]
+    unsafe fn promote_tick_cold(&self) {
+        const TICK: Duration = Duration::from_micros(100);
+        let now = Instant::now();
+        if now.duration_since(self.last_promotion.get()) >= TICK {
+            self.last_promotion.set(now);
+            if let Some(job) = (*self.private_jobs.get()).pop_front() {
+                self.push(job);
+            }
+        }
     }
 
     #[inline]
@@ -487,6 +569,9 @@ impl WorkerThread {
     /// protocol, not from polling, so the spin burn buys nothing).
     #[inline]
     pub(crate) unsafe fn wait_until<L: Probe>(&self, latch: &L) {
+        // About to (potentially) block: anything we were hoarding
+        // privately must become stealable first.
+        self.promote_all_private();
         let mut idle = 0u32;
         while !latch.probe() {
             let job = self
@@ -688,6 +773,10 @@ unsafe fn main_loop(worker: Worker<JobRef>, registry: Arc<Registry>, index: usiz
         rng: Cell::new(0x9E37_79B9_7F4A_7C15_u64 ^ ((index as u64 + 1) << 32) ^ (index as u64)),
         pushes_since_notify: Cell::new(0),
         spin_worthwhile: Cell::new(true),
+        pending_joins: Cell::new(0),
+        private_jobs: UnsafeCell::new(VecDeque::with_capacity(64)),
+        joins_since_tick: Cell::new(0),
+        last_promotion: Cell::new(Instant::now()),
     };
     WorkerThread::set_current(&worker_thread);
 
