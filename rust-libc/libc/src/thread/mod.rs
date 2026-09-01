@@ -86,6 +86,8 @@ pub struct Tcb {
     pub tm: crate::time::Tm,
     /// Result buffer of `asctime`/`ctime`.
     pub asctime_buf: [u8; 26],
+    /// Result buffer of `ttyname`.
+    pub path_buf: [u8; 256],
     /// The thread's allocator state.
     pub heap: crate::malloc::Heap,
     /// Kernel thread id. Cleared by the kernel (and a futex wake issued)
@@ -132,6 +134,7 @@ impl Tcb {
                 strtok_save: core::ptr::null_mut(),
                 tm: crate::time::Tm::default(),
                 asctime_buf: [0; 26],
+                path_buf: [0; 256],
                 heap: crate::malloc::Heap::new(),
                 tid: AtomicU32::new(0),
                 map_base: core::ptr::null_mut(),

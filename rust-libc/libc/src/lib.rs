@@ -27,12 +27,16 @@
 #![no_builtins]
 
 pub mod arch;
+pub mod dirent;
 pub mod errno;
 pub mod exit;
 pub mod fmt;
+pub mod fs;
+pub mod getopt;
 pub mod malloc;
 pub mod misc;
 pub mod process;
+pub mod pwd;
 pub mod signal;
 pub mod start;
 pub mod stdio;

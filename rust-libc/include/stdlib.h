@@ -62,6 +62,10 @@ __NORETURN void _Exit(int);
 __NORETURN void abort(void);
 int atexit(void (*)(void));
 int system(const char *);
+char *realpath(const char *__RESTRICT, char *__RESTRICT);
+int mkstemp(char *);
+int mkostemp(char *, int);
+char *mkdtemp(char *);
 
 void *malloc(size_t);
 void *calloc(size_t, size_t);

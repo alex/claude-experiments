@@ -53,6 +53,74 @@ pid_t getsid(pid_t);
 #define SEEK_SET 0
 #define SEEK_CUR 1
 #define SEEK_END 2
+#define F_OK 0
+#define X_OK 1
+#define W_OK 2
+#define R_OK 4
+
+int access(const char *, int);
+int faccessat(int, const char *, int, int);
+int chdir(const char *);
+int fchdir(int);
+char *getcwd(char *, size_t);
+int rmdir(const char *);
+int unlink(const char *);
+int unlinkat(int, const char *, int);
+int link(const char *, const char *);
+int linkat(int, const char *, int, const char *, int);
+int symlink(const char *, const char *);
+int symlinkat(const char *, int, const char *);
+ssize_t readlink(const char *__RESTRICT, char *__RESTRICT, size_t);
+ssize_t readlinkat(int, const char *__RESTRICT, char *__RESTRICT, size_t);
+int chown(const char *, uid_t, gid_t);
+int fchown(int, uid_t, gid_t);
+int lchown(const char *, uid_t, gid_t);
+int fchownat(int, const char *, uid_t, gid_t, int);
+int truncate(const char *, off_t);
+int ftruncate(int, off_t);
+int fsync(int);
+int fdatasync(int);
+void sync(void);
+int chroot(const char *);
+int gethostname(char *, size_t);
+char *ttyname(int);
+int ttyname_r(int, char *, size_t);
+long sysconf(int);
+int getpagesize(void);
+int nice(int);
+int daemon(int, int);
+long syscall(long, ...);
+int getentropy(void *, size_t);
+char *getlogin(void);
+
+extern char *optarg;
+extern int optind, opterr, optopt, optreset;
+int getopt(int, char *const[], const char *);
+
+#define _SC_ARG_MAX 0
+#define _SC_CHILD_MAX 1
+#define _SC_CLK_TCK 2
+#define _SC_NGROUPS_MAX 3
+#define _SC_OPEN_MAX 4
+#define _SC_PAGESIZE 30
+#define _SC_PAGE_SIZE 30
+#define _SC_LINE_MAX 43
+#define _SC_IOV_MAX 60
+#define _SC_THREADS 67
+#define _SC_GETGR_R_SIZE_MAX 69
+#define _SC_GETPW_R_SIZE_MAX 70
+#define _SC_LOGIN_NAME_MAX 71
+#define _SC_TTY_NAME_MAX 72
+#define _SC_NPROCESSORS_CONF 83
+#define _SC_NPROCESSORS_ONLN 84
+#define _SC_PHYS_PAGES 85
+#define _SC_AVPHYS_PAGES 86
+#define _SC_MONOTONIC_CLOCK 149
+#define _SC_SYMLOOP_MAX 173
+#define _SC_HOST_NAME_MAX 180
+
+#define _POSIX_VERSION 200809L
+#define _XOPEN_VERSION 700
 pid_t getpid(void);
 pid_t gettid(void);
 __NORETURN void _exit(int);

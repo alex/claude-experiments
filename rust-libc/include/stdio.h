@@ -24,6 +24,7 @@ typedef long fpos_t;
 #define TMP_MAX 10000
 #define L_tmpnam 20
 #define P_tmpdir "/tmp"
+#define L_ctermid 20
 
 #define _IOFBF 0
 #define _IOLBF 1
