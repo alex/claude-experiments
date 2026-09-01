@@ -367,6 +367,9 @@ mod tests {
     use super::*;
     use std::ffi::{CStr, CString};
 
+    /// getopt keeps global state, so its tests must not run concurrently.
+    static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     fn run(args: &[&str], optstring: &str) -> (Vec<(c_int, Option<String>)>, Vec<String>) {
         let owned: Vec<CString> = args.iter().map(|a| CString::new(*a).unwrap()).collect();
         let mut argv: Vec<*mut c_char> = owned.iter().map(|c| c.as_ptr() as *mut c_char).collect();
@@ -399,6 +402,7 @@ mod tests {
 
     #[test]
     fn short_options() {
+        let _guard = SERIAL.lock().unwrap();
         let (o, rest) = run(
             &["prog", "-a", "-bval", "-c", "arg", "file", "-d"],
             "ab:c:d",
@@ -435,6 +439,7 @@ mod tests {
 
     #[test]
     fn long_options() {
+        let _guard = SERIAL.lock().unwrap();
         let names = [c"verbose", c"output", c"level"];
         let mut flag = 0;
         let longopts = [

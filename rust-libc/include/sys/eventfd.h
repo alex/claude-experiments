@@ -10,6 +10,8 @@ typedef uint64_t eventfd_t;
 
 __BEGIN_DECLS
 int eventfd(unsigned, int);
+int eventfd_read(int, eventfd_t *);
+int eventfd_write(int, eventfd_t);
 __END_DECLS
 
 #endif
