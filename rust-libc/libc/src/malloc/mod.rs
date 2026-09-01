@@ -621,12 +621,11 @@ pub extern "C" fn valloc(size: usize) -> *mut c_void {
 /// `p` must be null or a live block from this allocator.
 #[cfg_attr(not(test), unsafe(no_mangle))]
 pub unsafe extern "C" fn malloc_usable_size(p: *mut c_void) -> usize {
-    // SAFETY: forwarded.
     if p.is_null() {
-        0
-    } else {
-        unsafe { usable_size(p as *mut u8) }
+        return 0;
     }
+    // SAFETY: forwarded.
+    unsafe { usable_size(p as *mut u8) }
 }
 
 /// Locks all allocator-global state (for `fork`).

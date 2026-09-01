@@ -32,6 +32,7 @@ pub mod exit;
 pub mod fmt;
 pub mod malloc;
 pub mod start;
+pub mod stdlib;
 pub mod string;
 pub mod sync;
 pub mod sys;
