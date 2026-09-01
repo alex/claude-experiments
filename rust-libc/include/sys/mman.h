@@ -44,6 +44,9 @@
 #define MADV_NOHUGEPAGE 15
 #define MADV_DONTDUMP 16
 #define MADV_DODUMP 17
+#define MCL_CURRENT 1
+#define MCL_FUTURE 2
+#define MCL_ONFAULT 4
 #define MFD_CLOEXEC 1U
 #define MFD_ALLOW_SEALING 2U
 
@@ -57,6 +60,10 @@ int madvise(void *, size_t, int);
 int mlock(const void *, size_t);
 int munlock(const void *, size_t);
 int memfd_create(const char *, unsigned);
+int mlockall(int);
+int munlockall(void);
+int shm_open(const char *, int, mode_t);
+int shm_unlink(const char *);
 __END_DECLS
 
 #endif

@@ -41,10 +41,10 @@ pub unsafe extern "C" fn ppoll(
     mask: *const u64,
 ) -> c_int {
     // The kernel modifies the timeout; pass a copy as glibc does.
-    // SAFETY: caller contract.
     let mut ts = if timeout.is_null() {
         Timespec::default()
     } else {
+        // SAFETY: caller contract.
         unsafe { *timeout }
     };
     let tsp = if timeout.is_null() {
@@ -92,10 +92,10 @@ pub unsafe extern "C" fn pselect(
     timeout: *const Timespec,
     mask: *const u64,
 ) -> c_int {
-    // SAFETY: caller contract.
     let mut ts = if timeout.is_null() {
         Timespec::default()
     } else {
+        // SAFETY: caller contract.
         unsafe { *timeout }
     };
     let tsp = if timeout.is_null() {

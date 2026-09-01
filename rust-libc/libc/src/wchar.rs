@@ -121,10 +121,10 @@ pub unsafe extern "C" fn mbrtowc(
     ps: *mut MbState,
 ) -> usize {
     let mut local = GLOBAL_STATE.lock();
-    // SAFETY: caller contract.
     let st: &mut MbState = if ps.is_null() {
         &mut local
     } else {
+        // SAFETY: caller contract.
         unsafe { &mut *ps }
     };
     if s.is_null() {
@@ -252,10 +252,10 @@ pub unsafe extern "C" fn mbsrtowcs(
     ps: *mut MbState,
 ) -> usize {
     let mut local = MbState::default();
-    // SAFETY: caller contract.
     let st: &mut MbState = if ps.is_null() {
         &mut local
     } else {
+        // SAFETY: caller contract.
         unsafe { &mut *ps }
     };
     // SAFETY: caller contract.

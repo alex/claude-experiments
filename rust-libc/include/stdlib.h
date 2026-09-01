@@ -82,6 +82,26 @@ int posix_memalign(void **, size_t, size_t);
 void *memalign(size_t, size_t);
 void *valloc(size_t);
 
+double drand48(void);
+double erand48(unsigned short[3]);
+long lrand48(void);
+long nrand48(unsigned short[3]);
+long mrand48(void);
+long jrand48(unsigned short[3]);
+void srand48(long);
+unsigned short *seed48(unsigned short[3]);
+void lcong48(unsigned short[7]);
+int at_quick_exit(void (*)(void));
+_Noreturn void quick_exit(int);
+char *secure_getenv(const char *);
+int getloadavg(double *, int);
+int getsubopt(char **, char *const *, char **);
+int posix_openpt(int);
+int grantpt(int);
+int unlockpt(int);
+int ptsname_r(int, char *, size_t);
+char *ptsname(int);
+const char *getprogname(void);
 __END_DECLS
 
 #endif

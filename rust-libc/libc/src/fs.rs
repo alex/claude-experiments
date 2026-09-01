@@ -151,8 +151,6 @@ syscalls! {
     pub unsafe fn setpriority(which: c_int, who: c_int, prio: c_int) = 141 => c_int, -1;
     /// `mknodat(2)`.
     pub unsafe fn mknodat(dirfd: c_int, path: *const c_char, mode: c_uint, dev: c_ulong) = 259 => c_int, -1;
-    /// `sched_getaffinity(2)`.
-    pub unsafe fn sched_getaffinity(pid: c_int, size: usize, mask: *mut c_void) = nr::SCHED_GETAFFINITY => c_int, -1;
     /// `sched_setaffinity(2)`.
     pub unsafe fn sched_setaffinity(pid: c_int, size: usize, mask: *const c_void) = nr::SCHED_SETAFFINITY => c_int, -1;
     /// `sysinfo(2)`.
@@ -531,7 +529,7 @@ pub extern "C" fn getpagesize() -> c_int {
 fn cpu_count() -> c_long {
     let mut mask = [0u64; 16];
     // SAFETY: the buffer is 128 bytes.
-    let r = unsafe { sched_getaffinity(0, 128, mask.as_mut_ptr() as *mut c_void) };
+    let r = unsafe { crate::extra::sched_getaffinity(0, 128, mask.as_mut_ptr() as *mut c_void) };
     if r < 0 {
         return 1;
     }

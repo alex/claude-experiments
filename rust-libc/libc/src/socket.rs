@@ -697,10 +697,10 @@ pub unsafe extern "C" fn getaddrinfo(
     if node.is_null() && service.is_null() {
         return EAI_NONAME;
     }
-    // SAFETY: caller contract.
     let service = if service.is_null() {
         &b""[..]
     } else {
+        // SAFETY: caller contract.
         unsafe {
             core::slice::from_raw_parts(
                 service as *const u8,

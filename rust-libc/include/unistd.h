@@ -8,6 +8,7 @@
 #define __NEED_pid_t
 #define __NEED_uid_t
 #define __NEED_gid_t
+#define __NEED_intptr_t
 #include <bits/alltypes.h>
 
 #ifdef __cplusplus
@@ -19,6 +20,24 @@
 #define STDIN_FILENO 0
 #define STDOUT_FILENO 1
 #define STDERR_FILENO 2
+
+#define F_ULOCK 0
+#define F_LOCK 1
+#define F_TLOCK 2
+#define F_TEST 3
+
+#define _PC_LINK_MAX 0
+#define _PC_MAX_CANON 1
+#define _PC_MAX_INPUT 2
+#define _PC_NAME_MAX 3
+#define _PC_PATH_MAX 4
+#define _PC_PIPE_BUF 5
+#define _PC_CHOWN_RESTRICTED 6
+#define _PC_NO_TRUNC 7
+#define _PC_VDISABLE 8
+#define _PC_REC_XFER_ALIGN 20
+
+#define _CS_PATH 0
 
 __BEGIN_DECLS
 
@@ -140,6 +159,26 @@ int pause(void);
 
 extern char **environ;
 
+int getgroups(int, gid_t[]);
+int setgroups(size_t, const gid_t *);
+int getresuid(uid_t *, uid_t *, uid_t *);
+int getresgid(gid_t *, gid_t *, gid_t *);
+int setresuid(uid_t, uid_t, uid_t);
+int setresgid(gid_t, gid_t, gid_t);
+int setpgrp(void);
+int lockf(int, int, off_t);
+long pathconf(const char *, int);
+long fpathconf(int, int);
+size_t confstr(int, char *, size_t);
+int brk(void *);
+void *sbrk(intptr_t);
+void swab(const void *__RESTRICT, void *__RESTRICT, ssize_t);
+int getdtablesize(void);
+ssize_t copy_file_range(int, off_t *, int, off_t *, size_t, unsigned);
+int sethostname(const char *, size_t);
+int getdomainname(char *, size_t);
+unsigned ualarm(unsigned, unsigned);
+int syncfs(int);
 __END_DECLS
 
 #endif

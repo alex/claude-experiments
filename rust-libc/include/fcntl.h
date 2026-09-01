@@ -57,6 +57,8 @@
 #define AT_EACCESS 0x200
 #define AT_EMPTY_PATH 0x1000
 
+#define FALLOC_FL_KEEP_SIZE 1
+#define FALLOC_FL_PUNCH_HOLE 2
 #define POSIX_FADV_NORMAL 0
 #define POSIX_FADV_RANDOM 1
 #define POSIX_FADV_SEQUENTIAL 2
@@ -77,6 +79,9 @@ int open(const char *, int, ...);
 int openat(int, const char *, int, ...);
 int creat(const char *, mode_t);
 int fcntl(int, int, ...);
+int posix_fadvise(int, off_t, off_t, int);
+int posix_fallocate(int, off_t, off_t);
+int fallocate(int, int, off_t, off_t);
 __END_DECLS
 
 #endif
