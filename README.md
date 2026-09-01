@@ -7,3 +7,4 @@ This repository contains experiments in autonomous Claude-work. Everything will 
 - [`pytest` in Rust](https://github.com/alex/claude-experiments/pull/1) (Opus 5)
 - [Kani formal verification of `self_cell`](https://github.com/alex/claude-experiments/pull/2) (Opus 5)
 - [High performance `rayon`-style library](https://github.com/alex/claude-experiments/pull/3) (Fable 5)
+- [Linux libc implemented in Rust](https://github.com/alex/claude-experiments/pull/4) (Fable 5.1)
