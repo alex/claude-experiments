@@ -3,6 +3,7 @@
 use core::arch::{asm, global_asm};
 
 pub mod cpu;
+pub mod fenv;
 pub mod nr;
 pub mod va;
 

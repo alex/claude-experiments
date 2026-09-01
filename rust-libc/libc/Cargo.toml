@@ -16,6 +16,8 @@ doctest = false
 
 [dependencies]
 fearless_simd = { version = "0.7", default-features = false, features = ["libm"] }
+# The Rust port of musl's math library, used for <math.h>.
+libm = "0.2"
 
 [lints.rust]
 # Every exported C function is `unsafe extern "C"`; we do not want the

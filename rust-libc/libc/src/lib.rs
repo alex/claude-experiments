@@ -28,12 +28,15 @@
 
 pub mod arch;
 pub mod dirent;
+pub mod dl;
 pub mod errno;
 pub mod exit;
 pub mod fmt;
 pub mod fs;
 pub mod getopt;
+pub mod locale;
 pub mod malloc;
+pub mod math;
 pub mod misc;
 pub mod poll;
 pub mod process;
@@ -47,8 +50,10 @@ pub mod string;
 pub mod sync;
 pub mod sys;
 pub mod thread;
+pub mod threads;
 pub mod time;
 pub mod unistd;
+pub mod wchar;
 
 #[cfg(not(test))]
 mod panic;

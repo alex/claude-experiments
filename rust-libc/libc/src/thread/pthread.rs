@@ -206,6 +206,7 @@ fn exit_thread(result: *mut c_void) -> ! {
                 f((*rec).arg);
             }
         }
+        crate::dl::run_thread_dtors();
         run_key_destructors(tcb);
         // The last thread ends the process as if by exit(0).
         if THREADS.fetch_sub(1, Ordering::AcqRel) == 1 {

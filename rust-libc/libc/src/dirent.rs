@@ -278,9 +278,8 @@ pub unsafe extern "C" fn scandir(
             break;
         }
         // SAFETY: `e` is a valid entry.
-        if let Some(f) = filter
-            && unsafe { f(e) } == 0
-        {
+        let rejected = filter.is_some_and(|f| unsafe { f(e) } == 0);
+        if rejected {
             continue;
         }
         if count == cap {

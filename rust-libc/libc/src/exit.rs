@@ -7,8 +7,22 @@ use core::ffi::c_int;
 /// Maximum number of `atexit` handlers. C requires at least 32.
 const MAX_ATEXIT: usize = 64;
 
+/// A registered exit handler: plain (`atexit`) or with an argument
+/// (`__cxa_atexit`).
+#[derive(Clone, Copy)]
+enum Handler {
+    Plain(extern "C" fn()),
+    WithArg(
+        unsafe extern "C" fn(*mut core::ffi::c_void),
+        *mut core::ffi::c_void,
+    ),
+}
+// SAFETY: the raw pointer is only handed back to the function it was
+// registered with.
+unsafe impl Send for Handler {}
+
 struct AtexitTable {
-    handlers: [Option<extern "C" fn()>; MAX_ATEXIT],
+    handlers: [Option<Handler>; MAX_ATEXIT],
     len: usize,
 }
 
@@ -17,23 +31,35 @@ static ATEXIT: Mutex<AtexitTable> = Mutex::new(AtexitTable {
     len: 0,
 });
 
-/// Registers a function to be called by [`exit`], in reverse order of
-/// registration. Returns non-zero when the table is full.
-#[cfg_attr(not(test), unsafe(no_mangle))]
-pub extern "C" fn atexit(func: extern "C" fn()) -> c_int {
+fn register(h: Handler) -> c_int {
     let mut table = ATEXIT.lock();
     if table.len == MAX_ATEXIT {
         return -1;
     }
     let len = table.len;
-    table.handlers[len] = Some(func);
+    table.handlers[len] = Some(h);
     table.len += 1;
     0
 }
 
+/// Registers a function to be called by [`exit`], in reverse order of
+/// registration. Returns non-zero when the table is full.
+#[cfg_attr(not(test), unsafe(no_mangle))]
+pub extern "C" fn atexit(func: extern "C" fn()) -> c_int {
+    register(Handler::Plain(func))
+}
+
+/// Registers `func(arg)` (for `__cxa_atexit`).
+pub fn register_with_arg(
+    func: unsafe extern "C" fn(*mut core::ffi::c_void),
+    arg: *mut core::ffi::c_void,
+) -> c_int {
+    register(Handler::WithArg(func, arg))
+}
+
 /// Runs the registered `atexit` handlers (last registered first).
 /// Handlers registered while running are picked up too, as C requires.
-fn run_atexit() {
+pub fn run_atexit() {
     loop {
         let handler = {
             let mut table = ATEXIT.lock();
@@ -44,8 +70,11 @@ fn run_atexit() {
             let len = table.len;
             table.handlers[len].take()
         };
-        if let Some(h) = handler {
-            h();
+        match handler {
+            Some(Handler::Plain(h)) => h(),
+            // SAFETY: registered by __cxa_atexit with this argument.
+            Some(Handler::WithArg(h, arg)) => unsafe { h(arg) },
+            None => {}
         }
     }
 }

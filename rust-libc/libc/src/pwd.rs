@@ -471,12 +471,11 @@ pub extern "C" fn getlogin() -> *mut c_char {
         return env;
     }
     let p = getpwuid(crate::unistd::getuid());
-    // SAFETY: a valid entry or null.
     if p.is_null() {
-        ptr::null_mut()
-    } else {
-        unsafe { (*p).pw_name }
+        return ptr::null_mut();
     }
+    // SAFETY: a valid entry.
+    unsafe { (*p).pw_name }
 }
 
 #[cfg(test)]

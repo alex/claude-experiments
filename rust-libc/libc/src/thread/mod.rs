@@ -111,6 +111,8 @@ pub struct Tcb {
     pub cleanup: *mut CleanupRecord,
     /// Thread-specific data values.
     pub keys: [*mut core::ffi::c_void; KEYS_MAX],
+    /// C++ `thread_local` destructors (`__cxa_thread_atexit_impl`).
+    pub thread_dtors: *mut crate::dl::ThreadDtor,
 }
 
 impl Tcb {
@@ -145,6 +147,7 @@ impl Tcb {
                 result: core::ptr::null_mut(),
                 cleanup: core::ptr::null_mut(),
                 keys: [core::ptr::null_mut(); KEYS_MAX],
+                thread_dtors: core::ptr::null_mut(),
             });
         }
     }
