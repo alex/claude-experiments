@@ -1,0 +1,13 @@
+--- a/src/unsafe_self_cell.rs
++++ b/src/unsafe_self_cell.rs
+@@ -172,8 +172,8 @@
+         // Must not read before dropping dependent!! (Which happened above.)
+         let owner = read(owner_ptr);
+ 
+-        // Deallocate JoinedCell
+-        let layout = Layout::new::<JoinedCell<Owner, Dependent>>();
++        // MUTATION M8: free with the owner's layout, not the whole cell's.
++        let layout = Layout::new::<Owner>();
+         dealloc(self.joined_void_ptr.as_ptr(), layout);
+ 
+         owner

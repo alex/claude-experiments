@@ -1,0 +1,13 @@
+--- a/src/unsafe_self_cell.rs
++++ b/src/unsafe_self_cell.rs
+@@ -441,7 +441,9 @@
+         // Ensure this function can only be called once.
+         // Relaxed should be fine, because only one thread could ever read `false` anyway,
+         // so further synchronization is pointless.
+-        let was_locked = self.is_locked.swap(true, Ordering::Relaxed);
++        // MUTATION M11: read the flag without setting it, so the lock never
++        // latches and a second borrow_mut would alias.
++        let was_locked = self.is_locked.load(Ordering::Relaxed);
+ 
+         if was_locked {
+             panic!("Tried to access locked MutBorrow")

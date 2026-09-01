@@ -1,0 +1,16 @@
+error[E0623]: lifetime mismatch
+  --> $DIR/wrong_covariance.rs:7:1
+   |
+7  | / self_cell!(
+8  | |     struct NoCov {
+9  | |         owner: String,
+10 | |
+...  |
+13 | |     }
+14 | | );
+   | |  ^
+   | |  |
+   | |__these two types are declared with different lifetimes...
+   |    ...but data from `x` flows into `x` here
+   |
+   = note: this error originates in a macro (in Nightly builds, run with -Z macro-backtrace for more info)
