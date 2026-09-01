@@ -20,6 +20,7 @@ typedef long blkcnt_t;
 typedef long suseconds_t;
 typedef unsigned useconds_t;
 typedef int id_t;
+typedef int key_t;
 typedef unsigned int u_int;
 typedef unsigned long u_long;
 typedef unsigned char u_char;

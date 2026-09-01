@@ -10,7 +10,7 @@ struct sysinfo {
     unsigned short procs, pad;
     unsigned long totalhigh, freehigh;
     unsigned mem_unit;
-    char __reserved[256];
+    char __reserved[20 - 2 * sizeof(long) - sizeof(unsigned)];
 };
 
 __BEGIN_DECLS

@@ -67,3 +67,39 @@ mod panic;
 pub type c_char = core::ffi::c_char;
 /// Convenience alias for the C `int` type.
 pub type c_int = core::ffi::c_int;
+
+/// Compile-time layout checks for the structures shared with C and the
+/// kernel.  `tests/c/abi.c` asserts the same numbers from the headers.
+mod abi_asserts {
+    use core::mem::size_of;
+    const _: () = assert!(size_of::<crate::fs::Stat>() == 144);
+    const _: () = assert!(size_of::<crate::fs::Rlimit>() == 16);
+    const _: () = assert!(size_of::<crate::fs::Utsname>() == 390);
+    const _: () = assert!(size_of::<crate::signal::SigSet>() == 128);
+    const _: () = assert!(size_of::<crate::signal::SigAction>() == 152);
+    const _: () = assert!(size_of::<crate::signal::StackT>() == 24);
+    const _: () = assert!(size_of::<crate::time::Tm>() == 56);
+    const _: () = assert!(size_of::<crate::time::Timeval>() == 16);
+    const _: () = assert!(size_of::<crate::sys::Timespec>() == 16);
+    const _: () = assert!(size_of::<crate::dirent::Dirent>() == 280);
+    const _: () = assert!(size_of::<crate::socket::AddrInfo>() == 48);
+    const _: () = assert!(size_of::<crate::socket::SockaddrIn>() == 16);
+    const _: () = assert!(size_of::<crate::socket::SockaddrIn6>() == 28);
+    const _: () = assert!(size_of::<crate::socket::Hostent>() == 32);
+    const _: () = assert!(size_of::<crate::poll::PollFd>() == 8);
+    const _: () = assert!(size_of::<crate::poll::FdSet>() == 128);
+    const _: () = assert!(size_of::<crate::poll::EpollEvent>() == 12);
+    const _: () = assert!(size_of::<crate::pwd::Passwd>() == 48);
+    const _: () = assert!(size_of::<crate::pwd::Group>() == 32);
+    const _: () = assert!(size_of::<crate::locale::Lconv>() == 96);
+    const _: () = assert!(size_of::<crate::dl::DlPhdrInfo>() == 64);
+    const _: () = assert!(size_of::<crate::termios::Termios>() == 60);
+    const _: () = assert!(size_of::<crate::search::Entry>() == 16);
+    const _: () = assert!(size_of::<crate::search::HsearchData>() == 16);
+    const _: () = assert!(size_of::<crate::thread::sync::Mutex>() == 16);
+    const _: () = assert!(size_of::<crate::thread::sync::Cond>() == 16);
+    const _: () = assert!(size_of::<crate::thread::sync::RwLock>() == 16);
+    const _: () = assert!(size_of::<crate::thread::sync::Barrier>() == 16);
+    const _: () = assert!(size_of::<crate::thread::sync::Sem>() == 16);
+    const _: () = assert!(size_of::<crate::wchar::MbState>() == 4);
+}
