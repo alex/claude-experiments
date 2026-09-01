@@ -36,6 +36,8 @@ pub struct Tcb {
     pub strerror_buf: [u8; 32],
     /// State of `strtok`.
     pub strtok_save: *mut crate::c_char,
+    /// The thread's allocator state.
+    pub heap: crate::malloc::Heap,
     /// Kernel thread id. Cleared by the kernel (and a futex wake issued)
     /// when the thread exits, because it is registered as the
     /// `CLONE_CHILD_CLEARTID` address.
@@ -61,6 +63,7 @@ impl Tcb {
                 errno: 0,
                 strerror_buf: [0; 32],
                 strtok_save: core::ptr::null_mut(),
+                heap: crate::malloc::Heap::new(),
                 tid: AtomicU32::new(0),
             });
         }

@@ -133,14 +133,15 @@ pub unsafe extern "C" fn start_c(sp: *const usize) -> ! {
             tls::init_from_phdrs(phdr, phnum);
         }
     }
-    let mut random = [0u8; 8];
+    let mut random = [0u8; 16];
     if let Some(p) = auxval(auxv::AT_RANDOM) {
         // SAFETY: AT_RANDOM points at 16 bytes of kernel randomness.
-        random.copy_from_slice(unsafe { core::slice::from_raw_parts(p as *const u8, 8) });
+        random.copy_from_slice(unsafe { core::slice::from_raw_parts(p as *const u8, 16) });
     } else if crate::sys::getrandom_exact(&mut random).is_err() {
         crate::exit::abort_now();
     }
-    let canary = crate::thread::canary_from_random(random);
+    let canary = crate::thread::canary_from_random(random[..8].try_into().unwrap());
+    crate::malloc::init(random[8..].try_into().unwrap());
     let size = tls::round_up(tls::region_size(), crate::sys::PAGE_SIZE);
     // SAFETY: anonymous private mapping with no address hint.
     let region = unsafe {

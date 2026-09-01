@@ -503,8 +503,40 @@ pub unsafe extern "C" fn strncasecmp(a: *const c_char, b: *const c_char, n: usiz
     }
 }
 
-/// `strverscmp(3)` is deliberately not provided; `basename`/`dirname` live
-/// in `libgen`.
+/// `strdup(3)`.
+///
+/// # Safety
+/// `s` must be NUL-terminated.
+#[cfg_attr(not(test), unsafe(no_mangle))]
+pub unsafe extern "C" fn strdup(s: *const c_char) -> *mut c_char {
+    // SAFETY: forwarded from the caller.
+    unsafe {
+        let len = strlen(s);
+        let p = crate::malloc::alloc(len + 1) as *mut c_char;
+        if !p.is_null() {
+            memcpy(p as *mut c_void, s as *const c_void, len + 1);
+        }
+        p
+    }
+}
+
+/// `strndup(3)`.
+///
+/// # Safety
+/// `s` must be NUL-terminated or readable for `n` bytes.
+#[cfg_attr(not(test), unsafe(no_mangle))]
+pub unsafe extern "C" fn strndup(s: *const c_char, n: usize) -> *mut c_char {
+    // SAFETY: forwarded from the caller.
+    unsafe {
+        let len = strnlen(s, n);
+        let p = crate::malloc::alloc(len + 1) as *mut c_char;
+        if !p.is_null() {
+            memcpy(p as *mut c_void, s as *const c_void, len);
+            *p.add(len) = 0;
+        }
+        p
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -610,6 +642,22 @@ mod tests {
             assert_eq!(cstr(strsep(&mut s, delim.as_ptr())), "");
             assert_eq!(cstr(strsep(&mut s, delim.as_ptr())), "c");
             assert!(strsep(&mut s, delim.as_ptr()).is_null());
+        }
+    }
+
+    #[test]
+    fn dup() {
+        // SAFETY: NUL-terminated inputs, blocks freed once.
+        unsafe {
+            let p = strdup(c("hello").as_ptr());
+            assert_eq!(cstr(p), "hello");
+            crate::malloc::dealloc(p as *mut u8);
+            let p = strndup(c("hello").as_ptr(), 3);
+            assert_eq!(cstr(p), "hel");
+            crate::malloc::dealloc(p as *mut u8);
+            let p = strndup(c("hello").as_ptr(), 30);
+            assert_eq!(cstr(p), "hello");
+            crate::malloc::dealloc(p as *mut u8);
         }
     }
 

@@ -115,6 +115,12 @@ impl<T> Mutex<T> {
         self.raw.lock();
         MutexGuard { mutex: self }
     }
+
+    /// The underlying lock, for code that must lock without a guard
+    /// (the `fork` handlers).
+    pub fn raw(&self) -> &RawMutex {
+        &self.raw
+    }
 }
 
 /// RAII guard returned by [`Mutex::lock`].

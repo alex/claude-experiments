@@ -22,6 +22,16 @@ __NORETURN void _Exit(int);
 __NORETURN void abort(void);
 int atexit(void (*)(void));
 
+void *malloc(size_t);
+void *calloc(size_t, size_t);
+void *realloc(void *, size_t);
+void *reallocarray(void *, size_t, size_t);
+void free(void *);
+void *aligned_alloc(size_t, size_t);
+int posix_memalign(void **, size_t, size_t);
+void *memalign(size_t, size_t);
+void *valloc(size_t);
+
 __END_DECLS
 
 #endif
