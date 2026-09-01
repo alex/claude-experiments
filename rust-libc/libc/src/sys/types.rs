@@ -114,3 +114,25 @@ pub const F_SETFD: c_int = 2;
 pub const F_GETFL: c_int = 3;
 pub const F_SETFL: c_int = 4;
 pub const FD_CLOEXEC: c_int = 1;
+
+/// Clock ids.
+pub const CLOCK_REALTIME: c_int = 0;
+pub const CLOCK_MONOTONIC: c_int = 1;
+pub const CLOCK_PROCESS_CPUTIME_ID: c_int = 2;
+pub const CLOCK_THREAD_CPUTIME_ID: c_int = 3;
+pub const CLOCK_MONOTONIC_RAW: c_int = 4;
+pub const CLOCK_REALTIME_COARSE: c_int = 5;
+pub const CLOCK_MONOTONIC_COARSE: c_int = 6;
+pub const CLOCK_BOOTTIME: c_int = 7;
+
+/// `clone(2)` flags.
+pub const CLONE_VM: usize = 0x100;
+pub const CLONE_FS: usize = 0x200;
+pub const CLONE_FILES: usize = 0x400;
+pub const CLONE_SIGHAND: usize = 0x800;
+pub const CLONE_THREAD: usize = 0x10000;
+pub const CLONE_SYSVSEM: usize = 0x40000;
+pub const CLONE_SETTLS: usize = 0x80000;
+pub const CLONE_PARENT_SETTID: usize = 0x100000;
+pub const CLONE_CHILD_CLEARTID: usize = 0x200000;
+pub const CLONE_CHILD_SETTID: usize = 0x1000000;

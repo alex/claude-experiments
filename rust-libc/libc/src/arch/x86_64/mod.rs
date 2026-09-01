@@ -26,6 +26,101 @@ global_asm!(
     start = sym crate::start::start_c,
 );
 
+// Thread creation trampoline (the same design as musl's `__clone`).
+//
+// `clone_thread(entry, stack, flags, arg, ptid, tls, ctid)`: performs the
+// clone syscall; the parent returns the child's tid (or -errno); the child
+// starts on `stack` and calls `entry(arg)`, then exits with its return
+// value. The child never returns from this function.
+#[cfg(not(test))]
+global_asm!(
+    ".globl __rustlibc_clone",
+    ".type __rustlibc_clone,@function",
+    "__rustlibc_clone:",
+    "mov r11, rdi",       // entry (temporarily)
+    "mov rdi, rdx",       // flags
+    "mov rdx, r8",        // ptid
+    "mov r8, r9",         // tls
+    "mov r10, [rsp + 8]", // ctid
+    "mov r9, r11",        // entry: r9 survives `syscall`, r11 does not
+    "and rsi, -16",       // child stack, aligned
+    "sub rsi, 8",
+    "mov [rsi], rcx", // push arg on the child stack
+    "mov eax, 56",    // SYS_clone
+    "syscall",
+    "test eax, eax",
+    "jnz 1f",
+    // Child.
+    "xor ebp, ebp",
+    "pop rdi",
+    "call r9",
+    "mov edi, eax",
+    "mov eax, 60", // SYS_exit
+    "syscall",
+    "hlt",
+    "1: ret",
+    ".size __rustlibc_clone, .-__rustlibc_clone",
+);
+
+// Unmaps the calling thread's own stack and exits: after `munmap` there is
+// no stack to return to, so both syscalls must be issued from assembly.
+#[cfg(not(test))]
+global_asm!(
+    ".globl __rustlibc_unmapself",
+    ".type __rustlibc_unmapself,@function",
+    "__rustlibc_unmapself:",
+    "mov eax, 11", // SYS_munmap
+    "syscall",
+    "xor edi, edi",
+    "mov eax, 60", // SYS_exit
+    "syscall",
+    "hlt",
+    ".size __rustlibc_unmapself, .-__rustlibc_unmapself",
+);
+
+#[cfg(not(test))]
+unsafe extern "C" {
+    fn __rustlibc_clone(
+        entry: extern "C" fn(*mut core::ffi::c_void) -> core::ffi::c_int,
+        stack: *mut u8,
+        flags: usize,
+        arg: *mut core::ffi::c_void,
+        ptid: *mut u32,
+        tls: *mut u8,
+        ctid: *mut u32,
+    ) -> isize;
+    fn __rustlibc_unmapself(base: *mut u8, len: usize) -> !;
+}
+
+/// Creates a thread. See the assembly above.
+///
+/// # Safety
+/// `stack` must be the top of a mapped stack; `tls` a prepared TCB.
+#[cfg(not(test))]
+pub unsafe fn clone_thread(
+    entry: extern "C" fn(*mut core::ffi::c_void) -> core::ffi::c_int,
+    stack: *mut u8,
+    flags: usize,
+    arg: *mut core::ffi::c_void,
+    ptid: *mut u32,
+    tls: *mut u8,
+    ctid: *mut u32,
+) -> crate::sys::Result<u32> {
+    // SAFETY: caller contract.
+    let r = unsafe { __rustlibc_clone(entry, stack, flags, arg, ptid, tls, ctid) };
+    crate::sys::check(r as usize).map(|v| v as u32)
+}
+
+/// Unmaps `[base, base+len)` (the caller's stack) and exits the thread.
+///
+/// # Safety
+/// Nothing may be used after this call; it does not return.
+#[cfg(not(test))]
+pub unsafe fn unmap_self_and_exit(base: *mut u8, len: usize) -> ! {
+    // SAFETY: caller contract.
+    unsafe { __rustlibc_unmapself(base, len) }
+}
+
 /// Performs a raw system call with no arguments.
 ///
 /// # Safety

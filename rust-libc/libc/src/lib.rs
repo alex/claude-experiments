@@ -38,6 +38,7 @@ pub mod string;
 pub mod sync;
 pub mod sys;
 pub mod thread;
+pub mod time;
 pub mod unistd;
 
 #[cfg(not(test))]

@@ -3,7 +3,31 @@
 use core::ffi::c_int;
 use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
+pub mod pthread;
+pub mod sync;
 pub mod tls;
+
+/// Maximum number of thread-specific data keys.
+pub const KEYS_MAX: usize = 128;
+
+/// Thread state (`Tcb::state`): joinable and running.
+pub const STATE_JOINABLE: u32 = 0;
+/// Thread state: detached.
+pub const STATE_DETACHED: u32 = 1;
+/// Thread state: exited while joinable; the joiner reclaims it.
+pub const STATE_EXITED: u32 = 2;
+
+/// A `pthread_cleanup_push` record (matches `struct __ptcb` in the
+/// header).
+#[repr(C)]
+pub struct CleanupRecord {
+    /// The handler.
+    pub func: Option<unsafe extern "C" fn(*mut core::ffi::c_void)>,
+    /// Its argument.
+    pub arg: *mut core::ffi::c_void,
+    /// The previously pushed record.
+    pub next: *mut CleanupRecord,
+}
 
 /// Set once the process has created a second thread. Until then locks
 /// that only guard against other threads can be skipped.
@@ -58,12 +82,33 @@ pub struct Tcb {
     pub strerror_buf: [u8; 32],
     /// State of `strtok`.
     pub strtok_save: *mut crate::c_char,
+    /// Result buffer of `gmtime`/`localtime`.
+    pub tm: crate::time::Tm,
+    /// Result buffer of `asctime`/`ctime`.
+    pub asctime_buf: [u8; 26],
     /// The thread's allocator state.
     pub heap: crate::malloc::Heap,
     /// Kernel thread id. Cleared by the kernel (and a futex wake issued)
     /// when the thread exits, because it is registered as the
     /// `CLONE_CHILD_CLEARTID` address.
     pub tid: AtomicU32,
+
+    /// Base of the thread's stack mapping (null for the main thread).
+    pub map_base: *mut u8,
+    /// Length of the stack mapping.
+    pub map_len: usize,
+    /// `STATE_*`.
+    pub state: AtomicU32,
+    /// The thread's start routine.
+    pub start: Option<unsafe extern "C" fn(*mut core::ffi::c_void) -> *mut core::ffi::c_void>,
+    /// Argument for `start`.
+    pub arg: *mut core::ffi::c_void,
+    /// Return value of the thread.
+    pub result: *mut core::ffi::c_void,
+    /// Innermost cleanup handler.
+    pub cleanup: *mut CleanupRecord,
+    /// Thread-specific data values.
+    pub keys: [*mut core::ffi::c_void; KEYS_MAX],
 }
 
 impl Tcb {
@@ -85,8 +130,18 @@ impl Tcb {
                 errno: 0,
                 strerror_buf: [0; 32],
                 strtok_save: core::ptr::null_mut(),
+                tm: crate::time::Tm::default(),
+                asctime_buf: [0; 26],
                 heap: crate::malloc::Heap::new(),
                 tid: AtomicU32::new(0),
+                map_base: core::ptr::null_mut(),
+                map_len: 0,
+                state: AtomicU32::new(STATE_JOINABLE),
+                start: None,
+                arg: core::ptr::null_mut(),
+                result: core::ptr::null_mut(),
+                cleanup: core::ptr::null_mut(),
+                keys: [core::ptr::null_mut(); KEYS_MAX],
             });
         }
     }

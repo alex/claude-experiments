@@ -22,6 +22,8 @@
 
 __BEGIN_DECLS
 
+unsigned sleep(unsigned);
+int usleep(unsigned);
 ssize_t read(int, void *, size_t);
 ssize_t write(int, const void *, size_t);
 int close(int);

@@ -210,6 +210,77 @@ pub fn futex_wait(addr: &AtomicU32, expected: u32, timeout: Option<&Timespec>) -
     }
 }
 
+/// `futex(FUTEX_WAIT)` with a *shared* key. Needed to wait for the tid
+/// word cleared by `CLONE_CHILD_CLEARTID`: the kernel wakes it with a
+/// shared key, which never matches a `FUTEX_PRIVATE` waiter.
+pub fn futex_wait_shared(addr: &AtomicU32, expected: u32) -> Result<()> {
+    const FUTEX_WAIT: usize = 0;
+    // SAFETY: `addr` is valid for the duration of the call.
+    let r = unsafe {
+        syscall4(
+            nr::FUTEX,
+            addr.as_ptr() as usize,
+            FUTEX_WAIT,
+            expected as usize,
+            0,
+        )
+    };
+    match check(r) {
+        Ok(_) | Err(Errno::EAGAIN) => Ok(()),
+        Err(e) => Err(e),
+    }
+}
+
+/// `futex(FUTEX_WAIT_BITSET_PRIVATE)` with an *absolute* timeout on
+/// `clock` (`CLOCK_REALTIME` or `CLOCK_MONOTONIC`). Returns
+/// `Err(ETIMEDOUT)` on timeout; a value mismatch counts as woken.
+pub fn futex_wait_abs(
+    addr: &AtomicU32,
+    expected: u32,
+    deadline: &Timespec,
+    clock: c_int,
+) -> Result<()> {
+    const FUTEX_WAIT_BITSET_PRIVATE: usize = 9 | 128;
+    const FUTEX_CLOCK_REALTIME: usize = 256;
+    const FUTEX_BITSET_MATCH_ANY: usize = 0xffff_ffff;
+    let op = FUTEX_WAIT_BITSET_PRIVATE
+        | if clock == CLOCK_REALTIME {
+            FUTEX_CLOCK_REALTIME
+        } else {
+            0
+        };
+    // SAFETY: `addr` and `deadline` are valid for the call.
+    let r = unsafe {
+        syscall6(
+            nr::FUTEX,
+            addr.as_ptr() as usize,
+            op,
+            expected as usize,
+            deadline as *const Timespec as usize,
+            0,
+            FUTEX_BITSET_MATCH_ANY,
+        )
+    };
+    match check(r) {
+        Ok(_) | Err(Errno::EAGAIN) => Ok(()),
+        Err(e) => Err(e),
+    }
+}
+
+/// `clock_gettime(2)`.
+pub fn clock_gettime(clock: c_int) -> Result<Timespec> {
+    let mut ts = Timespec::default();
+    // SAFETY: `ts` is valid for the write.
+    unsafe {
+        check(syscall2(
+            nr::CLOCK_GETTIME,
+            clock as usize,
+            &mut ts as *mut Timespec as usize,
+        ))?
+    };
+    Ok(ts)
+}
+
 /// `futex(FUTEX_WAKE_PRIVATE)`: wakes up to `n` waiters.
 pub fn futex_wake(addr: &AtomicU32, n: c_int) -> Result<usize> {
     const FUTEX_WAKE_PRIVATE: usize = 1 | 128;

@@ -17,7 +17,9 @@ const CONTENDED: u32 = 2;
 /// A small futex based mutex (the classic three-state design).
 ///
 /// Uncontended lock/unlock is a single atomic operation; waiters sleep in
-/// the kernel. It is not recursive.
+/// the kernel. It is not recursive. `pthread_mutex_t` embeds one, so the
+/// layout is a single `u32`.
+#[repr(transparent)]
 pub struct RawMutex {
     state: AtomicU32,
 }
@@ -60,6 +62,27 @@ impl RawMutex {
         while self.state.swap(CONTENDED, Ordering::Acquire) != UNLOCKED {
             let _ = sys::futex_wait(&self.state, CONTENDED, None);
         }
+    }
+
+    /// Acquires the lock, giving up at `deadline` (absolute, on `clock`).
+    /// Returns false on timeout.
+    pub fn lock_until(&self, deadline: &crate::sys::Timespec, clock: core::ffi::c_int) -> bool {
+        if self.try_lock() {
+            return true;
+        }
+        while self.state.swap(CONTENDED, Ordering::Acquire) != UNLOCKED {
+            if let Err(crate::errno::Errno::ETIMEDOUT) =
+                sys::futex_wait_abs(&self.state, CONTENDED, deadline, clock)
+            {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// Whether the lock is currently held (racy; for diagnostics).
+    pub fn is_locked(&self) -> bool {
+        self.state.load(Ordering::Relaxed) != UNLOCKED
     }
 
     /// Tries to acquire the lock without blocking.
