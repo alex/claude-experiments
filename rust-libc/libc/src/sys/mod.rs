@@ -23,7 +23,11 @@ pub type Result<T> = core::result::Result<T, Errno>;
 /// values such as `mmap` addresses).
 #[inline(always)]
 pub fn check(ret: usize) -> Result<usize> {
-    if ret > (-4096isize) as usize { Err(Errno((ret as isize).wrapping_neg() as i32)) } else { Ok(ret) }
+    if ret > (-4096isize) as usize {
+        Err(Errno((ret as isize).wrapping_neg() as i32))
+    } else {
+        Ok(ret)
+    }
 }
 
 /// `read(2)`.
@@ -102,7 +106,15 @@ pub fn kill(pid: c_int, sig: c_int) -> Result<()> {
 /// `tgkill(2)`.
 pub fn tgkill(tgid: c_int, tid: c_int, sig: c_int) -> Result<()> {
     // SAFETY: no memory is involved.
-    unsafe { check(syscall3(nr::TGKILL, tgid as usize, tid as usize, sig as usize)).map(drop) }
+    unsafe {
+        check(syscall3(
+            nr::TGKILL,
+            tgid as usize,
+            tid as usize,
+            sig as usize,
+        ))
+        .map(drop)
+    }
 }
 
 /// `mmap(2)`.
@@ -119,7 +131,15 @@ pub unsafe fn mmap(
 ) -> Result<*mut u8> {
     // SAFETY: the kernel validates all arguments.
     let r = unsafe {
-        syscall6(nr::MMAP, addr as usize, len, prot as usize, flags as usize, fd as usize, off as usize)
+        syscall6(
+            nr::MMAP,
+            addr as usize,
+            len,
+            prot as usize,
+            flags as usize,
+            fd as usize,
+            off as usize,
+        )
     };
     check(r).map(|p| p as *mut u8)
 }
@@ -145,7 +165,14 @@ pub unsafe fn mprotect(addr: *mut u8, len: usize, prot: c_int) -> Result<()> {
 /// `getrandom(2)`.
 pub fn getrandom(buf: &mut [u8], flags: c_int) -> Result<usize> {
     // SAFETY: the slice is valid for writes of its length.
-    unsafe { check(syscall3(nr::GETRANDOM, buf.as_mut_ptr() as usize, buf.len(), flags as usize)) }
+    unsafe {
+        check(syscall3(
+            nr::GETRANDOM,
+            buf.as_mut_ptr() as usize,
+            buf.len(),
+            flags as usize,
+        ))
+    }
 }
 
 /// Fills `buf` completely with kernel randomness, retrying on `EINTR`.
@@ -169,7 +196,13 @@ pub fn futex_wait(addr: &AtomicU32, expected: u32, timeout: Option<&Timespec>) -
     let ts = timeout.map_or(core::ptr::null(), |t| t as *const Timespec);
     // SAFETY: `addr` and `ts` are valid for the duration of the call.
     let r = unsafe {
-        syscall4(nr::FUTEX, addr.as_ptr() as usize, FUTEX_WAIT_PRIVATE, expected as usize, ts as usize)
+        syscall4(
+            nr::FUTEX,
+            addr.as_ptr() as usize,
+            FUTEX_WAIT_PRIVATE,
+            expected as usize,
+            ts as usize,
+        )
     };
     match check(r) {
         Ok(_) | Err(Errno::EAGAIN) => Ok(()),
@@ -181,7 +214,14 @@ pub fn futex_wait(addr: &AtomicU32, expected: u32, timeout: Option<&Timespec>) -
 pub fn futex_wake(addr: &AtomicU32, n: c_int) -> Result<usize> {
     const FUTEX_WAKE_PRIVATE: usize = 1 | 128;
     // SAFETY: `addr` is valid.
-    unsafe { check(syscall3(nr::FUTEX, addr.as_ptr() as usize, FUTEX_WAKE_PRIVATE, n as usize)) }
+    unsafe {
+        check(syscall3(
+            nr::FUTEX,
+            addr.as_ptr() as usize,
+            FUTEX_WAKE_PRIVATE,
+            n as usize,
+        ))
+    }
 }
 
 /// `sched_yield(2)`.
@@ -198,7 +238,16 @@ pub fn sched_yield() {
 /// `set` and `old` must each be null or valid.
 pub unsafe fn rt_sigprocmask(how: c_int, set: *const u64, old: *mut u64) -> Result<()> {
     // SAFETY: caller guarantees the pointers.
-    unsafe { check(syscall4(nr::RT_SIGPROCMASK, how as usize, set as usize, old as usize, 8)).map(drop) }
+    unsafe {
+        check(syscall4(
+            nr::RT_SIGPROCMASK,
+            how as usize,
+            set as usize,
+            old as usize,
+            8,
+        ))
+        .map(drop)
+    }
 }
 
 /// A [`core::fmt::Write`] implementation that writes directly to file

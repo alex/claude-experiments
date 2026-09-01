@@ -12,7 +12,10 @@ struct AtexitTable {
     len: usize,
 }
 
-static ATEXIT: Mutex<AtexitTable> = Mutex::new(AtexitTable { handlers: [None; MAX_ATEXIT], len: 0 });
+static ATEXIT: Mutex<AtexitTable> = Mutex::new(AtexitTable {
+    handlers: [None; MAX_ATEXIT],
+    len: 0,
+});
 
 /// Registers a function to be called by [`exit`], in reverse order of
 /// registration. Returns non-zero when the table is full.

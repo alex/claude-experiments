@@ -25,13 +25,19 @@ pub struct RawMutex {
 impl RawMutex {
     /// Creates an unlocked mutex.
     pub const fn new() -> Self {
-        RawMutex { state: AtomicU32::new(UNLOCKED) }
+        RawMutex {
+            state: AtomicU32::new(UNLOCKED),
+        }
     }
 
     /// Acquires the lock, blocking if necessary.
     #[inline]
     pub fn lock(&self) {
-        if self.state.compare_exchange(UNLOCKED, LOCKED, Ordering::Acquire, Ordering::Relaxed).is_err() {
+        if self
+            .state
+            .compare_exchange(UNLOCKED, LOCKED, Ordering::Acquire, Ordering::Relaxed)
+            .is_err()
+        {
             self.lock_slow();
         }
     }
@@ -41,7 +47,10 @@ impl RawMutex {
         // Spin briefly first: most critical sections are tiny.
         for _ in 0..64 {
             if self.state.load(Ordering::Relaxed) == UNLOCKED
-                && self.state.compare_exchange(UNLOCKED, LOCKED, Ordering::Acquire, Ordering::Relaxed).is_ok()
+                && self
+                    .state
+                    .compare_exchange(UNLOCKED, LOCKED, Ordering::Acquire, Ordering::Relaxed)
+                    .is_ok()
             {
                 return;
             }
@@ -56,7 +65,9 @@ impl RawMutex {
     /// Tries to acquire the lock without blocking.
     #[inline]
     pub fn try_lock(&self) -> bool {
-        self.state.compare_exchange(UNLOCKED, LOCKED, Ordering::Acquire, Ordering::Relaxed).is_ok()
+        self.state
+            .compare_exchange(UNLOCKED, LOCKED, Ordering::Acquire, Ordering::Relaxed)
+            .is_ok()
     }
 
     /// Releases the lock.
@@ -92,7 +103,10 @@ unsafe impl<T: Send> Send for Mutex<T> {}
 impl<T> Mutex<T> {
     /// Creates a new mutex holding `value`.
     pub const fn new(value: T) -> Self {
-        Mutex { raw: RawMutex::new(), value: UnsafeCell::new(value) }
+        Mutex {
+            raw: RawMutex::new(),
+            value: UnsafeCell::new(value),
+        }
     }
 
     /// Locks the mutex and returns a guard giving access to the value.

@@ -87,7 +87,10 @@ unsafe extern "C" {
 /// # Safety
 /// The range must be a valid array of function pointers.
 #[cfg(not(test))]
-unsafe fn run_array(start: *const Option<unsafe extern "C" fn()>, end: *const Option<unsafe extern "C" fn()>) {
+unsafe fn run_array(
+    start: *const Option<unsafe extern "C" fn()>,
+    end: *const Option<unsafe extern "C" fn()>,
+) {
     let mut p = start;
     while p < end {
         // SAFETY: entries are valid function pointers emitted by the linker.
@@ -150,7 +153,9 @@ pub unsafe extern "C" fn start_c(sp: *const usize) -> ! {
             0,
         )
     };
-    let Ok(region) = region else { crate::exit::abort_now() };
+    let Ok(region) = region else {
+        crate::exit::abort_now()
+    };
     // SAFETY: the mapping is fresh and large enough.
     let tcb = unsafe { tls::install(region, size, canary) };
     // SAFETY: `tcb` is a fully initialised, self-referencing TCB.
@@ -158,7 +163,12 @@ pub unsafe extern "C" fn start_c(sp: *const usize) -> ! {
         crate::exit::abort_now();
     }
     // SAFETY: the TCB is now reachable through the thread pointer.
-    unsafe { (*tcb).tid.store(crate::sys::gettid() as u32, core::sync::atomic::Ordering::Relaxed) };
+    unsafe {
+        (*tcb).tid.store(
+            crate::sys::gettid() as u32,
+            core::sync::atomic::Ordering::Relaxed,
+        )
+    };
 
     crate::string::simd::init();
 

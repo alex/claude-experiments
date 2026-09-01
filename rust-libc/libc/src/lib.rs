@@ -29,6 +29,7 @@
 pub mod arch;
 pub mod errno;
 pub mod exit;
+pub mod fmt;
 pub mod start;
 pub mod string;
 pub mod sync;

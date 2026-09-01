@@ -48,7 +48,12 @@ pub struct Image {
 }
 
 impl Image {
-    const EMPTY: Image = Image { addr: core::ptr::null(), filesz: 0, memsz: 0, align: 1 };
+    const EMPTY: Image = Image {
+        addr: core::ptr::null(),
+        filesz: 0,
+        memsz: 0,
+        align: 1,
+    };
 
     /// Size of the TLS block as seen by the linker.
     fn block_size(&self) -> usize {
@@ -143,7 +148,12 @@ mod tests {
     #[test]
     fn layout_matches_linker_expectations() {
         let data = [1u8, 2, 3, 4, 5];
-        let image = Image { addr: data.as_ptr(), filesz: 5, memsz: 12, align: 8 };
+        let image = Image {
+            addr: data.as_ptr(),
+            filesz: 5,
+            memsz: 12,
+            align: 8,
+        };
         // SAFETY: test-only mutation before any use.
         unsafe { *IMAGE.0.get() = image };
         let mut region = vec![0xAAu8; region_size() + 100];

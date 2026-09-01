@@ -17,10 +17,12 @@ macro_rules! errnos {
             $(pub const $name: Errno = Errno($num);)*
         }
 
-        /// Returns the `strerror` text for an error number, if it is known.
-        pub fn description(num: c_int) -> Option<&'static str> {
+        /// Returns the `strerror` text for an error number, if it is
+        /// known, as a NUL-terminated string (the NUL is included in the
+        /// slice so the pointer can be handed to C directly).
+        pub fn description_cstr(num: c_int) -> Option<&'static str> {
             match num {
-                $($num => Some($desc),)*
+                $($num => Some(concat!($desc, "\0")),)*
                 _ => None,
             }
         }
@@ -159,6 +161,11 @@ errnos! {
     ENOTRECOVERABLE = 131, "State not recoverable";
     ERFKILL = 132, "Operation not possible due to RF-kill";
     EHWPOISON = 133, "Memory page has hardware error";
+}
+
+/// Returns the `strerror` text for an error number, if it is known.
+pub fn description(num: c_int) -> Option<&'static str> {
+    description_cstr(num).map(|s| &s[..s.len() - 1])
 }
 
 impl Errno {

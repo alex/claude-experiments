@@ -18,7 +18,10 @@ use std::process::{Command, ExitCode, Stdio};
 use std::sync::Mutex;
 
 fn root() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap().to_path_buf()
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap()
+        .to_path_buf()
 }
 
 fn cc() -> String {
@@ -48,10 +51,8 @@ fn build(release: bool) -> Result<PathBuf, String> {
     // Provide the empty archives that gcc's default link line asks for.
     for name in ["libm.a", "libpthread.a", "librt.a", "libdl.a"] {
         let p = libdir.join(name);
-        if !p.exists() {
-            if !run(Command::new("ar").arg("rcs").arg(&p)) {
-                return Err(format!("ar failed for {}", p.display()));
-            }
+        if !p.exists() && !run(Command::new("ar").arg("rcs").arg(&p)) {
+            return Err(format!("ar failed for {}", p.display()));
         }
     }
     let inc = sysroot.join("include");
@@ -76,7 +77,10 @@ fn copy_dir(from: &Path, to: &Path) -> std::io::Result<()> {
 
 /// The compiler's own header directory (stdbool.h, float.h, intrinsics).
 fn compiler_include_dir() -> String {
-    let out = Command::new(cc()).arg("-print-file-name=include").output().expect("run cc");
+    let out = Command::new(cc())
+        .arg("-print-file-name=include")
+        .output()
+        .expect("run cc");
     String::from_utf8(out.stdout).unwrap().trim().to_string()
 }
 
@@ -124,8 +128,16 @@ fn parse_expect(src: &str) -> Expect {
         }
         if let Some(rest) = line.trim().strip_prefix("// expect-signal:") {
             let name = rest.trim();
-            let known = ["SIGABRT", "SIGSEGV", "SIGILL", "SIGFPE", "SIGKILL", "SIGTERM", "SIGTRAP"];
-            return Expect::Signal(known.iter().copied().find(|k| *k == name).expect("unknown signal"));
+            let known = [
+                "SIGABRT", "SIGSEGV", "SIGILL", "SIGFPE", "SIGKILL", "SIGTERM", "SIGTRAP",
+            ];
+            return Expect::Signal(
+                known
+                    .iter()
+                    .copied()
+                    .find(|k| *k == name)
+                    .expect("unknown signal"),
+            );
         }
     }
     Expect::Exit(0)
@@ -155,12 +167,21 @@ fn run_test(sysroot: &Path, bindir: &Path, src: &Path) -> Result<(), String> {
     let source = fs::read_to_string(src).map_err(|e| e.to_string())?;
     let expect = parse_expect(&source);
     let bin = bindir.join(&name);
-    let out = compile_cmd(sysroot, src, &bin).output().map_err(|e| e.to_string())?;
+    let out = compile_cmd(sysroot, src, &bin)
+        .output()
+        .map_err(|e| e.to_string())?;
     if !out.status.success() {
-        return Err(format!("compile failed:\n{}", String::from_utf8_lossy(&out.stderr)));
+        return Err(format!(
+            "compile failed:\n{}",
+            String::from_utf8_lossy(&out.stderr)
+        ));
     }
     let mut cmd = Command::new(&bin);
-    cmd.current_dir(bindir).stdin(Stdio::null()).env_clear().env("PATH", "/usr/bin:/bin").env("TESTVAR", "value");
+    cmd.current_dir(bindir)
+        .stdin(Stdio::null())
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin")
+        .env("TESTVAR", "value");
     let out = cmd.output().map_err(|e| e.to_string())?;
     let status = out.status;
     let actual = match (status.code(), status.signal()) {
@@ -215,7 +236,9 @@ fn test(filter: Option<&str>, release: bool) -> ExitCode {
     let failures = Mutex::new(Vec::<Failure>::new());
     let passed = std::sync::atomic::AtomicUsize::new(0);
     let next = std::sync::atomic::AtomicUsize::new(0);
-    let workers = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(2);
+    let workers = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(2);
     std::thread::scope(|s| {
         for _ in 0..workers {
             s.spawn(|| {
@@ -241,14 +264,26 @@ fn test(filter: Option<&str>, release: bool) -> ExitCode {
     for f in &failures {
         eprintln!("\n=== {} ===\n{}", f.name, f.message);
     }
-    println!("\n{} passed, {} failed", passed.load(std::sync::atomic::Ordering::Relaxed), failures.len());
-    if failures.is_empty() { ExitCode::SUCCESS } else { ExitCode::FAILURE }
+    println!(
+        "\n{} passed, {} failed",
+        passed.load(std::sync::atomic::Ordering::Relaxed),
+        failures.len()
+    );
+    if failures.is_empty() {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::FAILURE
+    }
 }
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let release = !args.iter().any(|a| a == "--debug");
-    let args: Vec<&str> = args.iter().map(String::as_str).filter(|a| *a != "--debug").collect();
+    let args: Vec<&str> = args
+        .iter()
+        .map(String::as_str)
+        .filter(|a| *a != "--debug")
+        .collect();
     match args.as_slice() {
         ["build"] => match build(release) {
             Ok(s) => {

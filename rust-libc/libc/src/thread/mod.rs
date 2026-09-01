@@ -32,6 +32,10 @@ pub struct Tcb {
 
     /// The C `errno` of this thread.
     pub errno: c_int,
+    /// Scratch buffer for `strerror` of unknown error numbers.
+    pub strerror_buf: [u8; 32],
+    /// State of `strtok`.
+    pub strtok_save: *mut crate::c_char,
     /// Kernel thread id. Cleared by the kernel (and a futex wake issued)
     /// when the thread exits, because it is registered as the
     /// `CLONE_CHILD_CLEARTID` address.
@@ -55,6 +59,8 @@ impl Tcb {
                 stack_guard: canary,
                 pointer_guard: 0,
                 errno: 0,
+                strerror_buf: [0; 32],
+                strtok_save: core::ptr::null_mut(),
                 tid: AtomicU32::new(0),
             });
         }
@@ -74,7 +80,10 @@ pub fn current() -> *mut Tcb {
 #[cfg(test)]
 pub fn current() -> *mut Tcb {
     use std::cell::UnsafeCell;
-    struct Slot(UnsafeCell<core::mem::MaybeUninit<Tcb>>, core::cell::Cell<bool>);
+    struct Slot(
+        UnsafeCell<core::mem::MaybeUninit<Tcb>>,
+        core::cell::Cell<bool>,
+    );
     thread_local! { static TCB: Slot = Slot(UnsafeCell::new(core::mem::MaybeUninit::uninit()), core::cell::Cell::new(false)); }
     TCB.with(|slot| {
         let p = slot.0.get() as *mut Tcb;

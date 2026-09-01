@@ -12,10 +12,11 @@
 //! All loads happen before all stores in the small-size paths, which makes
 //! them usable for overlapping `memmove` as well.
 
+use crate::string::search;
 use core::arch::asm;
 use core::arch::x86_64::{__m128i, _mm_loadu_si128, _mm_set1_epi8, _mm_storeu_si128};
 use core::ffi::{c_int, c_void};
-use core::ptr;
+use core::{ptr, slice};
 
 /// Sizes above this go to `rep movsb`/`rep stosb`.
 const REP_THRESHOLD: usize = 256;
@@ -227,45 +228,6 @@ pub unsafe extern "C" fn memset(dst: *mut c_void, c: c_int, n: usize) -> *mut c_
     dst
 }
 
-/// Compares `a[..n]` and `b[..n]`, returning the difference of the first
-/// mismatching bytes (as unsigned chars), or 0.
-///
-/// # Safety
-/// Both pointers must be valid for `n` bytes.
-#[inline]
-pub unsafe fn compare(a: *const u8, b: *const u8, n: usize) -> c_int {
-    use core::arch::x86_64::{_mm_cmpeq_epi8, _mm_movemask_epi8};
-    // SAFETY: every access stays inside `[0, n)`.
-    unsafe {
-        let mut i = 0;
-        while i + 16 <= n {
-            let eq = _mm_movemask_epi8(_mm_cmpeq_epi8(load16(a.add(i)), load16(b.add(i)))) as u32;
-            if eq != 0xffff {
-                let k = i + (!eq).trailing_zeros() as usize;
-                return *a.add(k) as c_int - *b.add(k) as c_int;
-            }
-            i += 16;
-        }
-        while i + 8 <= n {
-            let x = ptr::read_unaligned(a.add(i) as *const u64);
-            let y = ptr::read_unaligned(b.add(i) as *const u64);
-            if x != y {
-                let k = i + ((x ^ y).trailing_zeros() / 8) as usize;
-                return *a.add(k) as c_int - *b.add(k) as c_int;
-            }
-            i += 8;
-        }
-        while i < n {
-            let (x, y) = (*a.add(i), *b.add(i));
-            if x != y {
-                return x as c_int - y as c_int;
-            }
-            i += 1;
-        }
-        0
-    }
-}
-
 /// `memcmp(3)`.
 ///
 /// # Safety
@@ -273,7 +235,13 @@ pub unsafe fn compare(a: *const u8, b: *const u8, n: usize) -> c_int {
 #[cfg_attr(not(test), unsafe(no_mangle))]
 pub unsafe extern "C" fn memcmp(a: *const c_void, b: *const c_void, n: usize) -> c_int {
     // SAFETY: forwarded from the caller.
-    unsafe { compare(a as *const u8, b as *const u8, n) }
+    let (a, b) = unsafe {
+        (
+            slice::from_raw_parts(a as *const u8, n),
+            slice::from_raw_parts(b as *const u8, n),
+        )
+    };
+    search::memcmp(a, b)
 }
 
 /// `bcmp(3)`: like `memcmp` but only the zero/non-zero result matters.
@@ -283,7 +251,131 @@ pub unsafe extern "C" fn memcmp(a: *const c_void, b: *const c_void, n: usize) ->
 #[cfg_attr(not(test), unsafe(no_mangle))]
 pub unsafe extern "C" fn bcmp(a: *const c_void, b: *const c_void, n: usize) -> c_int {
     // SAFETY: forwarded from the caller.
-    unsafe { compare(a as *const u8, b as *const u8, n) }
+    unsafe { memcmp(a, b, n) }
+}
+
+/// `memchr(3)`.
+///
+/// # Safety
+/// `s` must be valid for `n` bytes.
+#[cfg_attr(not(test), unsafe(no_mangle))]
+pub unsafe extern "C" fn memchr(s: *const c_void, c: c_int, n: usize) -> *mut c_void {
+    // SAFETY: forwarded from the caller.
+    let hay = unsafe { slice::from_raw_parts(s as *const u8, n) };
+    match search::memchr(hay, c as u8) {
+        Some(i) => hay[i..].as_ptr() as *mut c_void,
+        None => ptr::null_mut(),
+    }
+}
+
+/// `memrchr(3)`.
+///
+/// # Safety
+/// `s` must be valid for `n` bytes.
+#[cfg_attr(not(test), unsafe(no_mangle))]
+pub unsafe extern "C" fn memrchr(s: *const c_void, c: c_int, n: usize) -> *mut c_void {
+    // SAFETY: forwarded from the caller.
+    let hay = unsafe { slice::from_raw_parts(s as *const u8, n) };
+    match search::memrchr(hay, c as u8) {
+        Some(i) => hay[i..].as_ptr() as *mut c_void,
+        None => ptr::null_mut(),
+    }
+}
+
+/// `memccpy(3)`: copies up to `n` bytes, stopping after the first `c`.
+/// Returns a pointer past the copied `c`, or NULL if `c` was not found.
+///
+/// # Safety
+/// `dst` and `src` must be valid for `n` bytes and must not overlap.
+#[cfg_attr(not(test), unsafe(no_mangle))]
+pub unsafe extern "C" fn memccpy(
+    dst: *mut c_void,
+    src: *const c_void,
+    c: c_int,
+    n: usize,
+) -> *mut c_void {
+    // SAFETY: forwarded from the caller.
+    let hay = unsafe { slice::from_raw_parts(src as *const u8, n) };
+    match search::memchr(hay, c as u8) {
+        Some(i) => {
+            // SAFETY: `i + 1 <= n`.
+            unsafe {
+                memcpy(dst, src, i + 1);
+                (dst as *mut u8).add(i + 1) as *mut c_void
+            }
+        }
+        None => {
+            // SAFETY: forwarded.
+            unsafe { memcpy(dst, src, n) };
+            ptr::null_mut()
+        }
+    }
+}
+
+/// `memmem(3)`.
+///
+/// # Safety
+/// `hay` must be valid for `hay_len` bytes and `needle` for `needle_len`.
+#[cfg_attr(not(test), unsafe(no_mangle))]
+pub unsafe extern "C" fn memmem(
+    hay: *const c_void,
+    hay_len: usize,
+    needle: *const c_void,
+    needle_len: usize,
+) -> *mut c_void {
+    // SAFETY: forwarded from the caller.
+    let (h, n) = unsafe {
+        (
+            slice::from_raw_parts(hay as *const u8, hay_len),
+            slice::from_raw_parts(needle as *const u8, needle_len),
+        )
+    };
+    match search::memmem(h, n) {
+        Some(i) => h[i..].as_ptr() as *mut c_void,
+        None => ptr::null_mut(),
+    }
+}
+
+/// `bcopy(3)`: legacy `memmove` with swapped arguments.
+///
+/// # Safety
+/// Both pointers must be valid for `n` bytes.
+#[cfg_attr(not(test), unsafe(no_mangle))]
+pub unsafe extern "C" fn bcopy(src: *const c_void, dst: *mut c_void, n: usize) {
+    // SAFETY: forwarded from the caller.
+    unsafe {
+        memmove(dst, src, n);
+    }
+}
+
+/// `ffs(3)`: index (1-based) of the least significant set bit, or 0.
+#[cfg_attr(not(test), unsafe(no_mangle))]
+pub extern "C" fn ffs(i: c_int) -> c_int {
+    if i == 0 {
+        0
+    } else {
+        i.trailing_zeros() as c_int + 1
+    }
+}
+
+/// `ffsl(3)`.
+#[cfg_attr(not(test), unsafe(no_mangle))]
+pub extern "C" fn ffsl(i: core::ffi::c_long) -> c_int {
+    if i == 0 {
+        0
+    } else {
+        i.trailing_zeros() as c_int + 1
+    }
+}
+
+/// `ffsll(3)`.
+#[cfg_attr(not(test), unsafe(no_mangle))]
+pub extern "C" fn ffsll(i: core::ffi::c_longlong) -> c_int {
+    if i == 0 {
+        0
+    } else {
+        i.trailing_zeros() as c_int + 1
+    }
 }
 
 /// `bzero(3)`.
@@ -319,7 +411,9 @@ mod tests {
     use super::*;
 
     fn pattern(n: usize, seed: u8) -> Vec<u8> {
-        (0..n).map(|i| (i as u8).wrapping_mul(31).wrapping_add(seed)).collect()
+        (0..n)
+            .map(|i| (i as u8).wrapping_mul(31).wrapping_add(seed))
+            .collect()
     }
 
     #[test]
@@ -355,12 +449,20 @@ mod tests {
                 let mut buf = orig.clone();
                 // SAFETY: within the buffer.
                 unsafe { memmove(buf.as_mut_ptr().add(shift) as _, buf.as_ptr() as _, n) };
-                assert_eq!(&buf[shift..shift + n], &orig[..n], "fwd n={n} shift={shift}");
+                assert_eq!(
+                    &buf[shift..shift + n],
+                    &orig[..n],
+                    "fwd n={n} shift={shift}"
+                );
                 // Backward overlap: dst < src.
                 let mut buf = orig.clone();
                 // SAFETY: within the buffer.
                 unsafe { memmove(buf.as_mut_ptr() as _, buf.as_ptr().add(shift) as _, n) };
-                assert_eq!(&buf[..n], &orig[shift..shift + n], "bwd n={n} shift={shift}");
+                assert_eq!(
+                    &buf[..n],
+                    &orig[shift..shift + n],
+                    "bwd n={n} shift={shift}"
+                );
             }
         }
     }
@@ -389,11 +491,42 @@ mod tests {
                 let expected = a[k] as i32 - b[k] as i32;
                 assert_eq!(r, expected, "n={n} k={k}");
                 // SAFETY: as above.
-                assert_eq!(unsafe { memcmp(b.as_ptr() as _, a.as_ptr() as _, n) }, -expected);
+                assert_eq!(
+                    unsafe { memcmp(b.as_ptr() as _, a.as_ptr() as _, n) },
+                    -expected
+                );
             }
             let a = pattern(n, 9);
             // SAFETY: as above.
-            assert_eq!(unsafe { memcmp(a.as_ptr() as _, a.clone().as_ptr() as _, n) }, 0);
+            assert_eq!(
+                unsafe { memcmp(a.as_ptr() as _, a.clone().as_ptr() as _, n) },
+                0
+            );
+        }
+    }
+
+    #[test]
+    fn memchr_memrchr_memccpy() {
+        let hay = b"hello world";
+        // SAFETY: in bounds.
+        unsafe {
+            let p = memchr(hay.as_ptr() as _, b'o' as c_int, hay.len());
+            assert_eq!(p as *const u8, hay.as_ptr().add(4));
+            let p = memrchr(hay.as_ptr() as _, b'o' as c_int, hay.len());
+            assert_eq!(p as *const u8, hay.as_ptr().add(7));
+            assert!(memchr(hay.as_ptr() as _, b'z' as c_int, hay.len()).is_null());
+            // The int argument is converted to unsigned char.
+            let p = memchr(hay.as_ptr() as _, b'o' as c_int + 256, hay.len());
+            assert_eq!(p as *const u8, hay.as_ptr().add(4));
+            let mut dst = [0u8; 11];
+            let p = memccpy(dst.as_mut_ptr() as _, hay.as_ptr() as _, b' ' as c_int, 11);
+            assert_eq!(p as *const u8, dst.as_ptr().add(6));
+            assert_eq!(&dst[..6], b"hello ");
+            assert_eq!(dst[6], 0);
+            assert!(memccpy(dst.as_mut_ptr() as _, hay.as_ptr() as _, b'z' as c_int, 11).is_null());
+            assert_eq!(&dst, hay);
+            let p = memmem(hay.as_ptr() as _, hay.len(), b"o w".as_ptr() as _, 3);
+            assert_eq!(p as *const u8, hay.as_ptr().add(4));
         }
     }
 
