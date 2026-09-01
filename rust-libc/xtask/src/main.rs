@@ -10,7 +10,8 @@
 //! and run. A test passes when its exit status matches (0 by default, or
 //! the `// expect-exit: N` / `// expect-signal: NAME` directive in the
 //! source) and, if a sibling `NAME.stdout` file exists, its standard
-//! output matches that file exactly.
+//! output matches that file exactly. A `// cflags: ...` line adds
+//! compiler flags for that test.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -84,8 +85,16 @@ fn compiler_include_dir() -> String {
     String::from_utf8(out.stdout).unwrap().trim().to_string()
 }
 
+/// Extra compiler flags requested by a `// cflags: ...` line in the test.
+fn parse_cflags(src: &str) -> Vec<String> {
+    src.lines()
+        .filter_map(|l| l.trim().strip_prefix("// cflags:"))
+        .flat_map(|l| l.split_whitespace().map(str::to_string).collect::<Vec<_>>())
+        .collect()
+}
+
 /// Command line to compile a C program against the sysroot.
-fn compile_cmd(sysroot: &Path, src: &Path, out: &Path) -> Command {
+fn compile_cmd(sysroot: &Path, src: &Path, out: &Path, extra: &[String]) -> Command {
     let mut cmd = Command::new(cc());
     cmd.args([
         "-std=gnu11",
@@ -106,6 +115,7 @@ fn compile_cmd(sysroot: &Path, src: &Path, out: &Path) -> Command {
     .arg(sysroot.join("include"))
     .arg("-isystem")
     .arg(compiler_include_dir())
+    .args(extra)
     .arg(src)
     .arg("-o")
     .arg(out)
@@ -166,8 +176,9 @@ fn run_test(sysroot: &Path, bindir: &Path, src: &Path) -> Result<(), String> {
     let name = src.file_stem().unwrap().to_string_lossy().to_string();
     let source = fs::read_to_string(src).map_err(|e| e.to_string())?;
     let expect = parse_expect(&source);
+    let cflags = parse_cflags(&source);
     let bin = bindir.join(&name);
-    let out = compile_cmd(sysroot, src, &bin)
+    let out = compile_cmd(sysroot, src, &bin, &cflags)
         .output()
         .map_err(|e| e.to_string())?;
     if !out.status.success() {

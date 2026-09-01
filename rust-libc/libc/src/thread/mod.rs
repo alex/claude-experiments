@@ -1,9 +1,31 @@
 //! Threads: the thread control block, static TLS and (later) pthreads.
 
 use core::ffi::c_int;
-use core::sync::atomic::AtomicU32;
+use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 pub mod tls;
+
+/// Set once the process has created a second thread. Until then locks
+/// that only guard against other threads can be skipped.
+static THREADED: AtomicBool = AtomicBool::new(false);
+
+/// True once more than one thread may exist.
+#[inline(always)]
+pub fn is_threaded() -> bool {
+    THREADED.load(Ordering::Relaxed)
+}
+
+/// Marks the process as multi-threaded (before the first `clone`).
+pub fn set_threaded() {
+    THREADED.store(true, Ordering::Release);
+}
+
+/// Kernel thread id of the calling thread.
+#[inline(always)]
+pub fn tid() -> u32 {
+    // SAFETY: the current thread's TCB is always valid.
+    unsafe { (*current()).tid.load(Ordering::Relaxed) }
+}
 
 /// The thread control block (TCB).
 ///
@@ -83,6 +105,8 @@ pub fn current() -> *mut Tcb {
 #[cfg(test)]
 pub fn current() -> *mut Tcb {
     use std::cell::UnsafeCell;
+    // Host tests run several threads at once.
+    THREADED.store(true, Ordering::Relaxed);
     struct Slot(
         UnsafeCell<core::mem::MaybeUninit<Tcb>>,
         core::cell::Cell<bool>,
@@ -92,7 +116,11 @@ pub fn current() -> *mut Tcb {
         let p = slot.0.get() as *mut Tcb;
         if !slot.1.get() {
             // SAFETY: initialised exactly once per thread.
-            unsafe { Tcb::init(p, 0) };
+            unsafe {
+                Tcb::init(p, 0);
+                (*p).tid
+                    .store(crate::sys::gettid() as u32, Ordering::Relaxed);
+            }
             slot.1.set(true);
         }
         p

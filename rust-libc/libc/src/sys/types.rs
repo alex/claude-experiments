@@ -71,3 +71,46 @@ pub const SIGSYS: c_int = 31;
 pub const SIG_BLOCK: c_int = 0;
 pub const SIG_UNBLOCK: c_int = 1;
 pub const SIG_SETMASK: c_int = 2;
+
+/// `open(2)` flags (x86_64 values).
+pub const O_RDONLY: c_int = 0;
+pub const O_WRONLY: c_int = 1;
+pub const O_RDWR: c_int = 2;
+pub const O_ACCMODE: c_int = 3;
+pub const O_CREAT: c_int = 0o100;
+pub const O_EXCL: c_int = 0o200;
+pub const O_NOCTTY: c_int = 0o400;
+pub const O_TRUNC: c_int = 0o1000;
+pub const O_APPEND: c_int = 0o2000;
+pub const O_NONBLOCK: c_int = 0o4000;
+pub const O_DSYNC: c_int = 0o10000;
+pub const O_ASYNC: c_int = 0o20000;
+pub const O_DIRECT: c_int = 0o40000;
+pub const O_LARGEFILE: c_int = 0o100000;
+pub const O_DIRECTORY: c_int = 0o200000;
+pub const O_NOFOLLOW: c_int = 0o400000;
+pub const O_NOATIME: c_int = 0o1000000;
+pub const O_CLOEXEC: c_int = 0o2000000;
+pub const O_SYNC: c_int = 0o4010000;
+pub const O_PATH: c_int = 0o10000000;
+pub const O_TMPFILE: c_int = 0o20200000;
+
+/// Special `dirfd` meaning the current working directory.
+pub const AT_FDCWD: c_int = -100;
+pub const AT_REMOVEDIR: c_int = 0x200;
+
+/// `lseek(2)` whence values.
+pub const SEEK_SET: c_int = 0;
+pub const SEEK_CUR: c_int = 1;
+pub const SEEK_END: c_int = 2;
+
+/// `ioctl` request to read terminal attributes; used by `isatty`.
+pub const TCGETS: usize = 0x5401;
+
+/// `fcntl` commands.
+pub const F_DUPFD: c_int = 0;
+pub const F_GETFD: c_int = 1;
+pub const F_SETFD: c_int = 2;
+pub const F_GETFL: c_int = 3;
+pub const F_SETFL: c_int = 4;
+pub const FD_CLOEXEC: c_int = 1;

@@ -172,6 +172,7 @@ pub unsafe extern "C" fn start_c(sp: *const usize) -> ! {
     };
 
     crate::string::simd::init();
+    crate::stdio::init();
 
     // SAFETY: the linker guarantees these symbol pairs bracket the arrays.
     unsafe {

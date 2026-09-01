@@ -81,6 +81,7 @@ fn run_fini_array() {}
 pub extern "C" fn exit(status: c_int) -> ! {
     run_atexit();
     run_fini_array();
+    crate::stdio::flush_all();
     sys::exit_group(status)
 }
 

@@ -4,6 +4,7 @@ use core::arch::{asm, global_asm};
 
 pub mod cpu;
 pub mod nr;
+pub mod va;
 
 // The ELF entry point.
 //

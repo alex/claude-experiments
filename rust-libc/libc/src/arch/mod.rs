@@ -8,7 +8,8 @@
 //!   [`crate::start::start_c`] with the initial stack pointer,
 //! * `thread_pointer()` / `set_thread_pointer()` – TLS register access,
 //! * `cpu::detect()` – SIMD feature detection,
-//! * `nr` – the syscall number table.
+//! * `nr` – the syscall number table,
+//! * `va` – `va_list` access and the `variadic_stub!` macro.
 
 #[cfg(target_arch = "x86_64")]
 #[path = "x86_64/mod.rs"]

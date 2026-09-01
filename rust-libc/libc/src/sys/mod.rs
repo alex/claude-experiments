@@ -5,7 +5,7 @@
 //! [`Result`] with the kernel's negative return value converted into an
 //! [`Errno`]; nothing here touches the C `errno` variable.
 
-use crate::arch::{nr, syscall0, syscall1, syscall2, syscall3, syscall4, syscall6};
+use crate::arch::{nr, syscall0, syscall1, syscall2, syscall3, syscall4, syscall5, syscall6};
 use crate::errno::Errno;
 use core::ffi::{c_int, c_void};
 use core::sync::atomic::AtomicU32;
@@ -248,6 +248,138 @@ pub unsafe fn rt_sigprocmask(how: c_int, set: *const u64, old: *mut u64) -> Resu
         ))
         .map(drop)
     }
+}
+
+/// `openat(2)`.
+///
+/// # Safety
+/// `path` must be NUL-terminated.
+pub unsafe fn openat(dirfd: c_int, path: *const u8, flags: c_int, mode: u32) -> Result<c_int> {
+    // SAFETY: caller contract.
+    unsafe {
+        check(syscall4(
+            nr::OPENAT,
+            dirfd as usize,
+            path as usize,
+            flags as usize,
+            mode as usize,
+        ))
+        .map(|fd| fd as c_int)
+    }
+}
+
+/// `lseek(2)`.
+pub fn lseek(fd: c_int, offset: i64, whence: c_int) -> Result<i64> {
+    // SAFETY: no memory is involved.
+    unsafe {
+        check(syscall3(
+            nr::LSEEK,
+            fd as usize,
+            offset as usize,
+            whence as usize,
+        ))
+        .map(|v| v as i64)
+    }
+}
+
+/// `ioctl(2)`.
+///
+/// # Safety
+/// `arg` must be whatever the request expects.
+pub unsafe fn ioctl(fd: c_int, request: usize, arg: usize) -> Result<c_int> {
+    // SAFETY: caller contract.
+    unsafe { check(syscall3(nr::IOCTL, fd as usize, request, arg)).map(|v| v as c_int) }
+}
+
+/// `unlinkat(2)`.
+///
+/// # Safety
+/// `path` must be NUL-terminated.
+pub unsafe fn unlinkat(dirfd: c_int, path: *const u8, flags: c_int) -> Result<()> {
+    // SAFETY: caller contract.
+    unsafe {
+        check(syscall3(
+            nr::UNLINKAT,
+            dirfd as usize,
+            path as usize,
+            flags as usize,
+        ))
+        .map(drop)
+    }
+}
+
+/// `renameat(2)`.
+///
+/// # Safety
+/// Both paths must be NUL-terminated.
+pub unsafe fn renameat(olddir: c_int, old: *const u8, newdir: c_int, new: *const u8) -> Result<()> {
+    // SAFETY: caller contract.
+    unsafe {
+        check(syscall4(
+            nr::RENAMEAT,
+            olddir as usize,
+            old as usize,
+            newdir as usize,
+            new as usize,
+        ))
+        .map(drop)
+    }
+}
+
+/// `dup3(2)` / `dup(2)`: `dup3` with `flags = 0` and no `newfd` is not a
+/// thing, so `dup` uses the plain syscall.
+pub fn dup(fd: c_int) -> Result<c_int> {
+    // SAFETY: no memory is involved.
+    unsafe { check(syscall1(nr::DUP, fd as usize)).map(|v| v as c_int) }
+}
+
+/// `fcntl(2)`.
+///
+/// # Safety
+/// `arg` must be whatever the command expects.
+pub unsafe fn fcntl(fd: c_int, cmd: c_int, arg: usize) -> Result<c_int> {
+    // SAFETY: caller contract.
+    unsafe { check(syscall3(nr::FCNTL, fd as usize, cmd as usize, arg)).map(|v| v as c_int) }
+}
+
+/// `pread64(2)`.
+///
+/// # Safety
+/// `buf` must be valid for writes of `len` bytes.
+pub unsafe fn pread(fd: c_int, buf: *mut u8, len: usize, off: i64) -> Result<usize> {
+    // SAFETY: caller contract.
+    unsafe {
+        check(syscall4(
+            nr::PREAD64,
+            fd as usize,
+            buf as usize,
+            len,
+            off as usize,
+        ))
+    }
+}
+
+/// `pwrite64(2)`.
+///
+/// # Safety
+/// `buf` must be valid for reads of `len` bytes.
+pub unsafe fn pwrite(fd: c_int, buf: *const u8, len: usize, off: i64) -> Result<usize> {
+    // SAFETY: caller contract.
+    unsafe {
+        check(syscall4(
+            nr::PWRITE64,
+            fd as usize,
+            buf as usize,
+            len,
+            off as usize,
+        ))
+    }
+}
+
+/// Reserved so `syscall5` stays referenced until more wrappers use it.
+#[allow(dead_code)]
+fn _uses_syscall5() {
+    let _ = syscall5 as unsafe fn(usize, usize, usize, usize, usize, usize) -> usize;
 }
 
 /// A [`core::fmt::Write`] implementation that writes directly to file
