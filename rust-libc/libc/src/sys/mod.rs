@@ -453,6 +453,68 @@ fn _uses_syscall5() {
     let _ = syscall5 as unsafe fn(usize, usize, usize, usize, usize, usize) -> usize;
 }
 
+/// `rt_sigaction(2)` with the kernel's `struct sigaction` layout.
+///
+/// # Safety
+/// `new` and `old` must be null or valid.
+pub unsafe fn rt_sigaction(
+    sig: c_int,
+    new: *const KernelSigaction,
+    old: *mut KernelSigaction,
+) -> Result<()> {
+    // SAFETY: caller contract.
+    unsafe {
+        check(syscall4(
+            nr::RT_SIGACTION,
+            sig as usize,
+            new as usize,
+            old as usize,
+            8,
+        ))
+        .map(drop)
+    }
+}
+
+/// `fork(2)`. Returns the child's pid in the parent and 0 in the child.
+pub fn fork() -> Result<c_int> {
+    // SAFETY: no memory is involved.
+    unsafe { check(syscall0(nr::FORK)).map(|v| v as c_int) }
+}
+
+/// `execve(2)`.
+///
+/// # Safety
+/// All pointers must be valid NUL-terminated strings / NULL-terminated
+/// arrays.
+pub unsafe fn execve(path: *const u8, argv: *const *const u8, envp: *const *const u8) -> Errno {
+    // SAFETY: caller contract.
+    let r = unsafe { syscall3(nr::EXECVE, path as usize, argv as usize, envp as usize) };
+    check(r).err().unwrap_or(Errno::EINVAL)
+}
+
+/// `wait4(2)`.
+///
+/// # Safety
+/// `status` and `rusage` must be null or valid.
+pub unsafe fn wait4(
+    pid: c_int,
+    status: *mut c_int,
+    options: c_int,
+    rusage: *mut c_void,
+) -> Result<c_int> {
+    // SAFETY: caller contract.
+    unsafe {
+        check(syscall4(
+            nr::WAIT4,
+            pid as usize,
+            status as usize,
+            options as usize,
+            rusage as usize,
+        ))
+        .map(|v| v as c_int)
+    }
+}
+
 /// A [`core::fmt::Write`] implementation that writes directly to file
 /// descriptor 2. Used for internal diagnostics only.
 pub struct StderrWriter;

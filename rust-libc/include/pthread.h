@@ -6,6 +6,7 @@
 #define __NEED_struct_timespec
 #define __NEED_time_t
 #define __NEED_clockid_t
+#define __NEED_sigset_t
 #include <bits/alltypes.h>
 #include <sched.h>
 #include <time.h>
@@ -60,7 +61,7 @@ int pthread_detach(pthread_t);
 __NORETURN void pthread_exit(void *);
 pthread_t pthread_self(void);
 int pthread_equal(pthread_t, pthread_t);
-int pthread_sigmask(int, const void *__RESTRICT, void *__RESTRICT);
+int pthread_sigmask(int, const sigset_t *__RESTRICT, sigset_t *__RESTRICT);
 int pthread_kill(pthread_t, int);
 int pthread_setname_np(pthread_t, const char *);
 int pthread_atfork(void (*)(void), void (*)(void), void (*)(void));

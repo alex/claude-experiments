@@ -121,6 +121,81 @@ pub unsafe fn unmap_self_and_exit(base: *mut u8, len: usize) -> ! {
     unsafe { __rustlibc_unmapself(base, len) }
 }
 
+// Signal return trampoline, installed as `sa_restorer` on every handler:
+// the kernel returns to it after a handler, and it performs
+// `rt_sigreturn` to restore the interrupted context.
+#[cfg(not(test))]
+global_asm!(
+    ".globl __rustlibc_restore_rt",
+    ".type __rustlibc_restore_rt,@function",
+    "__rustlibc_restore_rt:",
+    "mov eax, 15", // SYS_rt_sigreturn
+    "syscall",
+    ".size __rustlibc_restore_rt, .-__rustlibc_restore_rt",
+);
+
+// setjmp / longjmp.
+//
+// jmp_buf layout: rbx, rbp, r12, r13, r14, r15, rsp, rip (8 words),
+// then a spare word and 16 words of saved signal mask for sigsetjmp.
+// `sigsetjmp` with a non-zero `savemask` calls `setjmp` and then the Rust
+// `__sigsetjmp_tail`, which saves the mask on the first return and
+// restores it when returning through `siglongjmp` (musl's design).
+#[cfg(not(test))]
+global_asm!(
+    ".globl setjmp, _setjmp, longjmp, _longjmp, siglongjmp, sigsetjmp, __sigsetjmp",
+    ".type setjmp,@function",
+    ".type longjmp,@function",
+    ".type sigsetjmp,@function",
+    "_setjmp:",
+    "setjmp:",
+    "mov [rdi], rbx",
+    "mov [rdi + 8], rbp",
+    "mov [rdi + 16], r12",
+    "mov [rdi + 24], r13",
+    "mov [rdi + 32], r14",
+    "mov [rdi + 40], r15",
+    "lea rdx, [rsp + 8]",
+    "mov [rdi + 48], rdx",
+    "mov rdx, [rsp]",
+    "mov [rdi + 56], rdx",
+    "xor eax, eax",
+    "ret",
+    "_longjmp:",
+    "longjmp:",
+    "siglongjmp:",
+    "mov eax, esi",
+    "test eax, eax",
+    "jnz 2f",
+    "inc eax",
+    "2:",
+    "mov rbx, [rdi]",
+    "mov rbp, [rdi + 8]",
+    "mov r12, [rdi + 16]",
+    "mov r13, [rdi + 24]",
+    "mov r14, [rdi + 32]",
+    "mov r15, [rdi + 40]",
+    "mov rsp, [rdi + 48]",
+    "jmp qword ptr [rdi + 56]",
+    "__sigsetjmp:",
+    "sigsetjmp:",
+    "test esi, esi",
+    "jz setjmp",
+    "pop rsi",              // our return address
+    "mov [rdi + 64], rsi",  // stash it in the spare slot
+    "mov [rdi + 72], rbx",  // stash rbx in the first mask slot (restored
+                            // before the tail overwrites it with the mask)
+    "mov rbx, rdi",
+    "call setjmp",
+    "push qword ptr [rbx + 64]",
+    "mov rdi, rbx",
+    "mov esi, eax",
+    "mov rbx, [rbx + 72]",
+    "jmp {tail}",
+    ".size setjmp, .-setjmp",
+    tail = sym crate::signal::__sigsetjmp_tail,
+);
+
 /// Performs a raw system call with no arguments.
 ///
 /// # Safety
@@ -231,6 +306,28 @@ pub unsafe fn syscall6(
              in("r10") a4, in("r8") a5, in("r9") a6, out("rcx") _, out("r11") _, options(nostack));
     }
     ret
+}
+
+/// Performs a raw system call with up to six arguments taken from a
+/// slice (a convenience for generated wrappers).
+///
+/// # Safety
+/// See [`syscall0`].
+#[inline(always)]
+pub unsafe fn syscall_n(n: usize, args: &[usize]) -> usize {
+    let a = |i: usize| args.get(i).copied().unwrap_or(0);
+    // SAFETY: forwarded; unused registers hold zero.
+    unsafe {
+        match args.len() {
+            0 => syscall0(n),
+            1 => syscall1(n, a(0)),
+            2 => syscall2(n, a(0), a(1)),
+            3 => syscall3(n, a(0), a(1), a(2)),
+            4 => syscall4(n, a(0), a(1), a(2), a(3)),
+            5 => syscall5(n, a(0), a(1), a(2), a(3), a(4)),
+            _ => syscall6(n, a(0), a(1), a(2), a(3), a(4), a(5)),
+        }
+    }
 }
 
 /// Returns the thread pointer (`%fs` base).

@@ -203,6 +203,26 @@ pub trait CReturn {
     fn c_ret(self) -> Self::Out;
 }
 
+/// Like [`CReturn`] for arbitrary return types: yields `fail` (and sets
+/// `errno`) on error.
+pub trait CReturnOr<T> {
+    /// Converts the result, setting `errno` on error.
+    fn c_ret_or(self, fail: T) -> T;
+}
+
+impl<T> CReturnOr<T> for crate::sys::Result<T> {
+    #[inline]
+    fn c_ret_or(self, fail: T) -> T {
+        match self {
+            Ok(v) => v,
+            Err(e) => {
+                e.set();
+                fail
+            }
+        }
+    }
+}
+
 impl CReturn for crate::sys::Result<()> {
     type Out = c_int;
     #[inline]

@@ -153,6 +153,14 @@ impl FileLock {
         true
     }
 
+    /// Resets the lock in a forked child (see `postfork`).
+    fn reset(&self) {
+        self.count.set(0);
+        self.real.set(false);
+        self.owner.store(0, Ordering::Relaxed);
+        self.raw.force_unlock();
+    }
+
     fn unlock(&self) {
         let n = self.count.get() - 1;
         self.count.set(n);
@@ -733,6 +741,53 @@ pub fn flush_all() -> c_int {
         }
     }
     result
+}
+
+/// Locks every stream (and the stream list) before `fork`.
+pub fn prefork() {
+    FILES.raw().lock();
+    let mut f = FILES.lock_unchecked_head();
+    while !f.is_null() {
+        // SAFETY: streams on the list are valid while the list lock is held.
+        unsafe {
+            (*f).lock.lock();
+            f = (*f).next;
+        }
+    }
+}
+
+/// Undoes [`prefork`]. In the child the forking thread has a new tid, so
+/// the locks are reset rather than unlocked.
+///
+/// # Safety
+/// Must follow [`prefork`] on the same thread.
+pub unsafe fn postfork(child: bool) {
+    let mut f = FILES.lock_unchecked_head();
+    while !f.is_null() {
+        // SAFETY: as in `prefork`.
+        unsafe {
+            if child {
+                (*f).lock.reset();
+            } else {
+                (*f).lock.unlock();
+            }
+            f = (*f).next;
+        }
+    }
+    if child {
+        FILES.raw().force_unlock();
+    } else {
+        // SAFETY: taken in `prefork`.
+        unsafe { FILES.raw().unlock() };
+    }
+}
+
+impl Mutex<FileList> {
+    /// The list head, for callers that already hold the raw lock.
+    fn lock_unchecked_head(&self) -> *mut File {
+        // SAFETY: callers hold the raw lock.
+        unsafe { (*self.value_ptr()).0 }
+    }
 }
 
 fn flush_line_buffered_stdout() {

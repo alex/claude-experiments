@@ -61,6 +61,7 @@ __NORETURN void exit(int);
 __NORETURN void _Exit(int);
 __NORETURN void abort(void);
 int atexit(void (*)(void));
+int system(const char *);
 
 void *malloc(size_t);
 void *calloc(size_t, size_t);

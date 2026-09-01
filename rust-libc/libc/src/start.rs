@@ -173,6 +173,12 @@ pub unsafe extern "C" fn start_c(sp: *const usize) -> ! {
 
     crate::string::simd::init();
     crate::stdio::init();
+    // SAFETY: argv[0] lives on the initial stack for the whole process.
+    unsafe {
+        if argc > 0 {
+            crate::misc::set_program_name(*argv);
+        }
+    }
 
     // SAFETY: the linker guarantees these symbol pairs bracket the arrays.
     unsafe {

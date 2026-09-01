@@ -80,6 +80,12 @@ impl RawMutex {
         true
     }
 
+    /// Resets the lock to unlocked without waking anyone. For use in a
+    /// forked child, where no other thread exists.
+    pub fn force_unlock(&self) {
+        self.state.store(UNLOCKED, Ordering::Release);
+    }
+
     /// Whether the lock is currently held (racy; for diagnostics).
     pub fn is_locked(&self) -> bool {
         self.state.load(Ordering::Relaxed) != UNLOCKED
@@ -143,6 +149,11 @@ impl<T> Mutex<T> {
     /// (the `fork` handlers).
     pub fn raw(&self) -> &RawMutex {
         &self.raw
+    }
+
+    /// Raw access to the value for callers that hold the raw lock.
+    pub fn value_ptr(&self) -> *mut T {
+        self.value.get()
     }
 }
 

@@ -136,3 +136,30 @@ pub const CLONE_SETTLS: usize = 0x80000;
 pub const CLONE_PARENT_SETTID: usize = 0x100000;
 pub const CLONE_CHILD_CLEARTID: usize = 0x200000;
 pub const CLONE_CHILD_SETTID: usize = 0x1000000;
+
+/// The kernel's `struct sigaction` (x86_64).
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct KernelSigaction {
+    pub handler: usize,
+    pub flags: u64,
+    pub restorer: usize,
+    pub mask: u64,
+}
+
+/// `sigaction` flags.
+pub const SA_NOCLDSTOP: u64 = 1;
+pub const SA_NOCLDWAIT: u64 = 2;
+pub const SA_SIGINFO: u64 = 4;
+pub const SA_ONSTACK: u64 = 0x0800_0000;
+pub const SA_RESTART: u64 = 0x1000_0000;
+pub const SA_NODEFER: u64 = 0x4000_0000;
+pub const SA_RESETHAND: u64 = 0x8000_0000;
+pub const SA_RESTORER: u64 = 0x0400_0000;
+
+/// Number of signals (the highest is `NSIG - 1`).
+pub const NSIG: c_int = 65;
+
+/// `wait` options.
+pub const WNOHANG: c_int = 1;
+pub const WUNTRACED: c_int = 2;

@@ -65,3 +65,8 @@ typedef int clockid_t;
 struct timespec { long tv_sec; long tv_nsec; };
 #define __DEFINED_struct_timespec
 #endif
+
+#if defined(__NEED_sigset_t) && !defined(__DEFINED_sigset_t)
+typedef struct { unsigned long __bits[16]; } sigset_t;
+#define __DEFINED_sigset_t
+#endif
