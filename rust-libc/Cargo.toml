@@ -1,0 +1,23 @@
+[workspace]
+resolver = "2"
+members = ["libc", "xtask"]
+
+[workspace.package]
+edition = "2024"
+license = "BSD-3-Clause"
+rust-version = "1.94"
+
+# The libc itself is a freestanding static library: no unwinding, and the
+# release profile is what every C program links against.
+[profile.dev]
+panic = "abort"
+# Debug builds of a libc are only useful with some optimisation, otherwise
+# even memcpy is a call chain of inlined-nothing.
+opt-level = 1
+
+[profile.release]
+panic = "abort"
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+debug = "line-tables-only"
