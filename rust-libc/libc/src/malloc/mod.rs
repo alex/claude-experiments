@@ -248,9 +248,11 @@ unsafe fn span_collect_remote(span: *mut Span) -> bool {
     }
 }
 
+/// # Safety
+/// `span` must be a live span.
 #[inline(always)]
-fn span_has_free(span: *const Span) -> bool {
-    // SAFETY: valid span.
+unsafe fn span_has_free(span: *const Span) -> bool {
+    // SAFETY: caller contract.
     unsafe { (*span).free != 0 || (*span).bump < (*span).capacity }
 }
 

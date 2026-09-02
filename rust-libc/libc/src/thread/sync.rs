@@ -18,13 +18,12 @@ const MUTEX_RECURSIVE: u32 = 1;
 const MUTEX_ERRORCHECK: u32 = 2;
 
 /// Validates a `timespec` deadline.
-fn check_deadline(ts: *const Timespec) -> Result<&'static Timespec, Errno> {
+fn check_deadline(ts: *const Timespec) -> Result<Timespec, Errno> {
     if ts.is_null() {
         return Err(Errno::EINVAL);
     }
-    // SAFETY: the caller passed a valid pointer; the reference is only
-    // used for the duration of the call.
-    let ts = unsafe { &*ts };
+    // SAFETY: the caller passed a valid pointer; it is read once.
+    let ts = unsafe { ts.read() };
     if ts.tv_nsec < 0 || ts.tv_nsec >= 1_000_000_000 {
         return Err(Errno::EINVAL);
     }
@@ -200,6 +199,7 @@ pub unsafe extern "C" fn pthread_mutex_timedlock(
         Ok(d) => d,
         Err(e) => return e.0,
     };
+    let deadline = &deadline;
     // SAFETY: caller contract.
     unsafe {
         match lock_prologue(m) {
@@ -233,6 +233,7 @@ pub unsafe extern "C" fn pthread_mutex_clocklock(
         Ok(d) => d,
         Err(e) => return e.0,
     };
+    let deadline = &deadline;
     // SAFETY: caller contract.
     unsafe {
         match lock_prologue(m) {
@@ -432,6 +433,7 @@ pub unsafe extern "C" fn pthread_cond_timedwait(
         Ok(d) => d,
         Err(e) => return e.0,
     };
+    let deadline = &deadline;
     // SAFETY: forwarded.
     unsafe { cond_wait_impl(c, m, Some(deadline)) }
 }
@@ -454,6 +456,7 @@ pub unsafe extern "C" fn pthread_cond_clockwait(
         Ok(d) => d,
         Err(e) => return e.0,
     };
+    let deadline = &deadline;
     // SAFETY: forwarded.
     unsafe { cond_wait_clock(c, m, clock, Some(deadline)) }
 }
@@ -691,7 +694,7 @@ pub unsafe extern "C" fn pthread_rwlock_timedrdlock(
 ) -> c_int {
     match check_deadline(deadline) {
         // SAFETY: forwarded.
-        Ok(d) => unsafe { rdlock_impl(l, Some(d), false) },
+        Ok(d) => unsafe { rdlock_impl(l, Some(&d), false) },
         Err(e) => e.0,
     }
 }
@@ -727,7 +730,7 @@ pub unsafe extern "C" fn pthread_rwlock_timedwrlock(
 ) -> c_int {
     match check_deadline(deadline) {
         // SAFETY: forwarded.
-        Ok(d) => unsafe { wrlock_impl(l, Some(d), false) },
+        Ok(d) => unsafe { wrlock_impl(l, Some(&d), false) },
         Err(e) => e.0,
     }
 }
@@ -1058,7 +1061,7 @@ pub unsafe extern "C" fn sem_trywait(s: *mut Sem) -> c_int {
 pub unsafe extern "C" fn sem_timedwait(s: *mut Sem, deadline: *const Timespec) -> c_int {
     match check_deadline(deadline) {
         // SAFETY: forwarded.
-        Ok(d) => unsafe { sem_wait_impl(s, Some(d), false) },
+        Ok(d) => unsafe { sem_wait_impl(s, Some(&d), false) },
         Err(e) => {
             e.set();
             -1

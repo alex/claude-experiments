@@ -72,12 +72,10 @@ pub fn format(buf: &mut [u8], fmt: &[u8], tm: &Tm) -> Option<usize> {
         let spec = *fmt.get(i)?;
         i += 1;
         let year = tm.tm_year as i64 + 1900;
-        let name = |names: &[&str], idx: i32| -> &'static str {
-            // SAFETY: the tables are 'static.
+        let name = |names: &'static [&'static str], idx: i32| -> &'static str {
             usize::try_from(idx)
                 .ok()
                 .and_then(|i| names.get(i).copied())
-                .map(|s| unsafe { core::mem::transmute::<&str, &'static str>(s) })
                 .unwrap_or("?")
         };
         match spec {

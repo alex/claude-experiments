@@ -149,23 +149,36 @@ impl Span {
     }
 
     /// Tests the allocation bit of block `idx`.
+    ///
+    /// # Safety
+    /// The span must be live (its bitmap mapped) and `idx < capacity`,
+    /// which [`Span::block_index`] guarantees for its results.
     #[inline]
-    pub fn is_allocated(&self, idx: u32) -> bool {
-        // SAFETY: the bitmap has `capacity` bits.
+    pub unsafe fn is_allocated(&self, idx: u32) -> bool {
+        debug_assert!(idx < self.capacity);
+        // SAFETY: caller contract.
         unsafe { *self.bitmap.add(idx as usize / 64) & (1 << (idx % 64)) != 0 }
     }
 
     /// Sets the allocation bit of block `idx`.
+    ///
+    /// # Safety
+    /// As for [`Span::is_allocated`].
     #[inline]
-    pub fn mark_allocated(&mut self, idx: u32) {
-        // SAFETY: the bitmap has `capacity` bits.
+    pub unsafe fn mark_allocated(&mut self, idx: u32) {
+        debug_assert!(idx < self.capacity);
+        // SAFETY: caller contract.
         unsafe { *self.bitmap.add(idx as usize / 64) |= 1 << (idx % 64) }
     }
 
     /// Clears the allocation bit of block `idx`.
+    ///
+    /// # Safety
+    /// As for [`Span::is_allocated`].
     #[inline]
-    pub fn mark_free(&mut self, idx: u32) {
-        // SAFETY: the bitmap has `capacity` bits.
+    pub unsafe fn mark_free(&mut self, idx: u32) {
+        debug_assert!(idx < self.capacity);
+        // SAFETY: caller contract.
         unsafe { *self.bitmap.add(idx as usize / 64) &= !(1 << (idx % 64)) }
     }
 }

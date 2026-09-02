@@ -140,8 +140,9 @@ pub unsafe extern "C" fn start_c(sp: *const usize) -> ! {
     } else if crate::sys::getrandom_exact(&mut random).is_err() {
         crate::exit::abort_now();
     }
-    let canary = crate::thread::canary_from_random(random[..8].try_into().unwrap());
-    crate::malloc::init(random[8..].try_into().unwrap());
+    let (canary_seed, heap_seed) = random.split_at(8);
+    let canary = crate::thread::canary_from_random(canary_seed.try_into().unwrap_or([0; 8]));
+    crate::malloc::init(heap_seed.try_into().unwrap_or([0; 8]));
     let size = tls::round_up(tls::region_size(), crate::sys::PAGE_SIZE);
     // SAFETY: anonymous private mapping with no address hint.
     let region = unsafe {

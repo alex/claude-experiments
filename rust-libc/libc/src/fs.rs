@@ -62,6 +62,22 @@ macro_rules! syscalls {
     };
 }
 
+/// Like [`syscalls!`] for calls that take only integers: nothing about
+/// them can violate memory safety, so they are safe functions.
+macro_rules! safe_syscalls {
+    ($($(#[$doc:meta])* $vis:vis fn $name:ident($($arg:ident: $ty:ty),*) = $nr:expr => $ret:ty, $fail:expr;)*) => {
+        $(
+            $(#[$doc])*
+            #[cfg_attr(not(test), unsafe(no_mangle))]
+            $vis extern "C" fn $name($($arg: $ty),*) -> $ret {
+                // SAFETY: no memory is involved.
+                let r = unsafe { crate::arch::syscall_n($nr, &[$($arg as usize),*]) };
+                sys::check(r).map(|v| v as $ret).c_ret_or($fail)
+            }
+        )*
+    };
+}
+
 use crate::arch::nr;
 
 syscalls! {
@@ -77,8 +93,6 @@ syscalls! {
     pub unsafe fn fstat(fd: c_int, st: *mut Stat) = nr::FSTAT => c_int, -1;
     /// `chdir(2)`.
     pub unsafe fn chdir(path: *const c_char) = nr::CHDIR => c_int, -1;
-    /// `fchdir(2)`.
-    pub unsafe fn fchdir(fd: c_int) = nr::FCHDIR => c_int, -1;
     /// `mkdirat(2)`.
     pub unsafe fn mkdirat(dirfd: c_int, path: *const c_char, mode: c_uint) = nr::MKDIRAT => c_int, -1;
     /// `unlinkat(2)`.
@@ -93,22 +107,10 @@ syscalls! {
     pub unsafe fn renameat(olddir: c_int, old: *const c_char, newdir: c_int, new: *const c_char) = nr::RENAMEAT => c_int, -1;
     /// `fchmodat(2)`.
     pub unsafe fn fchmodat(dirfd: c_int, path: *const c_char, mode: c_uint, flags: c_int) = nr::FCHMODAT => c_int, -1;
-    /// `fchmod(2)`.
-    pub unsafe fn fchmod(fd: c_int, mode: c_uint) = nr::FCHMOD => c_int, -1;
     /// `fchownat(2)`.
     pub unsafe fn fchownat(dirfd: c_int, path: *const c_char, uid: c_uint, gid: c_uint, flags: c_int) = nr::FCHOWNAT => c_int, -1;
-    /// `fchown(2)`.
-    pub unsafe fn fchown(fd: c_int, uid: c_uint, gid: c_uint) = nr::FCHOWN => c_int, -1;
-    /// `umask(2)`.
-    pub unsafe fn umask(mask: c_uint) = nr::UMASK => c_uint, 0;
     /// `truncate(2)`.
     pub unsafe fn truncate(path: *const c_char, len: i64) = nr::TRUNCATE => c_int, -1;
-    /// `ftruncate(2)`.
-    pub unsafe fn ftruncate(fd: c_int, len: i64) = nr::FTRUNCATE => c_int, -1;
-    /// `fsync(2)`.
-    pub unsafe fn fsync(fd: c_int) = nr::FSYNC => c_int, -1;
-    /// `fdatasync(2)`.
-    pub unsafe fn fdatasync(fd: c_int) = nr::FDATASYNC => c_int, -1;
     /// `utimensat(2)`.
     pub unsafe fn utimensat(dirfd: c_int, path: *const c_char, times: *const Timespec, flags: c_int) = nr::UTIMENSAT => c_int, -1;
     /// `readv(2)`.
@@ -119,8 +121,6 @@ syscalls! {
     pub unsafe fn preadv(fd: c_int, iov: *const c_void, count: c_int, off: i64) = nr::PREADV => isize, -1;
     /// `pwritev(2)`.
     pub unsafe fn pwritev(fd: c_int, iov: *const c_void, count: c_int, off: i64) = nr::PWRITEV => isize, -1;
-    /// `flock(2)`.
-    pub unsafe fn flock(fd: c_int, op: c_int) = nr::FLOCK => c_int, -1;
     /// `sendfile(2)`.
     pub unsafe fn sendfile(out_fd: c_int, in_fd: c_int, off: *mut i64, count: usize) = nr::SENDFILE => isize, -1;
     /// `munmap(2)`.
@@ -143,18 +143,12 @@ syscalls! {
     pub unsafe fn getrusage(who: c_int, usage: *mut c_void) = nr::GETRUSAGE => c_int, -1;
     /// `uname(2)`.
     pub unsafe fn uname(buf: *mut c_void) = nr::UNAME => c_int, -1;
-    /// `sync(2)`.
-    pub unsafe fn sync() = nr::SYNC => c_int, -1;
-    /// `nice(2)` is not a syscall on x86_64; `setpriority` is used.
-    pub unsafe fn setpriority(which: c_int, who: c_int, prio: c_int) = 141 => c_int, -1;
     /// `mknodat(2)`.
     pub unsafe fn mknodat(dirfd: c_int, path: *const c_char, mode: c_uint, dev: c_ulong) = 259 => c_int, -1;
     /// `sched_setaffinity(2)`.
     pub unsafe fn sched_setaffinity(pid: c_int, size: usize, mask: *const c_void) = nr::SCHED_SETAFFINITY => c_int, -1;
     /// `sysinfo(2)`.
     pub unsafe fn sysinfo(info: *mut c_void) = nr::SYSINFO => c_int, -1;
-    /// `eventfd2(2)`.
-    pub unsafe fn eventfd(initval: c_uint, flags: c_int) = nr::EVENTFD2 => c_int, -1;
     /// `memfd_create(2)`.
     pub unsafe fn memfd_create(name: *const c_char, flags: c_uint) = nr::MEMFD_CREATE => c_int, -1;
     /// `statx(2)`.
@@ -169,6 +163,31 @@ syscalls! {
     pub unsafe fn getitimer(which: c_int, value: *mut c_void) = nr::GETITIMER => c_int, -1;
     /// `setitimer(2)`.
     pub unsafe fn setitimer(which: c_int, new: *const c_void, old: *mut c_void) = nr::SETITIMER => c_int, -1;
+}
+
+safe_syscalls! {
+    /// `fchdir(2)`.
+    pub fn fchdir(fd: c_int) = nr::FCHDIR => c_int, -1;
+    /// `fchmod(2)`.
+    pub fn fchmod(fd: c_int, mode: c_uint) = nr::FCHMOD => c_int, -1;
+    /// `fchown(2)`.
+    pub fn fchown(fd: c_int, uid: c_uint, gid: c_uint) = nr::FCHOWN => c_int, -1;
+    /// `umask(2)`.
+    pub fn umask(mask: c_uint) = nr::UMASK => c_uint, 0;
+    /// `ftruncate(2)`.
+    pub fn ftruncate(fd: c_int, len: i64) = nr::FTRUNCATE => c_int, -1;
+    /// `fsync(2)`.
+    pub fn fsync(fd: c_int) = nr::FSYNC => c_int, -1;
+    /// `fdatasync(2)`.
+    pub fn fdatasync(fd: c_int) = nr::FDATASYNC => c_int, -1;
+    /// `flock(2)`.
+    pub fn flock(fd: c_int, op: c_int) = nr::FLOCK => c_int, -1;
+    /// `sync(2)`.
+    pub fn sync() = nr::SYNC => c_int, -1;
+    /// `setpriority(2)`.
+    pub fn setpriority(which: c_int, who: c_int, prio: c_int) = 141 => c_int, -1;
+    /// `eventfd2(2)`.
+    pub fn eventfd(initval: c_uint, flags: c_int) = nr::EVENTFD2 => c_int, -1;
 }
 
 /// `open(2)`.
@@ -487,8 +506,7 @@ pub extern "C" fn getpriority(which: c_int, who: c_int) -> c_int {
 pub extern "C" fn nice(inc: c_int) -> c_int {
     let cur = getpriority(0, 0);
     let new = cur.saturating_add(inc).clamp(-20, 19);
-    // SAFETY: no memory is involved.
-    if unsafe { setpriority(0, 0, new) } < 0 {
+    if setpriority(0, 0, new) < 0 {
         -1
     } else {
         new
