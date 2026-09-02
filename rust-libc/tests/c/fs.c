@@ -11,6 +11,7 @@
 #include <sys/stat.h>
 #include <sys/uio.h>
 #include <sys/utsname.h>
+#include <sys/auxv.h>
 #include <unistd.h>
 
 #if defined(__x86_64__)
@@ -21,6 +22,9 @@
 #define CHECK(cond) do { if (!(cond)) { const char *m = "FAIL: " #cond "\n"; write(2, m, strlen(m)); return __LINE__; } } while (0)
 
 int main(void) {
+    // The page size comes from the kernel, not a compile-time constant.
+    CHECK(getpagesize() == (int)getauxval(AT_PAGESZ) && sysconf(_SC_PAGESIZE) == getpagesize());
+
     char tmpl[] = "/tmp/rustlibc-fs-XXXXXX";
     CHECK(mkdtemp(tmpl) != NULL);
     char path[512], lnk[512], cwd[512];
@@ -124,7 +128,7 @@ int main(void) {
     CHECK(uname(&u) == 0 && strcmp(u.sysname, "Linux") == 0 && strcmp(u.machine, MACHINE) == 0);
     char host[256];
     CHECK(gethostname(host, sizeof host) == 0 && strcmp(host, u.nodename) == 0);
-    CHECK(sysconf(_SC_PAGESIZE) == 4096 && getpagesize() == 4096);
+    CHECK(sysconf(_SC_PAGESIZE) >= 4096 && getpagesize() == sysconf(_SC_PAGESIZE));
     CHECK(sysconf(_SC_NPROCESSORS_ONLN) >= 1 && sysconf(_SC_OPEN_MAX) >= 256);
     struct rlimit rl;
     CHECK(getrlimit(RLIMIT_NOFILE, &rl) == 0 && rl.rlim_cur >= 256 && rl.rlim_cur <= rl.rlim_max);

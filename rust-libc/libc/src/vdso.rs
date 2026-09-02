@@ -120,7 +120,7 @@ pub fn init() {
         return;
     }
     // The program headers must be mapped along with the header page.
-    img.len = crate::sys::PAGE_SIZE.max(phoff as usize + phnum as usize * phentsize as usize);
+    img.len = crate::sys::page_size().max(phoff as usize + phnum as usize * phentsize as usize);
     let mut dynamic = None;
     let mut load: Option<Phdr> = None;
     for i in 0..phnum as usize {

@@ -30,7 +30,7 @@ use super::{
 use crate::errno::Errno;
 use crate::sync::Mutex;
 use crate::sys::{
-    self, MAP_ANONYMOUS, MAP_NORESERVE, MAP_PRIVATE, MAP_STACK, PAGE_SIZE, PROT_NONE, PROT_READ,
+    self, MAP_ANONYMOUS, MAP_NORESERVE, MAP_PRIVATE, MAP_STACK, MIN_PAGE_SIZE, PROT_NONE, PROT_READ,
     PROT_WRITE,
 };
 use core::ffi::{c_int, c_void};
@@ -43,7 +43,8 @@ pub type PthreadT = usize;
 /// Default stack size for new threads.
 const DEFAULT_STACK: usize = 8 << 20;
 /// Default guard size.
-const DEFAULT_GUARD: usize = PAGE_SIZE;
+/// Default guard size (rounded up to the kernel's page size on use).
+const DEFAULT_GUARD: usize = MIN_PAGE_SIZE;
 
 /// `pthread_attr_t`.
 #[repr(C)]
@@ -150,8 +151,8 @@ pub unsafe extern "C" fn pthread_create(
     let attr = unsafe { attr.as_ref().copied() }.unwrap_or(DEFAULT_ATTR);
     let tls_len = tls::round_up(tls::region_size(), 16);
     let (Some(guard), Some(stack)) = (
-        attr.guard_size.checked_next_multiple_of(PAGE_SIZE),
-        attr.stack_size.max(16 * 1024).checked_next_multiple_of(PAGE_SIZE),
+        attr.guard_size.checked_next_multiple_of(sys::page_size()),
+        attr.stack_size.max(16 * 1024).checked_next_multiple_of(sys::page_size()),
     ) else {
         return Errno::EINVAL.0;
     };
@@ -161,7 +162,7 @@ pub unsafe extern "C" fn pthread_create(
     let Some(len) = guard
         .checked_add(stack)
         .and_then(|v| v.checked_add(tls_len))
-        .map(|v| tls::round_up(v, PAGE_SIZE))
+        .map(|v| tls::round_up(v, sys::page_size()))
     else {
         return Errno::EINVAL.0;
     };

@@ -8,7 +8,7 @@
 use crate::arch::{nr, syscall0, syscall1, syscall2, syscall3, syscall4, syscall5, syscall6};
 use crate::errno::Errno;
 use core::ffi::{c_int, c_void};
-use core::sync::atomic::AtomicU32;
+use core::sync::atomic::{AtomicU32, AtomicUsize};
 
 pub mod types;
 pub use types::*;
@@ -381,6 +381,24 @@ pub unsafe fn unlinkat(dirfd: c_int, path: *const u8, flags: c_int) -> Result<()
             flags as usize,
         ))
         .map(drop)
+    }
+}
+
+/// The kernel's page size, from `AT_PAGESZ` (aarch64 kernels may use
+/// 16 or 64 KiB pages). Anything the kernel requires to be page aligned
+/// (`mprotect`, `madvise`, guard pages) must use this.
+static PAGE_SIZE: AtomicUsize = AtomicUsize::new(MIN_PAGE_SIZE);
+
+/// The page size of the running kernel.
+#[inline]
+pub fn page_size() -> usize {
+    PAGE_SIZE.load(core::sync::atomic::Ordering::Relaxed)
+}
+
+/// Records the page size reported by the kernel (startup only).
+pub fn set_page_size(size: usize) {
+    if size.is_power_of_two() && size >= MIN_PAGE_SIZE {
+        PAGE_SIZE.store(size, core::sync::atomic::Ordering::Relaxed);
     }
 }
 

@@ -47,7 +47,24 @@ struct Rela {
 /// Must be called exactly once, before anything else in the process
 /// reads a relocated pointer.
 #[inline(always)]
-pub unsafe fn relocate() -> usize {
+pub unsafe fn relocate(sp: *const usize) -> usize {
+    // The page size, for the RELRO protection: read straight from the
+    // auxiliary vector on the initial stack (nothing else is usable yet).
+    let mut page = crate::sys::MIN_PAGE_SIZE;
+    // SAFETY: the kernel lays out argc, argv, NULL, envp, NULL, auxv.
+    unsafe {
+        let mut p = sp.add(*sp + 2);
+        while !(*p as *const u8).is_null() {
+            p = p.add(1);
+        }
+        p = p.add(1);
+        while *p != 0 {
+            if *p == 6 {
+                page = *p.add(1);
+            }
+            p = p.add(2);
+        }
+    }
     let ehdr = crate::arch::ehdr_start();
     // SAFETY: the ELF header is mapped (the linker put it in the first
     // segment); the program headers follow at `e_phoff`.
@@ -141,7 +158,7 @@ pub unsafe fn relocate() -> usize {
         // GOT, `const` tables of pointers, ...) is now final: take the
         // write permission away, as the dynamic linker would.
         if let Some((vaddr, len)) = relro {
-            let start = bias.wrapping_add(vaddr) & !(crate::sys::PAGE_SIZE - 1);
+            let start = bias.wrapping_add(vaddr) & !(page - 1);
             let end = bias.wrapping_add(vaddr).wrapping_add(len);
             if end > start {
                 let _ = crate::sys::mprotect(start as *mut u8, end - start, crate::sys::PROT_READ);

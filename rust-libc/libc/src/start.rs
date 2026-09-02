@@ -133,7 +133,7 @@ pub unsafe extern "C" fn start_c(sp: *const usize) -> ! {
     // A static PIE must relocate itself before any pointer in its data
     // (including the statics below) can be trusted.
     // SAFETY: called once, first.
-    let bias = unsafe { crate::reloc::relocate() };
+    let bias = unsafe { crate::reloc::relocate(sp) };
     // SAFETY: startup is single-threaded.
     unsafe { *LOAD_BIAS.0.get() = bias };
     // SAFETY: the kernel lays out argc, argv, NULL, envp, NULL, auxv.
@@ -149,6 +149,9 @@ pub unsafe extern "C" fn start_c(sp: *const usize) -> ! {
         environ = envp;
         (argc, argv, envp)
     };
+    if let Some(size) = auxval(auxv::AT_PAGESZ) {
+        crate::sys::set_page_size(size);
+    }
 
     // Static TLS and the main thread's TCB.
     // SAFETY: AT_PHDR/AT_PHNUM describe the executable's own headers.
@@ -175,7 +178,7 @@ pub unsafe extern "C" fn start_c(sp: *const usize) -> ! {
         __stack_chk_guard = canary;
     }
     crate::malloc::init(heap_seed.try_into().unwrap_or([0; 8]));
-    let size = tls::round_up(tls::region_size(), crate::sys::PAGE_SIZE);
+    let size = tls::round_up(tls::region_size(), crate::sys::page_size());
     // SAFETY: anonymous private mapping with no address hint.
     let region = unsafe {
         crate::sys::mmap(

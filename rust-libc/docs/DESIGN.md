@@ -92,6 +92,14 @@ calls that exist everywhere (`openat`, `ppoll`, `clone`, `dup3`,
 `epoll_event`, the `O_*` flags, `wchar_t`) are conditional in both the
 Rust code and the headers, and `tests/c/abi.c` checks the header side.
 
+The page size is not a constant: AArch64 kernels are built with 4, 16 or
+64 KiB pages. `sys::page_size()` holds the value of `AT_PAGESZ` and is
+what every page-granular kernel interface uses (guard pages, `mprotect`,
+`madvise`, RELRO, `sysconf`); `MIN_PAGE_SIZE` (4 KiB) remains where only
+a lower bound matters, such as the string kernels' rule that an aligned
+vector load never crosses a page. `cargo xtask --aarch64
+--pagesize=65536 test` runs the suite with qemu emulating such a kernel.
+
 ## Error handling
 
 Internally everything returns `sys::Result<T>` (`Result<T, Errno>`).

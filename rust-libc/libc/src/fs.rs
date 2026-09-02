@@ -12,7 +12,7 @@
 use crate::c_char;
 use crate::errno::{CReturn, CReturnOr, Errno};
 use crate::malloc;
-use crate::sys::{self, AT_FDCWD, PAGE_SIZE, Timespec};
+use crate::sys::{self, AT_FDCWD, Timespec};
 use core::ffi::{c_int, c_long, c_uint, c_ulong, c_void};
 use core::ptr;
 
@@ -491,7 +491,7 @@ pub unsafe extern "C" fn mmap(
     fd: c_int,
     off: i64,
 ) -> *mut c_void {
-    if off % PAGE_SIZE as i64 != 0 || len == 0 {
+    if off % sys::page_size() as i64 != 0 || len == 0 {
         Errno::EINVAL.set();
         return usize::MAX as *mut c_void;
     }
@@ -605,7 +605,7 @@ pub unsafe extern "C" fn prlimit(
 /// `getpagesize(3)`.
 #[cfg_attr(not(test), unsafe(no_mangle))]
 pub extern "C" fn getpagesize() -> c_int {
-    PAGE_SIZE as c_int
+    sys::page_size() as c_int
 }
 
 /// Number of online CPUs, from the affinity mask.
@@ -683,7 +683,7 @@ pub extern "C" fn sysconf(name: c_int) -> c_long {
                 -1
             }
         }
-        SC_PAGESIZE => PAGE_SIZE as c_long,
+        SC_PAGESIZE => sys::page_size() as c_long,
         SC_LINE_MAX => 4096,
         SC_IOV_MAX => 1024,
         SC_GETGR_R_SIZE_MAX | SC_GETPW_R_SIZE_MAX => 1024,
@@ -707,7 +707,7 @@ pub extern "C" fn sysconf(name: c_int) -> c_long {
             } else {
                 info.freeram
             };
-            (bytes / PAGE_SIZE as u64) as c_long
+            (bytes / sys::page_size() as u64) as c_long
         }
         SC_MONOTONIC_CLOCK => 200809,
         SC_SYMLOOP_MAX => 40,

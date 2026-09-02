@@ -26,7 +26,7 @@
 
 use crate::string::lanes::{Lanes, Mask};
 use crate::string::simd::dispatch_fn;
-use crate::sys::PAGE_SIZE;
+use crate::sys::MIN_PAGE_SIZE;
 use core::ffi::c_int;
 
 /// Loads one vector from `p`.
@@ -43,14 +43,14 @@ unsafe fn load<L: Lanes>(p: *const u8) -> L {
 /// True if a read of `n` bytes at `p` stays inside one page.
 #[inline(always)]
 fn page_safe(p: *const u8, n: usize) -> bool {
-    (p as usize & (PAGE_SIZE - 1)) <= PAGE_SIZE - n
+    (p as usize & (MIN_PAGE_SIZE - 1)) <= MIN_PAGE_SIZE - n
 }
 
 /// [`page_safe`] for two pointers, evaluated without branches.
 #[inline(always)]
 fn both_page_safe(a: *const u8, b: *const u8, n: usize) -> bool {
-    let (oa, ob) = (a as usize & (PAGE_SIZE - 1), b as usize & (PAGE_SIZE - 1));
-    oa.max(ob) <= PAGE_SIZE - n
+    let (oa, ob) = (a as usize & (MIN_PAGE_SIZE - 1), b as usize & (MIN_PAGE_SIZE - 1));
+    oa.max(ob) <= MIN_PAGE_SIZE - n
 }
 
 /// Mask of the low `k` bits (all bits for `k >= 64`).
@@ -951,7 +951,7 @@ mod tests {
         for_each_level(|| {
             // Two buffers placed at the end of a page so vector loads would
             // fault if the page-safety check were wrong.
-            let page = PAGE_SIZE;
+            let page = MIN_PAGE_SIZE;
             let mut region_a = vec![0u8; 3 * page];
             let mut region_b = vec![0u8; 3 * page];
             let base_a = (region_a.as_ptr() as usize + page - 1) & !(page - 1);
@@ -1015,7 +1015,7 @@ mod tests {
     #[test]
     fn memchr_memcmp_small_inputs_at_page_edges() {
         for_each_level(|| {
-            let page = PAGE_SIZE;
+            let page = MIN_PAGE_SIZE;
             let mut region = vec![0u8; 3 * page];
             let base = (region.as_ptr() as usize + page - 1) & !(page - 1);
             let off = base - region.as_ptr() as usize;

@@ -54,6 +54,7 @@ cargo test -p rustlibc   # host unit tests of the pure Rust code
 cargo xtask --aarch64 test   # cross-build with aarch64-linux-gnu-gcc and
                              # run the suite under qemu-aarch64
 cargo xtask --pie test       # link every test as a static PIE
+cargo xtask --aarch64 --pagesize=65536 test  # emulate a 64 KiB-page kernel
 ```
 
 The AArch64 build needs `rustup target add aarch64-unknown-linux-gnu`,
@@ -114,9 +115,7 @@ Known limitations: no dynamic linking (static and static-pie only);
 multibyte conversion is UTF-8 only; `long double` is treated as `double` (no `*l` math functions;
 `strtold` returns a `double`'s precision, in the platform's `long double`
 format); no `dlopen` (static linking only); cancellation is acted on at
-cancellation points rather than at any instruction inside a system call;
-the page size is assumed to be 4 KiB (AArch64 kernels configured for
-16 or 64 KiB pages are not supported).
+cancellation points rather than at any instruction inside a system call.
 
 ## Performance
 

@@ -32,7 +32,11 @@ pub const MAP_POPULATE: c_int = 0x8000;
 pub const MAP_STACK: c_int = 0x20000;
 
 /// The page size on x86_64. Linux on x86_64 only supports 4 KiB pages.
-pub const PAGE_SIZE: usize = 4096;
+/// The smallest page size of any supported kernel configuration. Used
+/// where a *lower bound* on the page size is what matters (the string
+/// kernels' over-read safety, allocator alignment); the actual page size
+/// is [`super::page_size`].
+pub const MIN_PAGE_SIZE: usize = 4096;
 
 /// Signal numbers.
 pub const SIGHUP: c_int = 1;

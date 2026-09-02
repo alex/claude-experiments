@@ -417,7 +417,7 @@ pub fn alloc_aligned(size: usize, align: usize) -> *mut u8 {
     if align <= 16 {
         return alloc(size);
     }
-    if align <= crate::sys::PAGE_SIZE
+    if align <= crate::sys::MIN_PAGE_SIZE
         && let Some(class) = class_for_aligned(size, align)
     {
         return alloc(CLASS_SIZE[class] as usize);
@@ -689,7 +689,7 @@ pub extern "C" fn memalign(align: usize, size: usize) -> *mut c_void {
 /// `valloc(3)`.
 #[cfg_attr(not(test), unsafe(no_mangle))]
 pub extern "C" fn valloc(size: usize) -> *mut c_void {
-    memalign(crate::sys::PAGE_SIZE, size)
+    memalign(crate::sys::page_size(), size)
 }
 
 /// `malloc_usable_size(3)`.

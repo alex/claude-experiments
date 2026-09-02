@@ -19,7 +19,7 @@
 use super::classes::{CLASS_INV, CLASS_INV_SHIFT, CLASS_SIZE, units_for_class};
 use crate::sync::{Mutex, RawMutex};
 use crate::sys::{
-    self, MAP_ANONYMOUS, MAP_NORESERVE, MAP_PRIVATE, PAGE_SIZE, PROT_READ, PROT_WRITE,
+    self, MAP_ANONYMOUS, MAP_NORESERVE, MAP_PRIVATE, MIN_PAGE_SIZE, PROT_READ, PROT_WRITE,
 };
 use core::ptr;
 use core::sync::atomic::{AtomicU8, AtomicU64, AtomicUsize, Ordering};
@@ -33,7 +33,7 @@ pub const UNITS: usize = SEGMENT_SIZE / UNIT_SIZE;
 /// Bytes at the start of a normal segment reserved for the header.
 const HEADER_SIZE: usize = 8192;
 /// Bytes at the start of a huge mapping reserved for the header.
-const HUGE_HEADER_SIZE: usize = PAGE_SIZE;
+const HUGE_HEADER_SIZE: usize = MIN_PAGE_SIZE;
 
 const MAGIC_NORMAL: usize = 0x5a5a_a11c_5e6d_0001;
 const MAGIC_HUGE: usize = 0x5a5a_a11c_5e6d_0002;
@@ -370,7 +370,7 @@ pub fn alloc_span(class: usize, owner: usize) -> Option<*mut Span> {
         // smallest class fits fewer than that per unit.
         let max_blocks = (end - start) / block_size;
         let bitmap_bytes = max_blocks.div_ceil(64) * 8;
-        let data = (start + bitmap_bytes).next_multiple_of(PAGE_SIZE);
+        let data = (start + bitmap_bytes).next_multiple_of(MIN_PAGE_SIZE);
         let capacity = ((end - data) / block_size) as u32;
         ptr::write_bytes(start as *mut u8, 0, bitmap_bytes);
         span.write(Span {
@@ -460,9 +460,13 @@ unsafe fn madvise_units(seg: *mut Segment, first: usize, n: usize) {
     let mut start = seg as usize + first * UNIT_SIZE;
     let end = start + n * UNIT_SIZE;
     if first == 0 {
-        start += HEADER_SIZE;
+        // Keep the header, rounded to the kernel's page size (which may
+        // exceed the header's size).
+        start += HEADER_SIZE.next_multiple_of(sys::page_size());
     }
-    madvise_dontneed(start as *mut u8, end - start);
+    if end > start {
+        madvise_dontneed(start as *mut u8, end - start);
+    }
 }
 
 fn madvise_dontneed(addr: *mut u8, len: usize) {
@@ -560,14 +564,14 @@ fn is_registered(base: usize) -> bool {
 /// The flag is true if the memory is a fresh (zero-filled) mapping rather
 /// than a recycled one.
 pub fn alloc_huge(size: usize, align: usize) -> Option<(*mut u8, bool)> {
-    let align = align.max(PAGE_SIZE);
+    let align = align.max(MIN_PAGE_SIZE);
     if align > SEGMENT_SIZE {
         return None;
     }
     let data_off = HUGE_HEADER_SIZE.next_multiple_of(align);
     let len = data_off
         .checked_add(size)?
-        .checked_next_multiple_of(PAGE_SIZE)?;
+        .checked_next_multiple_of(MIN_PAGE_SIZE)?;
     let (base, len, fresh) = match take_cached(len) {
         Some((base, len, zeroed)) => (base, len, zeroed),
         None => (map_aligned(len)?, len, true),
@@ -602,7 +606,7 @@ pub unsafe fn realloc_huge(h: *mut Header, size: usize) -> Option<*mut u8> {
     let (old_len, data_off) = unsafe { ((*h).map_len, (*h).data as usize - h as usize) };
     let new_len = data_off
         .checked_add(size)?
-        .checked_next_multiple_of(PAGE_SIZE)?;
+        .checked_next_multiple_of(MIN_PAGE_SIZE)?;
     if new_len == old_len {
         // SAFETY: caller contract.
         return Some(unsafe { (*h).data });
@@ -743,7 +747,7 @@ mod tests {
         unsafe {
             assert_eq!((*span).block_size, 16);
             assert!((*span).capacity > 15000);
-            assert_eq!((*span).data as usize % PAGE_SIZE, 0);
+            assert_eq!((*span).data as usize % MIN_PAGE_SIZE, 0);
             assert!(!(*span).is_allocated(0));
             (*span).mark_allocated(70);
             assert!((*span).is_allocated(70));

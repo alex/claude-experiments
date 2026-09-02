@@ -9,6 +9,7 @@
 //! cargo xtask --aarch64 test  # cross-build with aarch64-linux-gnu-gcc,
 //!                             # run under qemu-aarch64
 //! cargo xtask --pie test      # link the tests as static PIEs
+//! cargo xtask --aarch64 --pagesize=65536 test  # emulate 64 KiB pages
 //! ```
 //!
 //! Each C test (or C++ test, `*.cpp`, linked with the host toolchain's
@@ -43,6 +44,8 @@ static TARGET: Mutex<Target> = Mutex::new(Target::Host);
 /// Link the test programs as static PIEs instead of fixed-address
 /// executables.
 static PIE: Mutex<bool> = Mutex::new(false);
+/// Page size to emulate (`qemu -p`), for cross runs.
+static PAGESIZE: Mutex<Option<String>> = Mutex::new(None);
 
 fn pie() -> bool {
     *PIE.lock().unwrap()
@@ -330,6 +333,9 @@ fn run_test(sysroot: &Path, bindir: &Path, src: &Path) -> Result<(), String> {
     let mut cmd = match target().runner() {
         Some(runner) => {
             let mut c = Command::new(runner);
+            if let Some(p) = PAGESIZE.lock().unwrap().as_ref() {
+                c.args(["-p", p]);
+            }
             c.arg(&bin);
             c
         }
@@ -545,10 +551,13 @@ fn main() -> ExitCode {
     if args.iter().any(|a| a == "--pie") {
         *PIE.lock().unwrap() = true;
     }
+    if let Some(p) = args.iter().find_map(|a| a.strip_prefix("--pagesize=")) {
+        *PAGESIZE.lock().unwrap() = Some(p.to_string());
+    }
     let args: Vec<&str> = args
         .iter()
         .map(String::as_str)
-        .filter(|a| *a != "--debug" && *a != "--aarch64" && *a != "--pie")
+        .filter(|a| *a != "--debug" && *a != "--aarch64" && *a != "--pie" && !a.starts_with("--pagesize="))
         .collect();
     match args.as_slice() {
         ["build"] => match build(release) {
