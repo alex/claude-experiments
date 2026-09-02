@@ -903,7 +903,8 @@ pub unsafe extern "C" fn fdopen(fd: c_int, mode: *const c_char) -> *mut File {
     f
 }
 
-/// `freopen(3)`. A NULL path is not supported (returns NULL, `EINVAL`).
+/// `freopen(3)`. With a NULL path the stream's own file is reopened with
+/// the new mode (through `/proc/self/fd`), keeping its descriptor number.
 ///
 /// # Safety
 /// `path` and `mode` must be NUL-terminated; `f` must be a valid stream.
@@ -913,10 +914,6 @@ pub unsafe extern "C" fn freopen(
     mode: *const c_char,
     f: *mut File,
 ) -> *mut File {
-    if path.is_null() {
-        Errno::EINVAL.set();
-        return ptr::null_mut();
-    }
     // SAFETY: forwarded.
     let mode_bytes =
         unsafe { core::slice::from_raw_parts(mode as *const u8, crate::string::str::strlen(mode)) };
@@ -927,27 +924,65 @@ pub unsafe extern "C" fn freopen(
     // SAFETY: forwarded.
     let mut g = unsafe { lock(f) };
     let _ = g.flush();
-    if g.fd >= 0 {
-        // SAFETY: the ops are valid for this stream.
-        let _ = unsafe { (g.ops.close)(&mut g) };
-    }
-    // SAFETY: forwarded.
-    let fd = match unsafe {
-        sys::openat(
-            sys::AT_FDCWD,
-            path as *const u8,
-            oflags | crate::sys::O_LARGEFILE,
-            0o666,
-        )
-    } {
-        Ok(fd) => fd,
-        Err(e) => {
-            g.fd = -1;
-            e.set();
+    if path.is_null() {
+        // Reopen the same file: open it again by descriptor path, then
+        // move the new descriptor onto the old number.
+        if g.fd < 0 {
+            Errno::EBADF.set();
             return ptr::null_mut();
         }
-    };
-    g.fd = fd;
+        let mut p = [0u8; 32];
+        let mut w = crate::fmt::SliceWriter::new(&mut p);
+        let _ = core::fmt::write(&mut w, format_args!("/proc/self/fd/{}", g.fd));
+        // SAFETY: NUL-terminated path in a local buffer.
+        let newfd = match unsafe {
+            sys::openat(
+                sys::AT_FDCWD,
+                p.as_ptr(),
+                oflags | crate::sys::O_LARGEFILE,
+                0o666,
+            )
+        } {
+            Ok(fd) => fd,
+            Err(e) => {
+                e.set();
+                return ptr::null_mut();
+            }
+        };
+        if newfd != g.fd {
+            // SAFETY: both descriptors are ours.
+            let r = unsafe {
+                crate::arch::syscall3(crate::arch::nr::DUP3, newfd as usize, g.fd as usize, 0)
+            };
+            let _ = sys::close(newfd);
+            if let Err(e) = sys::check(r) {
+                e.set();
+                return ptr::null_mut();
+            }
+        }
+    } else {
+        if g.fd >= 0 {
+            // SAFETY: the ops are valid for this stream.
+            let _ = unsafe { (g.ops.close)(&mut g) };
+        }
+        // SAFETY: forwarded.
+        let fd = match unsafe {
+            sys::openat(
+                sys::AT_FDCWD,
+                path as *const u8,
+                oflags | crate::sys::O_LARGEFILE,
+                0o666,
+            )
+        } {
+            Ok(fd) => fd,
+            Err(e) => {
+                g.fd = -1;
+                e.set();
+                return ptr::null_mut();
+            }
+        };
+        g.fd = fd;
+    }
     g.flags = (g.flags & (F_STATIC | F_OWN_BUF)) | flags;
     g.mode = MODE_IDLE;
     g.rpos = UNGET;

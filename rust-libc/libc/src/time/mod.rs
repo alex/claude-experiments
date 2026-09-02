@@ -2,11 +2,12 @@
 //!
 //! Clocks go straight to the kernel (no vDSO yet). Calendar conversion
 //! implements the proleptic Gregorian calendar with the well known
-//! days-from-civil algorithm. Only UTC is supported: `localtime` is
-//! `gmtime`, `tzname` is `{"UTC", "UTC"}` and `timezone` is 0.
+//! days-from-civil algorithm. Time zones (`TZ`, TZif files, POSIX rules)
+//! live in `tz.rs`.
 
 pub mod calendar;
 pub mod strftime;
+pub mod tz;
 
 use crate::c_char;
 use crate::errno::{CReturn, Errno};
@@ -261,9 +262,19 @@ pub extern "C" fn difftime(a: i64, b: i64) -> f64 {
     a as f64 - b as f64
 }
 
-/// `tzset(3)`: only UTC is supported, so nothing to do.
+/// `tzset(3)`: loads the zone named by `TZ` and sets `tzname`,
+/// `timezone` and `daylight`.
 #[cfg_attr(not(test), unsafe(no_mangle))]
-pub extern "C" fn tzset() {}
+pub extern "C" fn tzset() {
+    let (std, dst, west, has_dst) = tz::tzset();
+    // SAFETY: plain globals, written under the zone lock's protection in
+    // practice (concurrent tzset calls store the same values).
+    unsafe {
+        tzname = [std as *mut c_char, dst as *mut c_char];
+        timezone = west as c_long;
+        daylight = has_dst as c_int;
+    }
+}
 
 /// `gmtime_r(3)`.
 ///
@@ -297,24 +308,41 @@ pub unsafe extern "C" fn gmtime(t: *const i64) -> *mut Tm {
     unsafe { gmtime_r(t, out) }
 }
 
-/// `localtime_r(3)` (UTC).
+/// `localtime_r(3)`.
 ///
 /// # Safety
 /// Both pointers must be valid.
 #[cfg_attr(not(test), unsafe(no_mangle))]
 pub unsafe extern "C" fn localtime_r(t: *const i64, out: *mut Tm) -> *mut Tm {
-    // SAFETY: forwarded.
-    unsafe { gmtime_r(t, out) }
+    // SAFETY: caller contract.
+    let t = unsafe { *t };
+    let info = tz::local(t);
+    match t.checked_add(info.gmtoff).and_then(calendar::to_tm) {
+        Some(mut tm) => {
+            tm.tm_isdst = info.isdst as c_int;
+            tm.tm_gmtoff = info.gmtoff as c_long;
+            tm.tm_zone = info.zone;
+            // SAFETY: caller contract.
+            unsafe { *out = tm };
+            out
+        }
+        None => {
+            Errno::EOVERFLOW.set();
+            ptr::null_mut()
+        }
+    }
 }
 
-/// `localtime(3)` (UTC).
+/// `localtime(3)`.
 ///
 /// # Safety
 /// `t` must be valid.
 #[cfg_attr(not(test), unsafe(no_mangle))]
 pub unsafe extern "C" fn localtime(t: *const i64) -> *mut Tm {
+    // SAFETY: the TCB is valid for the life of the thread.
+    let out = unsafe { &raw mut (*crate::thread::current()).tm };
     // SAFETY: forwarded.
-    unsafe { gmtime(t) }
+    unsafe { localtime_r(t, out) }
 }
 
 /// `timegm(3)`: normalises `tm` and returns the corresponding time.
@@ -345,8 +373,23 @@ pub unsafe extern "C" fn timegm(tm: *mut Tm) -> i64 {
 /// `tm` must be valid.
 #[cfg_attr(not(test), unsafe(no_mangle))]
 pub unsafe extern "C" fn mktime(tm: *mut Tm) -> i64 {
-    // SAFETY: forwarded.
-    unsafe { timegm(tm) }
+    // SAFETY: caller contract.
+    let t = unsafe { &mut *tm };
+    let Some(local_secs) = calendar::from_tm(t) else {
+        Errno::EOVERFLOW.set();
+        return -1;
+    };
+    let isdst = match t.tm_isdst {
+        0 => Some(false),
+        d if d > 0 => Some(true),
+        _ => None,
+    };
+    let secs = tz::from_local(local_secs, isdst);
+    // SAFETY: `tm` is valid.
+    if unsafe { localtime_r(&secs, tm) }.is_null() {
+        return -1;
+    }
+    secs
 }
 
 /// `asctime_r(3)`: `buf` must hold at least 26 bytes.

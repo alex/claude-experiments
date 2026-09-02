@@ -19,7 +19,7 @@
 use crate::errno::Errno;
 use crate::poll::PollFd;
 use crate::socket::{AF_INET, AF_INET6, Addr, SOCK_DGRAM, SOCK_STREAM, SockaddrIn, SockaddrIn6};
-use crate::sys::{self, Timespec};
+use crate::sys;
 
 const POLLIN: i16 = 1;
 const POLLOUT: i16 = 4;
