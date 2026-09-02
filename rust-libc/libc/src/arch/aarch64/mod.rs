@@ -348,7 +348,7 @@ pub unsafe fn thread_pointer() -> *mut u8 {
 pub unsafe fn set_thread_pointer(tp: *mut u8) -> crate::sys::Result<()> {
     // SAFETY: caller contract.
     unsafe {
-        asm!("msr tpidr_el0, {}", in(reg) tp, options(nostack, nomem, preserves_flags));
+        asm!("msr tpidr_el0, {}", in(reg) tp, options(nostack, preserves_flags));
     }
     Ok(())
 }
@@ -359,3 +359,12 @@ pub fn trap() -> ! {
     // SAFETY: `brk` never returns.
     unsafe { asm!("brk #1", options(noreturn, nostack)) }
 }
+
+/// Index of the `jmp_buf` word where `sigsetjmp` keeps the signal mask
+/// (words 21 and 22 are the stashes used by the assembly stub).
+pub const JMPBUF_MASK_WORD: usize = 23;
+
+/// Names of the vDSO entry points.
+pub const VDSO_CLOCK_GETTIME: &[u8] = b"__kernel_clock_gettime";
+#[allow(missing_docs)]
+pub const VDSO_GETCPU: &[u8] = b"__kernel_getcpu";

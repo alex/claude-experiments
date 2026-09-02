@@ -157,3 +157,81 @@ pub const STATX: usize = 332;
 pub const RSEQ: usize = 334;
 pub const CLONE3: usize = 435;
 pub const FACCESSAT2: usize = 439;
+#[allow(missing_docs)]
+pub const RENAMEAT2: usize = 316;
+#[allow(missing_docs)]
+pub const EPOLL_CREATE1: usize = 291;
+#[allow(missing_docs)]
+pub const EPOLL_CTL: usize = 233;
+#[allow(missing_docs)]
+pub const GETGROUPS: usize = 115;
+#[allow(missing_docs)]
+pub const SETGROUPS: usize = 116;
+#[allow(missing_docs)]
+pub const SETRESUID: usize = 117;
+#[allow(missing_docs)]
+pub const SETRESGID: usize = 119;
+#[allow(missing_docs)]
+pub const FALLOCATE: usize = 285;
+#[allow(missing_docs)]
+pub const SETHOSTNAME: usize = 170;
+#[allow(missing_docs)]
+pub const SYNCFS: usize = 306;
+#[allow(missing_docs)]
+pub const EXECVEAT: usize = 322;
+#[allow(missing_docs)]
+pub const WAITID: usize = 247;
+#[allow(missing_docs)]
+pub const MLOCK: usize = 149;
+#[allow(missing_docs)]
+pub const MUNLOCK: usize = 150;
+#[allow(missing_docs)]
+pub const MKNODAT: usize = 259;
+#[allow(missing_docs)]
+pub const GETPRIORITY: usize = 140;
+#[allow(missing_docs)]
+pub const SETPRIORITY: usize = 141;
+#[allow(missing_docs)]
+pub const TIMERFD_CREATE: usize = 283;
+#[allow(missing_docs)]
+pub const EPOLL_PWAIT: usize = 281;
+#[allow(missing_docs)]
+pub const GETCPU: usize = 309;
+#[allow(missing_docs)]
+pub const SCHED_SETPARAM: usize = 142;
+#[allow(missing_docs)]
+pub const SCHED_GETPARAM: usize = 143;
+#[allow(missing_docs)]
+pub const SCHED_SETSCHEDULER: usize = 144;
+#[allow(missing_docs)]
+pub const SCHED_GETSCHEDULER: usize = 145;
+#[allow(missing_docs)]
+pub const SCHED_GET_PRIORITY_MAX: usize = 146;
+#[allow(missing_docs)]
+pub const SCHED_GET_PRIORITY_MIN: usize = 147;
+#[allow(missing_docs)]
+pub const SCHED_RR_GET_INTERVAL: usize = 148;
+#[allow(missing_docs)]
+pub const TIMERFD_SETTIME: usize = 286;
+#[allow(missing_docs)]
+pub const TIMERFD_GETTIME: usize = 287;
+#[allow(missing_docs)]
+pub const FADVISE64: usize = 221;
+#[allow(missing_docs)]
+pub const COPY_FILE_RANGE: usize = 326;
+#[allow(missing_docs)]
+pub const SIGNALFD4: usize = 289;
+#[allow(missing_docs)]
+pub const INOTIFY_INIT1: usize = 294;
+#[allow(missing_docs)]
+pub const INOTIFY_ADD_WATCH: usize = 254;
+#[allow(missing_docs)]
+pub const INOTIFY_RM_WATCH: usize = 255;
+#[allow(missing_docs)]
+pub const MLOCKALL: usize = 151;
+#[allow(missing_docs)]
+pub const MUNLOCKALL: usize = 152;
+#[allow(missing_docs)]
+pub const GETRESUID: usize = 118;
+#[allow(missing_docs)]
+pub const GETRESGID: usize = 120;

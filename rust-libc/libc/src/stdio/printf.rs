@@ -1549,12 +1549,12 @@ pub unsafe fn veprintf(fmt: *const c_char, ap: *mut VaList) -> c_int {
 #[cfg(not(test))]
 mod stubs {
     use crate::arch::va::variadic_stub;
-    variadic_stub!(printf, 1, "rsi", super::vprintf);
-    variadic_stub!(fprintf, 2, "rdx", super::vfprintf);
-    variadic_stub!(dprintf, 2, "rdx", super::vdprintf);
-    variadic_stub!(sprintf, 2, "rdx", super::vsprintf);
-    variadic_stub!(snprintf, 3, "rcx", super::vsnprintf);
-    variadic_stub!(asprintf, 2, "rdx", super::vasprintf);
+    variadic_stub!(printf, 1, super::vprintf);
+    variadic_stub!(fprintf, 2, super::vfprintf);
+    variadic_stub!(dprintf, 2, super::vdprintf);
+    variadic_stub!(sprintf, 2, super::vsprintf);
+    variadic_stub!(snprintf, 3, super::vsnprintf);
+    variadic_stub!(asprintf, 2, super::vasprintf);
 }
 
 #[cfg(test)]

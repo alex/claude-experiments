@@ -26,8 +26,20 @@ pub struct PollFd {
 #[cfg_attr(not(test), unsafe(no_mangle))]
 pub unsafe extern "C" fn poll(fds: *mut PollFd, n: c_uint, timeout: c_int) -> c_int {
     crate::thread::cancel_point();
-    // SAFETY: caller contract.
-    let r = unsafe { crate::arch::syscall3(nr::POLL, fds as usize, n as usize, timeout as usize) };
+    // `ppoll` exists everywhere; `poll` does not (aarch64).
+    let ts = sys::Timespec {
+        tv_sec: timeout as i64 / 1000,
+        tv_nsec: (timeout as i64 % 1000) * 1_000_000,
+    };
+    let ts_ptr = if timeout < 0 {
+        core::ptr::null()
+    } else {
+        &ts as *const sys::Timespec
+    };
+    // SAFETY: caller contract; `ts` outlives the call.
+    let r = unsafe {
+        crate::arch::syscall5(nr::PPOLL, fds as usize, n as usize, ts_ptr as usize, 0, 8)
+    };
     crate::thread::cancel_point();
     sys::check(r).map(|v| v as c_int).c_ret_or(-1)
 }
@@ -188,8 +200,9 @@ pub unsafe extern "C" fn select(
     result
 }
 
-/// `struct epoll_event` (packed on x86_64).
-#[repr(C, packed)]
+/// `struct epoll_event` (packed on x86_64, naturally aligned elsewhere).
+#[cfg_attr(target_arch = "x86_64", repr(C, packed))]
+#[cfg_attr(not(target_arch = "x86_64"), repr(C))]
 pub struct EpollEvent {
     /// Event mask.
     pub events: u32,
@@ -201,7 +214,7 @@ pub struct EpollEvent {
 #[cfg_attr(not(test), unsafe(no_mangle))]
 pub extern "C" fn epoll_create1(flags: c_int) -> c_int {
     // SAFETY: no memory is involved.
-    let r = unsafe { crate::arch::syscall1(291, flags as usize) };
+    let r = unsafe { crate::arch::syscall1(nr::EPOLL_CREATE1, flags as usize) };
     sys::check(r).map(|v| v as c_int).c_ret_or(-1)
 }
 
@@ -228,7 +241,7 @@ pub unsafe extern "C" fn epoll_ctl(
 ) -> c_int {
     // SAFETY: caller contract.
     let r = unsafe {
-        crate::arch::syscall4(233, epfd as usize, op as usize, fd as usize, event as usize)
+        crate::arch::syscall4(nr::EPOLL_CTL, epfd as usize, op as usize, fd as usize, event as usize)
     };
     sys::check(r).map(drop).c_ret()
 }
@@ -248,7 +261,7 @@ pub unsafe extern "C" fn epoll_pwait(
     // SAFETY: caller contract.
     let r = unsafe {
         crate::arch::syscall6(
-            281,
+            nr::EPOLL_PWAIT,
             epfd as usize,
             events as usize,
             max as usize,

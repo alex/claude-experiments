@@ -233,7 +233,7 @@ pub unsafe extern "C" fn pthread_create(
             flags,
             tcb as *mut c_void,
             tid,
-            tcb as *mut u8,
+            tls::thread_pointer_of(tcb),
             tid,
         )
     };

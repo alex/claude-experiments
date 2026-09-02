@@ -323,8 +323,17 @@ pub extern "C" fn raise(sig: c_int) -> c_int {
 #[cfg_attr(not(test), unsafe(no_mangle))]
 pub extern "C" fn pause() -> c_int {
     crate::thread::cancel_point();
-    // SAFETY: no memory is involved.
-    let r = unsafe { crate::arch::syscall0(crate::arch::nr::PAUSE) };
+    // `sigsuspend` with the current mask, which every architecture has.
+    let mut mask: u64 = 0;
+    // SAFETY: valid out-pointer.
+    if let Err(e) = unsafe { sys::rt_sigprocmask(SIG_BLOCK, ptr::null(), &mut mask) } {
+        e.set();
+        return -1;
+    }
+    // SAFETY: `mask` outlives the call.
+    let r = unsafe {
+        crate::arch::syscall2(crate::arch::nr::RT_SIGSUSPEND, &mask as *const u64 as usize, 8)
+    };
     sys::check(r).map(drop).c_ret()
 }
 
@@ -435,8 +444,23 @@ pub unsafe extern "C" fn sigwait(set: *const SigSet, sig: *mut c_int) -> c_int {
 /// `alarm(2)`.
 #[cfg_attr(not(test), unsafe(no_mangle))]
 pub extern "C" fn alarm(seconds: c_uint) -> c_uint {
-    // SAFETY: no memory is involved.
-    unsafe { crate::arch::syscall1(crate::arch::nr::ALARM, seconds as usize) as c_uint }
+    // `setitimer(ITIMER_REAL)`, which every architecture has. The old
+    // value's remaining time is rounded up as `alarm` documents.
+    let new: [i64; 4] = [0, 0, seconds as i64, 0];
+    let mut old: [i64; 4] = [0; 4];
+    // SAFETY: both structures outlive the call.
+    let r = unsafe {
+        crate::arch::syscall3(
+            crate::arch::nr::SETITIMER,
+            0,
+            new.as_ptr() as usize,
+            old.as_mut_ptr() as usize,
+        )
+    };
+    if sys::check(r).is_err() {
+        return 0;
+    }
+    (old[2] + (old[3] > 0) as i64) as c_uint
 }
 
 /// `stack_t`.
@@ -585,10 +609,10 @@ pub unsafe extern "C" fn psignal(sig: c_int, prefix: *const c_char) {
 /// Called only from the assembly stub with a valid `jmp_buf`.
 #[cfg_attr(not(test), unsafe(no_mangle))]
 pub unsafe extern "C" fn __sigsetjmp_tail(jb: *mut c_long, ret: c_int) -> c_int {
-    // SAFETY: the buffer has 8 register words, a stash word and 16 mask
-    // words; only the first mask word is used.
+    // SAFETY: the buffer has the register and stash words the assembly
+    // uses followed by 16 mask words; only the first mask word is used.
     unsafe {
-        let mask = jb.add(9) as *mut u64;
+        let mask = jb.add(crate::arch::JMPBUF_MASK_WORD) as *mut u64;
         if ret == 0 {
             let _ = sys::rt_sigprocmask(SIG_BLOCK, ptr::null(), mask);
         } else {

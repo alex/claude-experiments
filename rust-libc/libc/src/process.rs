@@ -122,12 +122,11 @@ pub unsafe extern "C" fn fexecve(
     argv: *const *const c_char,
     envp: *const *const c_char,
 ) -> c_int {
-    const EXECVEAT: usize = 322;
     const AT_EMPTY_PATH: usize = 0x1000;
     // SAFETY: caller contract; the empty path is a literal.
     let r = unsafe {
         crate::arch::syscall5(
-            EXECVEAT,
+            crate::arch::nr::EXECVEAT,
             fd as usize,
             c"".as_ptr() as usize,
             argv as usize,
@@ -367,9 +366,9 @@ pub unsafe extern "C" fn vexecle(
 #[cfg(not(test))]
 mod stubs {
     use crate::arch::va::variadic_stub;
-    variadic_stub!(execl, 2, "rdx", super::vexecl);
-    variadic_stub!(execlp, 2, "rdx", super::vexeclp);
-    variadic_stub!(execle, 2, "rdx", super::vexecle);
+    variadic_stub!(execl, 2, super::vexecl);
+    variadic_stub!(execlp, 2, super::vexeclp);
+    variadic_stub!(execle, 2, super::vexecle);
 }
 
 /// `wait4(2)`.
@@ -420,11 +419,10 @@ pub unsafe extern "C" fn waitid(
     info: *mut c_void,
     options: c_int,
 ) -> c_int {
-    const WAITID: usize = 247;
     // SAFETY: caller contract.
     let r = unsafe {
         crate::arch::syscall5(
-            WAITID,
+            crate::arch::nr::WAITID,
             idtype as usize,
             id as usize,
             info as usize,

@@ -391,12 +391,14 @@ pub unsafe fn unlinkat(dirfd: c_int, path: *const u8, flags: c_int) -> Result<()
 pub unsafe fn renameat(olddir: c_int, old: *const u8, newdir: c_int, new: *const u8) -> Result<()> {
     // SAFETY: caller contract.
     unsafe {
-        check(syscall4(
-            nr::RENAMEAT,
+        // `renameat2` with no flags: the only form every architecture has.
+        check(syscall5(
+            nr::RENAMEAT2,
             olddir as usize,
             old as usize,
             newdir as usize,
             new as usize,
+            0,
         ))
         .map(drop)
     }
@@ -482,8 +484,11 @@ pub unsafe fn rt_sigaction(
 
 /// `fork(2)`. Returns the child's pid in the parent and 0 in the child.
 pub fn fork() -> Result<c_int> {
+    // `clone(SIGCHLD)` is what `fork` is on every architecture (some have
+    // no `fork` system call); with every other argument zero the argument
+    // order differences do not matter.
     // SAFETY: no memory is involved.
-    unsafe { check(syscall0(nr::FORK)).map(|v| v as c_int) }
+    unsafe { check(syscall5(nr::CLONE, SIGCHLD as usize, 0, 0, 0, 0)).map(|v| v as c_int) }
 }
 
 /// `execve(2)`.

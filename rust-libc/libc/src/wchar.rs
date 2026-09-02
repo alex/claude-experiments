@@ -11,7 +11,11 @@ use core::ffi::{c_int, c_long, c_longlong, c_ulong, c_ulonglong};
 use core::ptr;
 
 /// `wchar_t`.
+#[cfg(target_arch = "x86_64")]
 pub type WChar = i32;
+/// `wchar_t` (unsigned on AArch64).
+#[cfg(not(target_arch = "x86_64"))]
+pub type WChar = u32;
 /// `wint_t`.
 pub type WInt = u32;
 /// `WEOF`.
@@ -1539,27 +1543,15 @@ pub unsafe extern "C" fn wcsftime(
 #[cfg(not(test))]
 mod stubs {
     use crate::arch::va::variadic_stub;
-    variadic_stub!(swprintf, 3, "rcx", super::vswprintf);
-    variadic_stub!(fwprintf, 2, "rdx", super::vfwprintf);
-    variadic_stub!(wprintf, 1, "rsi", super::vwprintf);
-    variadic_stub!(fwscanf, 2, "rdx", super::vfwscanf);
-    variadic_stub!(wscanf, 1, "rsi", super::vwscanf);
-    variadic_stub!(swscanf, 2, "rdx", super::vswscanf);
-    // `long double` is returned in `st(0)`; these convert `wcstod`'s
-    // `double` result (`long double` is not distinguished by this
-    // library).
-    core::arch::global_asm!(
-        ".globl wcstold",
-        ".type wcstold, @function",
-        "wcstold:",
-        "sub rsp, 8",
-        "call {wcstod}",
-        "movsd qword ptr [rsp], xmm0",
-        "fld qword ptr [rsp]",
-        "add rsp, 8",
-        "ret",
-        wcstod = sym super::wcstod,
-    );
+    variadic_stub!(swprintf, 3, super::vswprintf);
+    variadic_stub!(fwprintf, 2, super::vfwprintf);
+    variadic_stub!(wprintf, 1, super::vwprintf);
+    variadic_stub!(fwscanf, 2, super::vfwscanf);
+    variadic_stub!(wscanf, 1, super::vwscanf);
+    variadic_stub!(swscanf, 2, super::vswscanf);
+    // `long double` is not distinguished by this library: `wcstold`
+    // returns `wcstod`'s result converted to the `long double` format.
+    crate::arch::va::long_double_stub!(wcstold, super::wcstod);
 }
 
 #[cfg(test)]

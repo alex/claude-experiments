@@ -20,6 +20,7 @@ use core::ptr;
 #[allow(missing_docs)]
 #[repr(C)]
 #[derive(Clone, Copy, Default, Debug)]
+#[cfg(target_arch = "x86_64")]
 pub struct Stat {
     pub st_dev: u64,
     pub st_ino: u64,
@@ -38,7 +39,34 @@ pub struct Stat {
     pub _unused: [i64; 3],
 }
 
+/// `struct stat` (the asm-generic layout used by aarch64).
+#[allow(missing_docs)]
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+#[cfg(target_arch = "aarch64")]
+pub struct Stat {
+    pub st_dev: u64,
+    pub st_ino: u64,
+    pub st_mode: u32,
+    pub st_nlink: u32,
+    pub st_uid: u32,
+    pub st_gid: u32,
+    pub st_rdev: u64,
+    pub _pad1: u64,
+    pub st_size: i64,
+    pub st_blksize: i32,
+    pub _pad2: i32,
+    pub st_blocks: i64,
+    pub st_atim: Timespec,
+    pub st_mtim: Timespec,
+    pub st_ctim: Timespec,
+    pub _unused: [u32; 2],
+}
+
+#[cfg(target_arch = "x86_64")]
 const _: () = assert!(core::mem::size_of::<Stat>() == 144);
+#[cfg(target_arch = "aarch64")]
+const _: () = assert!(core::mem::size_of::<Stat>() == 128);
 
 /// `AT_SYMLINK_NOFOLLOW`.
 pub const AT_SYMLINK_NOFOLLOW: c_int = 0x100;
@@ -103,8 +131,8 @@ syscalls! {
     pub unsafe fn symlinkat(target: *const c_char, dirfd: c_int, path: *const c_char) = nr::SYMLINKAT => c_int, -1;
     /// `readlinkat(2)`.
     pub unsafe fn readlinkat(dirfd: c_int, path: *const c_char, buf: *mut c_char, len: usize) = nr::READLINKAT => isize, -1;
-    /// `renameat(2)`.
-    pub unsafe fn renameat(olddir: c_int, old: *const c_char, newdir: c_int, new: *const c_char) = nr::RENAMEAT => c_int, -1;
+    /// `renameat2(2)`.
+    pub unsafe fn renameat2(olddir: c_int, old: *const c_char, newdir: c_int, new: *const c_char, flags: c_uint) = nr::RENAMEAT2 => c_int, -1;
     /// `fchmodat(2)`.
     pub unsafe fn fchmodat(dirfd: c_int, path: *const c_char, mode: c_uint, flags: c_int) = nr::FCHMODAT => c_int, -1;
     /// `fchownat(2)`.
@@ -132,9 +160,9 @@ syscalls! {
     /// `msync(2)`.
     pub unsafe fn msync(addr: *mut c_void, len: usize, flags: c_int) = nr::MSYNC => c_int, -1;
     /// `mlock(2)`.
-    pub unsafe fn mlock(addr: *const c_void, len: usize) = 149 => c_int, -1;
+    pub unsafe fn mlock(addr: *const c_void, len: usize) = nr::MLOCK => c_int, -1;
     /// `munlock(2)`.
-    pub unsafe fn munlock(addr: *const c_void, len: usize) = 150 => c_int, -1;
+    pub unsafe fn munlock(addr: *const c_void, len: usize) = nr::MUNLOCK => c_int, -1;
     /// `chroot(2)`.
     pub unsafe fn chroot(path: *const c_char) = nr::CHROOT => c_int, -1;
     /// `prctl(2)`.
@@ -144,7 +172,7 @@ syscalls! {
     /// `uname(2)`.
     pub unsafe fn uname(buf: *mut c_void) = nr::UNAME => c_int, -1;
     /// `mknodat(2)`.
-    pub unsafe fn mknodat(dirfd: c_int, path: *const c_char, mode: c_uint, dev: c_ulong) = 259 => c_int, -1;
+    pub unsafe fn mknodat(dirfd: c_int, path: *const c_char, mode: c_uint, dev: c_ulong) = nr::MKNODAT => c_int, -1;
     /// `sched_setaffinity(2)`.
     pub unsafe fn sched_setaffinity(pid: c_int, size: usize, mask: *const c_void) = nr::SCHED_SETAFFINITY => c_int, -1;
     /// `sysinfo(2)`.
@@ -154,7 +182,7 @@ syscalls! {
     /// `statx(2)`.
     pub unsafe fn statx(dirfd: c_int, path: *const c_char, flags: c_int, mask: c_uint, buf: *mut c_void) = nr::STATX => c_int, -1;
     /// `getpriority(2)`; the kernel returns `20 - nice`, see wrapper.
-    unsafe fn getpriority_raw(which: c_int, who: c_int) = 140 => c_int, -1;
+    unsafe fn getpriority_raw(which: c_int, who: c_int) = nr::GETPRIORITY => c_int, -1;
     /// `setrlimit` via `prlimit64` on the calling process.
     unsafe fn prlimit64(pid: c_int, resource: c_int, new: *const c_void, old: *mut c_void) = nr::PRLIMIT64 => c_int, -1;
     /// `times(2)`.
@@ -185,7 +213,7 @@ safe_syscalls! {
     /// `sync(2)`.
     pub fn sync() = nr::SYNC => c_int, -1;
     /// `setpriority(2)`.
-    pub fn setpriority(which: c_int, who: c_int, prio: c_int) = 141 => c_int, -1;
+    pub fn setpriority(which: c_int, who: c_int, prio: c_int) = nr::SETPRIORITY => c_int, -1;
     /// `eventfd2(2)`.
     pub fn eventfd(initval: c_uint, flags: c_int) = nr::EVENTFD2 => c_int, -1;
 }
@@ -268,6 +296,22 @@ pub unsafe extern "C" fn faccessat(
         r = unsafe { crate::arch::syscall_n(nr::FACCESSAT, &args[..3]) };
     }
     sys::check(r).map(|v| v as c_int).c_ret_or(-1)
+}
+
+/// `renameat(2)`: `renameat2` without flags, the form every
+/// architecture has.
+///
+/// # Safety
+/// Both paths must be NUL-terminated.
+#[cfg_attr(not(test), unsafe(no_mangle))]
+pub unsafe extern "C" fn renameat(
+    olddir: c_int,
+    old: *const c_char,
+    newdir: c_int,
+    new: *const c_char,
+) -> c_int {
+    // SAFETY: forwarded.
+    unsafe { renameat2(olddir, old, newdir, new, 0) }
 }
 
 /// `mkdir(2)`.

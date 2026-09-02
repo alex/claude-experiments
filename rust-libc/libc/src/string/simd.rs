@@ -26,6 +26,7 @@ pub static LEVEL_FOR_TESTS: AtomicU8 = AtomicU8::new(UNKNOWN);
 /// anything else can run; if it somehow has not happened yet the baseline
 /// is used, which is always correct. (Host tests, which have no startup
 /// code, detect lazily instead.)
+#[cfg(target_arch = "x86_64")]
 #[inline(always)]
 pub fn level() -> Level {
     #[cfg(test)]
@@ -46,7 +47,14 @@ pub fn level() -> Level {
     }
 }
 
-#[cfg(test)]
+/// On AArch64 the baseline (NEON) is the only level.
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+pub fn level() -> Level {
+    Level::Neon
+}
+
+#[cfg(all(test, target_arch = "x86_64"))]
 #[cold]
 #[inline(never)]
 fn detect_slow() -> Level {
@@ -55,6 +63,7 @@ fn detect_slow() -> Level {
 }
 
 /// True if 32-byte AVX2 vectors may be used.
+#[cfg(target_arch = "x86_64")]
 #[inline(always)]
 pub fn has_avx2() -> bool {
     level() >= Level::Avx2
@@ -111,6 +120,7 @@ macro_rules! dispatch_fn_ymm {
 pub(crate) use dispatch_fn_ymm;
 
 /// Body shared by the dispatch macros.
+#[cfg(target_arch = "x86_64")]
 macro_rules! dispatch_body {
     (zmm, $kernel:ident, ($($arg:ident: $ty:ty),*) -> $ret:ty) => {{
         #[allow(unused_unsafe)]
@@ -160,6 +170,18 @@ macro_rules! dispatch_body {
                 }
                 $crate::arch::cpu::Level::Sse2 => sse2($($arg),*),
             }
+        }
+    }};
+}
+/// On AArch64 there is nothing to dispatch: every kernel runs on NEON.
+#[cfg(target_arch = "aarch64")]
+macro_rules! dispatch_body {
+    ($_kind:ident, $kernel:ident, ($($arg:ident: $ty:ty),*) -> $ret:ty) => {{
+        // SAFETY: NEON is part of the AArch64 baseline; the kernel's own
+        // contract is the caller's.
+        #[allow(unused_unsafe)]
+        unsafe {
+            $kernel::<$crate::string::lanes::Neon>($($arg),*)
         }
     }};
 }

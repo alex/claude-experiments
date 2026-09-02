@@ -610,32 +610,20 @@ pub unsafe extern "C" fn __wmemset_chk(
 #[cfg(not(test))]
 mod stubs {
     use crate::arch::va::variadic_stub;
-    // `long double` results go in `st(0)`: convert `strtod`'s `double`.
-    core::arch::global_asm!(
-        ".globl strtold_l",
-        ".type strtold_l, @function",
-        "strtold_l:",
-        ".globl __strtold_l",
-        ".type __strtold_l, @function",
-        "__strtold_l:",
-        "sub rsp, 8",
-        "call {strtod}",
-        "movsd qword ptr [rsp], xmm0",
-        "fld qword ptr [rsp]",
-        "add rsp, 8",
-        "ret",
-        strtod = sym crate::stdlib::num::strtod,
-    );
-    variadic_stub!(__sprintf_chk, 4, "r8", super::__vsprintf_chk);
-    variadic_stub!(__snprintf_chk, 5, "r9", super::__vsnprintf_chk);
-    variadic_stub!(__printf_chk, 2, "rdx", super::__vprintf_chk);
-    variadic_stub!(__fprintf_chk, 3, "rcx", super::__vfprintf_chk);
-    variadic_stub!(__isoc99_sscanf, 2, "rdx", crate::stdio::scanf::vsscanf);
-    variadic_stub!(__isoc99_fscanf, 2, "rdx", crate::stdio::scanf::vfscanf);
-    variadic_stub!(__isoc99_scanf, 1, "rsi", crate::stdio::scanf::vscanf);
-    variadic_stub!(__isoc23_sscanf, 2, "rdx", crate::stdio::scanf::vsscanf);
-    variadic_stub!(__isoc23_fscanf, 2, "rdx", crate::stdio::scanf::vfscanf);
-    variadic_stub!(__isoc23_scanf, 1, "rsi", crate::stdio::scanf::vscanf);
+    // The locale argument is ignored (only "C" exists); the `double`
+    // result is converted to the `long double` format.
+    crate::arch::va::long_double_stub!(strtold_l, crate::stdlib::num::strtod);
+    crate::arch::va::long_double_stub!(__strtold_l, crate::stdlib::num::strtod);
+    variadic_stub!(__sprintf_chk, 4, super::__vsprintf_chk);
+    variadic_stub!(__snprintf_chk, 5, super::__vsnprintf_chk);
+    variadic_stub!(__printf_chk, 2, super::__vprintf_chk);
+    variadic_stub!(__fprintf_chk, 3, super::__vfprintf_chk);
+    variadic_stub!(__isoc99_sscanf, 2, crate::stdio::scanf::vsscanf);
+    variadic_stub!(__isoc99_fscanf, 2, crate::stdio::scanf::vfscanf);
+    variadic_stub!(__isoc99_scanf, 1, crate::stdio::scanf::vscanf);
+    variadic_stub!(__isoc23_sscanf, 2, crate::stdio::scanf::vsscanf);
+    variadic_stub!(__isoc23_fscanf, 2, crate::stdio::scanf::vfscanf);
+    variadic_stub!(__isoc23_scanf, 1, crate::stdio::scanf::vscanf);
 }
 
 // ---------------------------------------------------------------------

@@ -365,3 +365,12 @@ pub fn trap() -> ! {
     // SAFETY: `ud2` raises SIGILL; it never returns.
     unsafe { asm!("ud2", options(noreturn, nostack)) }
 }
+
+/// Index of the `jmp_buf` word where `sigsetjmp` keeps the signal mask
+/// (word 8 is the stash used by the assembly stub).
+pub const JMPBUF_MASK_WORD: usize = 9;
+
+/// Names of the vDSO entry points.
+pub const VDSO_CLOCK_GETTIME: &[u8] = b"__vdso_clock_gettime";
+#[allow(missing_docs)]
+pub const VDSO_GETCPU: &[u8] = b"__vdso_getcpu";

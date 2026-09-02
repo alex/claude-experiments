@@ -45,9 +45,15 @@
 #define OFF(t, f, n) _Static_assert(offsetof(t, f) == (n), "offsetof " #t "." #f " != " #n)
 
 // Kernel ABI.
+#if defined(__x86_64__)
 SIZE(struct stat, 144);
 OFF(struct stat, st_size, 48);
 OFF(struct stat, st_mtim, 88);
+#else
+SIZE(struct stat, 128);
+OFF(struct stat, st_size, 48);
+OFF(struct stat, st_mtim, 88);
+#endif
 SIZE(sigset_t, 128);
 SIZE(struct sigaction, 152);
 OFF(struct sigaction, sa_mask, 8);
@@ -62,8 +68,13 @@ SIZE(stack_t, 24);
 SIZE(struct dirent, 280);
 OFF(struct dirent, d_type, 18);
 OFF(struct dirent, d_name, 19);
+#if defined(__x86_64__)
 SIZE(struct epoll_event, 12);
 OFF(struct epoll_event, data, 4);
+#else
+SIZE(struct epoll_event, 16);
+OFF(struct epoll_event, data, 8);
+#endif
 SIZE(struct timespec, 16);
 SIZE(struct timeval, 16);
 SIZE(struct itimerspec, 32);
@@ -119,8 +130,16 @@ SIZE(off_t, 8);
 SIZE(ino_t, 8);
 SIZE(dev_t, 8);
 SIZE(mode_t, 4);
+#if defined(__x86_64__)
 SIZE(nlink_t, 8);
+#else
+SIZE(nlink_t, 4);
+#endif
+#if defined(__x86_64__)
 SIZE(blksize_t, 8);
+#else
+SIZE(blksize_t, 4);
+#endif
 SIZE(blkcnt_t, 8);
 SIZE(socklen_t, 4);
 SIZE(sa_family_t, 2);
@@ -141,8 +160,13 @@ SIZE(ldiv_t, 16);
 SIZE(lldiv_t, 16);
 
 // Widely shared library structures (same as glibc/musl).
+#if defined(__x86_64__)
 SIZE(jmp_buf, 200);
 SIZE(sigjmp_buf, 200);
+#else
+SIZE(jmp_buf, 320);
+SIZE(sigjmp_buf, 320);
+#endif
 SIZE(struct tm, 56);
 OFF(struct tm, tm_gmtoff, 40);
 OFF(struct tm, tm_zone, 48);
@@ -190,7 +214,11 @@ _Static_assert(_Alignof(pthread_cond_t) >= 4, "cond alignment");
 int main(void) {
     // A few runtime checks that the headers and library agree on the
     // values baked into macros.
+#if defined(__x86_64__)
     if (sizeof(struct stat) != 144) return 1;
+#else
+    if (sizeof(struct stat) != 128) return 1;
+#endif
     struct stat st;
     if (stat("/", &st) != 0 || !S_ISDIR(st.st_mode)) return 2;
     struct rusage ru;

@@ -442,7 +442,7 @@ pub unsafe fn scan<S: Source>(src: &mut S, fmt: *const u8, ap: &mut VaList) -> c
                     } else {
                         num::strtoull(buf.as_ptr() as *const c_char, &mut end, base as c_int)
                     };
-                    if end as *const u8 == buf.as_ptr() {
+                    if end as usize == buf.as_ptr() as usize {
                         break; // matching failure
                     }
                     if !dst.is_null() {
@@ -468,11 +468,7 @@ pub unsafe fn scan<S: Source>(src: &mut S, fmt: *const u8, ap: &mut VaList) -> c
                     if !dst.is_null() {
                         match length {
                             Length::None => *(dst as *mut f32) = res.value as f32,
-                            Length::BigL => {
-                                let (m, se) = crate::arch::va::f64_to_x87(res.value);
-                                *(dst as *mut u64) = m;
-                                *((dst as *mut u8).add(8) as *mut u16) = se;
-                            }
+                            Length::BigL => crate::arch::va::write_long_double(dst as *mut u8, res.value),
                             _ => *(dst as *mut f64) = res.value,
                         }
                         assigned += 1;
@@ -604,9 +600,9 @@ pub unsafe extern "C" fn vsscanf(s: *const c_char, fmt: *const c_char, ap: *mut 
 #[cfg(not(test))]
 mod stubs {
     use crate::arch::va::variadic_stub;
-    variadic_stub!(scanf, 1, "rsi", super::vscanf);
-    variadic_stub!(fscanf, 2, "rdx", super::vfscanf);
-    variadic_stub!(sscanf, 2, "rdx", super::vsscanf);
+    variadic_stub!(scanf, 1, super::vscanf);
+    variadic_stub!(fscanf, 2, super::vfscanf);
+    variadic_stub!(sscanf, 2, super::vsscanf);
 }
 
 #[cfg(test)]

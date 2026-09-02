@@ -176,7 +176,7 @@ impl Tcb {
 #[inline(always)]
 pub fn current() -> *mut Tcb {
     // SAFETY: the thread pointer is set before any Rust code runs.
-    unsafe { crate::arch::thread_pointer() as *mut Tcb }
+    tls::tcb_of(unsafe { crate::arch::thread_pointer() })
 }
 
 /// Host-test stand-in: a `thread_local!` TCB, because the real thread

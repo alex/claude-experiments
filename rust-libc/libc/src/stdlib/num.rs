@@ -815,18 +815,7 @@ mod tests {
     }
 }
 
+// `long double` is not distinguished by this library: `strtold` returns
+// `strtod`'s result converted to the `long double` format.
 #[cfg(not(test))]
-core::arch::global_asm!(
-    // `long double` is returned in `st(0)`; convert `strtod`'s `double`
-    // result (`long double` is not distinguished by this library).
-    ".globl strtold",
-    ".type strtold, @function",
-    "strtold:",
-    "sub rsp, 8",
-    "call {strtod}",
-    "movsd qword ptr [rsp], xmm0",
-    "fld qword ptr [rsp]",
-    "add rsp, 8",
-    "ret",
-    strtod = sym strtod,
-);
+crate::arch::va::long_double_stub!(strtold, strtod);

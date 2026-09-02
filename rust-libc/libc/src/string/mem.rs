@@ -19,23 +19,29 @@ use crate::string::lanes::Lanes;
 use crate::string::search;
 use crate::string::simd::dispatch_fn_ymm;
 use core::arch::asm;
-use core::arch::x86_64::{__m128i, _mm_loadu_si128, _mm_set1_epi8, _mm_storeu_si128};
 use core::ffi::{c_int, c_void};
 use core::{ptr, slice};
 
-/// Sizes above this go to `rep movsb`/`rep stosb`.
+/// The 16-byte vector type every supported CPU has.
+#[cfg(target_arch = "x86_64")]
+type Base = crate::string::lanes::Sse2;
+#[cfg(target_arch = "aarch64")]
+type Base = crate::string::lanes::Neon;
+
+/// Sizes above this go to `rep movsb`/`rep stosb` (or, without them, to
+/// the aligned vector loops).
 const REP_THRESHOLD: usize = 256;
 
 #[inline(always)]
-unsafe fn load16(p: *const u8) -> __m128i {
+unsafe fn load16(p: *const u8) -> Base {
     // SAFETY: caller guarantees 16 readable bytes.
-    unsafe { _mm_loadu_si128(p as *const __m128i) }
+    unsafe { Base::load(p) }
 }
 
 #[inline(always)]
-unsafe fn store16(p: *mut u8, v: __m128i) {
+unsafe fn store16(p: *mut u8, v: Base) {
     // SAFETY: caller guarantees 16 writable bytes.
-    unsafe { _mm_storeu_si128(p as *mut __m128i, v) }
+    unsafe { v.store(p) }
 }
 
 /// Copies `n <= 64` bytes. Loads everything before storing, so `src` and
@@ -296,6 +302,7 @@ fn forward_ok(dst: *mut u8, src: *const u8, n: usize) -> bool {
 /// True if a forward copy from `src` to `dst` may use `rep movsb`: it
 /// handles overlapping buffers correctly as long as the copy direction is
 /// forward, but is slow when the distance is smaller than a cache line.
+#[cfg(target_arch = "x86_64")]
 #[inline(always)]
 fn rep_ok(dst: *mut u8, src: *const u8) -> bool {
     (src as usize).wrapping_sub(dst as usize) >= 64
@@ -306,12 +313,65 @@ fn rep_ok(dst: *mut u8, src: *const u8) -> bool {
 /// # Safety
 /// Both pointers must be valid for `n` bytes; if they overlap, `dst` must
 /// be below `src`.
+#[cfg(target_arch = "x86_64")]
 #[inline(always)]
 unsafe fn rep_movsb(dst: *mut u8, src: *const u8, n: usize) {
     // SAFETY: caller contract.
     unsafe {
         asm!("rep movsb", inout("rcx") n => _, inout("rdi") dst => _, inout("rsi") src => _,
              options(nostack, preserves_flags));
+    }
+}
+
+/// Large forward copy: `rep movsb` where it is fast, else the vector loop.
+///
+/// # Safety
+/// As for [`copy_forward`].
+#[inline(always)]
+unsafe fn copy_large(dst: *mut u8, src: *const u8, n: usize) {
+    // SAFETY: caller contract.
+    unsafe {
+        #[cfg(target_arch = "x86_64")]
+        if rep_ok(dst, src) {
+            rep_movsb(dst, src, n);
+            return;
+        }
+        copy_forward_any(dst, src, n);
+    }
+}
+
+/// Large fill: `rep stosb` on x86_64, else aligned four-vector stores.
+///
+/// # Safety
+/// `dst` must be valid for `n > 4 * 16` bytes.
+#[inline(always)]
+unsafe fn set_large(dst: *mut u8, b: u8, n: usize) {
+    // SAFETY: caller contract.
+    unsafe {
+        #[cfg(target_arch = "x86_64")]
+        {
+            asm!("rep stosb", inout("rcx") n => _, inout("rdi") dst => _, in("al") b,
+                 options(nostack, preserves_flags));
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            let v = Base::N;
+            let x = Base::splat(b);
+            x.store(dst);
+            let end = dst.add(n);
+            let mut p = ((dst as usize + v) & !(v - 1)) as *mut u8;
+            while p.add(4 * v) <= end {
+                x.store(p);
+                x.store(p.add(v));
+                x.store(p.add(2 * v));
+                x.store(p.add(3 * v));
+                p = p.add(4 * v);
+            }
+            x.store(end.sub(4 * v));
+            x.store(end.sub(3 * v));
+            x.store(end.sub(2 * v));
+            x.store(end.sub(v));
+        }
     }
 }
 
@@ -373,10 +433,8 @@ pub unsafe extern "C" fn memcpy(dst: *mut c_void, src: *const c_void, n: usize) 
             copy_small(d, s, n);
         } else if n <= REP_THRESHOLD {
             copy_mid_any(d, s, n);
-        } else if rep_ok(d, s) {
-            rep_movsb(d, s, n);
         } else {
-            copy_forward_any(d, s, n);
+            copy_large(d, s, n);
         }
     }
     dst
@@ -396,11 +454,7 @@ pub unsafe extern "C" fn memmove(dst: *mut c_void, src: *const c_void, n: usize)
         } else if n <= REP_THRESHOLD {
             move_mid_any(d, s, n);
         } else if forward_ok(d, s, n) {
-            if rep_ok(d, s) {
-                rep_movsb(d, s, n);
-            } else {
-                copy_forward_any(d, s, n);
-            }
+            copy_large(d, s, n);
         } else {
             copy_backward_any(d, s, n);
         }
@@ -419,7 +473,7 @@ pub unsafe extern "C" fn memset(dst: *mut c_void, c: c_int, n: usize) -> *mut c_
     // SAFETY: every access stays inside `[0, n)`.
     unsafe {
         if n >= 16 {
-            let v = _mm_set1_epi8(b as i8);
+            let v = Base::splat(b);
             if n <= 32 {
                 store16(d, v);
                 store16(d.add(n - 16), v);
@@ -431,8 +485,7 @@ pub unsafe extern "C" fn memset(dst: *mut c_void, c: c_int, n: usize) -> *mut c_
             } else if n <= REP_THRESHOLD {
                 set_mid_any(d, b, n);
             } else {
-                asm!("rep stosb", inout("rcx") n => _, inout("rdi") d => _, in("al") b,
-                     options(nostack, preserves_flags));
+                set_large(d, b, n);
             }
         } else if n >= 8 {
             let w = u64::from_ne_bytes([b; 8]);

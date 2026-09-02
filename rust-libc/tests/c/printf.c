@@ -25,7 +25,8 @@ int main(void) {
     printf("[%10s] [%-10s] [%.2s] [%s]\n", "right", "left", "truncate", (char *)NULL);
     printf("%f %.2f %e %E %g %G %a\n", 3.14159, 2.71828, 12345.678, 0.000123, 100000.0, 1e-7, 1.0);
     printf("%.0f %.0f %.0f %.10f %.20f\n", 0.5, 1.5, 2.5, 1.0 / 3.0, 0.1);
-    printf("%f %f %f %F\n", 1.0 / 0.0, -1.0 / 0.0, 0.0 / 0.0, 1.0 / 0.0);
+    // The sign of the NaN a division produces is architecture specific.
+    printf("%f %f %f %F\n", 1.0 / 0.0, -1.0 / 0.0, -__builtin_nan(""), 1.0 / 0.0);
     printf("%Lf %Le %Lg %La\n", 1.5L, 1.5L, 1.5L, 1.5L);
     printf("%hhd %hd %hhu %hu %jd %td\n", 300, 70000, 300, 70000, (intmax_t)-9, (ptrdiff_t)-3);
     printf("%p %p\n", (void *)0x1234, (void *)0);

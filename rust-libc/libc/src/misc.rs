@@ -180,8 +180,8 @@ pub unsafe extern "C" fn verrx(
 #[cfg(not(test))]
 mod stubs {
     use crate::arch::va::variadic_stub;
-    variadic_stub!(warn, 1, "rsi", super::vwarn);
-    variadic_stub!(warnx, 1, "rsi", super::vwarnx);
-    variadic_stub!(err, 2, "rdx", super::verr);
-    variadic_stub!(errx, 2, "rdx", super::verrx);
+    variadic_stub!(warn, 1, super::vwarn);
+    variadic_stub!(warnx, 1, super::vwarnx);
+    variadic_stub!(err, 2, super::verr);
+    variadic_stub!(errx, 2, super::verrx);
 }

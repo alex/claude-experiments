@@ -13,6 +13,11 @@
 #include <sys/utsname.h>
 #include <unistd.h>
 
+#if defined(__x86_64__)
+#define MACHINE "x86_64"
+#else
+#define MACHINE "aarch64"
+#endif
 #define CHECK(cond) do { if (!(cond)) { const char *m = "FAIL: " #cond "\n"; write(2, m, strlen(m)); return __LINE__; } } while (0)
 
 int main(void) {
@@ -116,7 +121,7 @@ int main(void) {
 
     // System information.
     struct utsname u;
-    CHECK(uname(&u) == 0 && strcmp(u.sysname, "Linux") == 0 && strcmp(u.machine, "x86_64") == 0);
+    CHECK(uname(&u) == 0 && strcmp(u.sysname, "Linux") == 0 && strcmp(u.machine, MACHINE) == 0);
     char host[256];
     CHECK(gethostname(host, sizeof host) == 0 && strcmp(host, u.nodename) == 0);
     CHECK(sysconf(_SC_PAGESIZE) == 4096 && getpagesize() == 4096);

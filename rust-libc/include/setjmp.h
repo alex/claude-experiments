@@ -3,7 +3,11 @@
 #include <bits/features.h>
 
 typedef struct __jmp_buf_tag {
+#if defined(__x86_64__)
     unsigned long __jb[8];
+#else
+    unsigned long __jb[23];
+#endif
     unsigned long __fl;
     unsigned long __ss[16];
 } jmp_buf[1];

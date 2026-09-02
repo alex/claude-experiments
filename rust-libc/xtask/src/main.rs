@@ -6,6 +6,8 @@
 //! cargo xtask test NAME  # only tests whose file name contains NAME
 //! cargo xtask bench      # run bench/bench.c against rustlibc and glibc
 //! cargo xtask bench alloc  # the allocator workloads in bench/alloc.c
+//! cargo xtask --aarch64 test  # cross-build with aarch64-linux-gnu-gcc,
+//!                             # run under qemu-aarch64
 //! ```
 //!
 //! Each C test (or C++ test, `*.cpp`, linked with the host toolchain's
@@ -28,8 +30,58 @@ fn root() -> PathBuf {
         .to_path_buf()
 }
 
+/// The build target: the host, or a cross target with its own toolchain
+/// prefix and emulator.
+#[derive(Clone, Copy, PartialEq)]
+enum Target {
+    Host,
+    Aarch64,
+}
+
+static TARGET: Mutex<Target> = Mutex::new(Target::Host);
+
+fn target() -> Target {
+    *TARGET.lock().unwrap()
+}
+
+impl Target {
+    fn triple(self) -> Option<&'static str> {
+        match self {
+            Target::Host => None,
+            Target::Aarch64 => Some("aarch64-unknown-linux-gnu"),
+        }
+    }
+    /// Prefix of the GNU toolchain binaries.
+    fn prefix(self) -> &'static str {
+        match self {
+            Target::Host => "",
+            Target::Aarch64 => "aarch64-linux-gnu-",
+        }
+    }
+    /// Emulator that runs the target's binaries, if not the host.
+    fn runner(self) -> Option<&'static str> {
+        match self {
+            Target::Host => None,
+            Target::Aarch64 => Some("qemu-aarch64"),
+        }
+    }
+    fn sysroot_name(self) -> &'static str {
+        match self {
+            Target::Host => "sysroot",
+            Target::Aarch64 => "sysroot-aarch64",
+        }
+    }
+}
+
 fn cc() -> String {
-    std::env::var("CC").unwrap_or_else(|_| "cc".to_string())
+    match target() {
+        Target::Host => std::env::var("CC").unwrap_or_else(|_| "cc".to_string()),
+        t => format!("{}gcc", t.prefix()),
+    }
+}
+
+fn ar() -> String {
+    format!("{}ar", target().prefix())
 }
 
 fn run(cmd: &mut Command) -> bool {
@@ -43,19 +95,24 @@ fn build(release: bool) -> Result<PathBuf, String> {
     if release {
         cargo.arg("--release");
     }
+    let mut libdir_parts = root.join("target");
+    if let Some(triple) = target().triple() {
+        cargo.args(["--target", triple]);
+        libdir_parts = libdir_parts.join(triple);
+    }
     if !run(&mut cargo) {
         return Err("cargo build failed".into());
     }
     let profile = if release { "release" } else { "debug" };
-    let lib = root.join("target").join(profile).join("libc.a");
-    let sysroot = root.join("target/sysroot");
+    let lib = libdir_parts.join(profile).join("libc.a");
+    let sysroot = root.join("target").join(target().sysroot_name());
     let libdir = sysroot.join("lib");
     fs::create_dir_all(&libdir).map_err(|e| e.to_string())?;
     fs::copy(&lib, libdir.join("libc.a")).map_err(|e| e.to_string())?;
     // Provide the empty archives that gcc's default link line asks for.
     for name in ["libm.a", "libpthread.a", "librt.a", "libdl.a"] {
         let p = libdir.join(name);
-        if !p.exists() && !run(Command::new("ar").arg("rcs").arg(&p)) {
+        if !p.exists() && !run(Command::new(ar()).arg("rcs").arg(&p)) {
             return Err(format!("ar failed for {}", p.display()));
         }
     }
@@ -144,7 +201,21 @@ fn compile_cmd(sysroot: &Path, src: &Path, out: &Path, extra: &[String]) -> Comm
 }
 
 fn cxx_compiler() -> String {
-    std::env::var("CXX").unwrap_or_else(|_| "c++".to_string())
+    match target() {
+        Target::Host => std::env::var("CXX").unwrap_or_else(|_| "c++".to_string()),
+        t => format!("{}g++", t.prefix()),
+    }
+}
+
+/// Whether the target toolchain can build C++ (a cross g++ may be absent).
+fn have_cxx() -> bool {
+    Command::new(cxx_compiler())
+        .arg("--version")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
 }
 
 /// Asks the compiler where a library file lives.
@@ -244,7 +315,14 @@ fn run_test(sysroot: &Path, bindir: &Path, src: &Path) -> Result<(), String> {
             String::from_utf8_lossy(&out.stderr)
         ));
     }
-    let mut cmd = Command::new(&bin);
+    let mut cmd = match target().runner() {
+        Some(runner) => {
+            let mut c = Command::new(runner);
+            c.arg(&bin);
+            c
+        }
+        None => Command::new(&bin),
+    };
     cmd.current_dir(bindir)
         .stdin(Stdio::null())
         .env_clear()
@@ -292,12 +370,19 @@ fn test(filter: Option<&str>, release: bool) -> ExitCode {
         }
     };
     let root = root();
-    let bindir = root.join("target/ctests");
+    let bindir = root.join("target").join(match target() {
+        Target::Host => "ctests".to_string(),
+        t => format!("ctests-{}", t.sysroot_name().trim_start_matches("sysroot-")),
+    });
     fs::create_dir_all(&bindir).unwrap();
+    let cxx_ok = have_cxx();
+    if !cxx_ok {
+        println!("note: no C++ compiler for this target, skipping *.cpp tests");
+    }
     let mut sources: Vec<PathBuf> = fs::read_dir(root.join("tests/c"))
         .unwrap()
         .filter_map(|e| e.ok().map(|e| e.path()))
-        .filter(|p| p.extension().is_some_and(|x| x == "c" || x == "cpp"))
+        .filter(|p| p.extension().is_some_and(|x| x == "c" || (x == "cpp" && cxx_ok)))
         .filter(|p| filter.is_none_or(|f| p.file_name().unwrap().to_string_lossy().contains(f)))
         .collect();
     sources.sort();
@@ -439,10 +524,13 @@ fn bench(filter: Option<&str>, release: bool) -> ExitCode {
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let release = !args.iter().any(|a| a == "--debug");
+    if args.iter().any(|a| a == "--aarch64") {
+        *TARGET.lock().unwrap() = Target::Aarch64;
+    }
     let args: Vec<&str> = args
         .iter()
         .map(String::as_str)
-        .filter(|a| *a != "--debug")
+        .filter(|a| *a != "--debug" && *a != "--aarch64")
         .collect();
     match args.as_slice() {
         ["build"] => match build(release) {
@@ -461,7 +549,7 @@ fn main() -> ExitCode {
         ["bench", filter] => bench(Some(filter), release),
         _ => {
             eprintln!(
-                "usage: cargo xtask [--debug] build | test [FILTER] | bench [mem|malloc|stdlib]"
+                "usage: cargo xtask [--debug] [--aarch64] build | test [FILTER] | bench [mem|malloc|stdlib|alloc]"
             );
             ExitCode::FAILURE
         }

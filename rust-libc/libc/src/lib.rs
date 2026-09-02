@@ -19,6 +19,9 @@
 //! are exported (`#[cfg_attr(not(test), unsafe(no_mangle))]`), so the tests
 //! never shadow the host libc. End-to-end behaviour is covered by the C
 //! programs under `tests/c`, which are linked against the real `libc.a`.
+// `c_char` is `u8` on AArch64, which makes the `*const c_char -> *const u8`
+// casts the x86_64 build needs no-ops there.
+#![cfg_attr(target_arch = "aarch64", allow(clippy::unnecessary_cast))]
 #![cfg_attr(not(test), no_std)]
 #![cfg_attr(test, allow(dead_code, unused_imports))]
 #![allow(non_camel_case_types)]
@@ -76,7 +79,10 @@ pub type c_int = core::ffi::c_int;
 /// kernel.  `tests/c/abi.c` asserts the same numbers from the headers.
 mod abi_asserts {
     use core::mem::size_of;
+    #[cfg(target_arch = "x86_64")]
     const _: () = assert!(size_of::<crate::fs::Stat>() == 144);
+    #[cfg(target_arch = "aarch64")]
+    const _: () = assert!(size_of::<crate::fs::Stat>() == 128);
     const _: () = assert!(size_of::<crate::fs::Rlimit>() == 16);
     const _: () = assert!(size_of::<crate::fs::Utsname>() == 390);
     const _: () = assert!(size_of::<crate::signal::SigSet>() == 128);
@@ -92,7 +98,10 @@ mod abi_asserts {
     const _: () = assert!(size_of::<crate::socket::Hostent>() == 32);
     const _: () = assert!(size_of::<crate::poll::PollFd>() == 8);
     const _: () = assert!(size_of::<crate::poll::FdSet>() == 128);
+    #[cfg(target_arch = "x86_64")]
     const _: () = assert!(size_of::<crate::poll::EpollEvent>() == 12);
+    #[cfg(target_arch = "aarch64")]
+    const _: () = assert!(size_of::<crate::poll::EpollEvent>() == 16);
     const _: () = assert!(size_of::<crate::pwd::Passwd>() == 48);
     const _: () = assert!(size_of::<crate::pwd::Group>() == 32);
     const _: () = assert!(size_of::<crate::locale::Lconv>() == 96);

@@ -79,6 +79,7 @@ static int test_env(void) {
 
 static sigjmp_buf jb;
 
+#if defined(__x86_64__)
 static int test_sigsetjmp(void) {
     // siglongjmp must restore rbx to its value at sigsetjmp, not the
     // saved signal mask.
@@ -108,6 +109,35 @@ static int test_sigsetjmp(void) {
     CHECK(r == 0x1234567);
     return 0;
 }
+#else
+static int test_sigsetjmp(void) {
+    // Callee-saved x19 must survive siglongjmp.
+    long r;
+    asm volatile(
+        "stp x29, x30, [sp, #-32]!\n\t"
+        "mov x29, sp\n\t"
+        "mov x20, %1\n\t"
+        "mov x19, #0x4567\n\t"
+        "movk x19, #0x123, lsl #16\n\t"
+        "mov x0, x20\n\t"
+        "mov w1, #1\n\t"
+        "bl sigsetjmp\n\t"
+        "cbnz w0, 1f\n\t"
+        "mov x19, #0\n\t"
+        "mov x0, x20\n\t"
+        "mov w1, #1\n\t"
+        "bl siglongjmp\n\t"
+        "1:\n\t"
+        "mov %0, x19\n\t"
+        "ldp x29, x30, [sp], #32\n\t"
+        : "=r"(r)
+        : "r"(jb)
+        : "x0", "x1", "x2", "x3", "x4", "x5", "x6", "x7", "x8", "x9", "x10", "x11", "x12",
+          "x13", "x14", "x15", "x16", "x17", "x18", "x19", "x20", "x30", "memory", "cc");
+    CHECK(r == 0x1234567);
+    return 0;
+}
+#endif
 
 static int test_getopt(void) {
     char *argv[] = {"prog", "file", "-o", "out", "-x", "rest", NULL};

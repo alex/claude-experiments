@@ -14,8 +14,13 @@
 
 typedef unsigned long dev_t;
 typedef unsigned long ino_t;
+#if defined(__x86_64__)
 typedef unsigned long nlink_t;
 typedef long blksize_t;
+#else
+typedef unsigned int nlink_t;
+typedef int blksize_t;
+#endif
 typedef long blkcnt_t;
 typedef long suseconds_t;
 typedef unsigned useconds_t;

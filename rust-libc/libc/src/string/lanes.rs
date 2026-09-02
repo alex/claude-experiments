@@ -21,6 +21,9 @@
 //! is what makes them sound; the backends must not be used in any other
 //! way.
 
+#[cfg(target_arch = "aarch64")]
+use core::arch::aarch64::*;
+#[cfg(target_arch = "x86_64")]
 use core::arch::x86_64::*;
 
 /// A predicate over the lanes of a [`Lanes`] vector.
@@ -73,9 +76,11 @@ pub trait Lanes: Copy {
 }
 
 /// 16-byte vectors (x86_64 baseline).
+#[cfg(target_arch = "x86_64")]
 #[derive(Clone, Copy)]
 pub struct Sse2(__m128i);
 
+#[cfg(target_arch = "x86_64")]
 impl Mask for Sse2 {
     #[inline(always)]
     fn bits(self) -> u64 {
@@ -112,6 +117,7 @@ impl Mask for Sse2 {
     }
 }
 
+#[cfg(target_arch = "x86_64")]
 impl Lanes for Sse2 {
     const N: usize = 16;
     type Mask = Sse2;
@@ -153,9 +159,11 @@ impl Lanes for Sse2 {
 }
 
 /// 32-byte vectors (AVX2).
+#[cfg(target_arch = "x86_64")]
 #[derive(Clone, Copy)]
 pub struct Avx2(__m256i);
 
+#[cfg(target_arch = "x86_64")]
 impl Mask for Avx2 {
     #[inline(always)]
     fn bits(self) -> u64 {
@@ -192,6 +200,7 @@ impl Mask for Avx2 {
     }
 }
 
+#[cfg(target_arch = "x86_64")]
 impl Lanes for Avx2 {
     const N: usize = 32;
     type Mask = Avx2;
@@ -233,9 +242,11 @@ impl Lanes for Avx2 {
 }
 
 /// 64-byte vectors (AVX-512F + AVX-512BW); comparisons produce `k` masks.
+#[cfg(target_arch = "x86_64")]
 #[derive(Clone, Copy)]
 pub struct Avx512(__m512i);
 
+#[cfg(target_arch = "x86_64")]
 impl Mask for u64 {
     #[inline(always)]
     fn bits(self) -> u64 {
@@ -267,6 +278,7 @@ impl Mask for u64 {
     }
 }
 
+#[cfg(target_arch = "x86_64")]
 impl Lanes for Avx512 {
     const N: usize = 64;
     type Mask = u64;
@@ -304,5 +316,104 @@ impl Lanes for Avx512 {
     fn xor(self, other: Self) -> Self {
         // SAFETY: see the module documentation.
         Self(unsafe { _mm512_xor_si512(self.0, other.0) })
+    }
+}
+
+/// 16-byte NEON vectors (the AArch64 baseline). A mask is the comparison
+/// result itself (`0xff`/`0x00` lanes); [`Mask::bits`] compresses it to
+/// one bit per lane with a weighted horizontal add, since NEON has no
+/// `movemask`.
+#[cfg(target_arch = "aarch64")]
+#[derive(Clone, Copy)]
+pub struct Neon(uint8x16_t);
+
+#[cfg(target_arch = "aarch64")]
+impl Mask for Neon {
+    #[inline(always)]
+    fn bits(self) -> u64 {
+        // SAFETY: NEON is always available on AArch64.
+        unsafe {
+            let weights = vld1q_u8(WEIGHTS.as_ptr());
+            let v = vandq_u8(self.0, weights);
+            let lo = vaddv_u8(vget_low_u8(v)) as u64;
+            let hi = vaddv_u8(vget_high_u8(v)) as u64;
+            lo | (hi << 8)
+        }
+    }
+    #[inline(always)]
+    fn any(self) -> bool {
+        // SAFETY: as above.
+        unsafe { vmaxvq_u8(self.0) != 0 }
+    }
+    #[inline(always)]
+    fn all(self) -> bool {
+        // SAFETY: as above.
+        unsafe { vminvq_u8(self.0) != 0 }
+    }
+    #[inline(always)]
+    fn or(self, other: Self) -> Self {
+        // SAFETY: as above.
+        Neon(unsafe { vorrq_u8(self.0, other.0) })
+    }
+    #[inline(always)]
+    fn and(self, other: Self) -> Self {
+        // SAFETY: as above.
+        Neon(unsafe { vandq_u8(self.0, other.0) })
+    }
+    #[inline(always)]
+    fn not(self) -> Self {
+        // SAFETY: as above.
+        Neon(unsafe { vmvnq_u8(self.0) })
+    }
+    #[inline(always)]
+    fn and_not(self, other: Self) -> Self {
+        // SAFETY: as above.
+        Neon(unsafe { vbicq_u8(self.0, other.0) })
+    }
+}
+
+/// Bit weights for [`Mask::bits`] on NEON: lane `i` contributes bit
+/// `i % 8` of its half.
+#[cfg(target_arch = "aarch64")]
+static WEIGHTS: [u8; 16] = [1, 2, 4, 8, 16, 32, 64, 128, 1, 2, 4, 8, 16, 32, 64, 128];
+
+#[cfg(target_arch = "aarch64")]
+impl Lanes for Neon {
+    const N: usize = 16;
+    type Mask = Neon;
+    #[inline(always)]
+    unsafe fn load(p: *const u8) -> Self {
+        // SAFETY: caller contract.
+        Neon(unsafe { vld1q_u8(p) })
+    }
+    #[inline(always)]
+    unsafe fn store(self, p: *mut u8) {
+        // SAFETY: caller contract.
+        unsafe { vst1q_u8(p, self.0) }
+    }
+    #[inline(always)]
+    fn splat(b: u8) -> Self {
+        // SAFETY: NEON is always available on AArch64.
+        Neon(unsafe { vdupq_n_u8(b) })
+    }
+    #[inline(always)]
+    fn eq(self, other: Self) -> Self {
+        // SAFETY: as above.
+        Neon(unsafe { vceqq_u8(self.0, other.0) })
+    }
+    #[inline(always)]
+    fn min(self, other: Self) -> Self {
+        // SAFETY: as above.
+        Neon(unsafe { vminq_u8(self.0, other.0) })
+    }
+    #[inline(always)]
+    fn keep_eq(self, other: Self) -> Self {
+        // SAFETY: as above.
+        Neon(unsafe { vandq_u8(self.0, vceqq_u8(self.0, other.0)) })
+    }
+    #[inline(always)]
+    fn xor(self, other: Self) -> Self {
+        // SAFETY: as above.
+        Neon(unsafe { veorq_u8(self.0, other.0) })
     }
 }

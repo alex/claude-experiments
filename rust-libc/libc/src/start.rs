@@ -41,6 +41,14 @@ struct AuxvCell(UnsafeCell<*const usize>);
 unsafe impl Sync for AuxvCell {}
 static AUXV: AuxvCell = AuxvCell(UnsafeCell::new(core::ptr::null()));
 
+/// The stack protector canary on architectures whose compilers read it
+/// from a global rather than the TCB.
+#[cfg(all(target_arch = "aarch64", not(test)))]
+#[unsafe(no_mangle)]
+pub static mut __stack_chk_guard: usize = 0;
+#[cfg(all(target_arch = "aarch64", test))]
+static mut __stack_chk_guard: usize = 0;
+
 /// Looks up an auxiliary vector entry (the `getauxval` primitive).
 pub fn auxval(kind: usize) -> Option<usize> {
     // SAFETY: only written during startup; entries come in pairs and the
@@ -142,6 +150,12 @@ pub unsafe extern "C" fn start_c(sp: *const usize) -> ! {
     }
     let (canary_seed, heap_seed) = random.split_at(8);
     let canary = crate::thread::canary_from_random(canary_seed.try_into().unwrap_or([0; 8]));
+    // Without a TCB slot for it, gcc reads the canary from this global.
+    #[cfg(target_arch = "aarch64")]
+    // SAFETY: startup is single-threaded and nothing has read it yet.
+    unsafe {
+        __stack_chk_guard = canary;
+    }
     crate::malloc::init(heap_seed.try_into().unwrap_or([0; 8]));
     let size = tls::round_up(tls::region_size(), crate::sys::PAGE_SIZE);
     // SAFETY: anonymous private mapping with no address hint.
@@ -161,7 +175,7 @@ pub unsafe extern "C" fn start_c(sp: *const usize) -> ! {
     // SAFETY: the mapping is fresh and large enough.
     let tcb = unsafe { tls::install(region, size, canary) };
     // SAFETY: `tcb` is a fully initialised, self-referencing TCB.
-    if unsafe { crate::arch::set_thread_pointer(tcb as *mut u8) }.is_err() {
+    if unsafe { crate::arch::set_thread_pointer(tls::thread_pointer_of(tcb)) }.is_err() {
         crate::exit::abort_now();
     }
     // SAFETY: the TCB is now reachable through the thread pointer.

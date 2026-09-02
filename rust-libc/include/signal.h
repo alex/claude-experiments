@@ -111,8 +111,13 @@ typedef void (*sighandler_t)(int);
 
 #define SS_ONSTACK 1
 #define SS_DISABLE 2
+#if defined(__x86_64__)
 #define MINSIGSTKSZ 2048
 #define SIGSTKSZ 8192
+#else
+#define MINSIGSTKSZ 5120
+#define SIGSTKSZ 16384
+#endif
 
 #define SI_USER 0
 #define SI_KERNEL 128

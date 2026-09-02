@@ -172,3 +172,7 @@ pub const STATX: usize = 291;
 pub const RSEQ: usize = 293;
 pub const CLONE3: usize = 435;
 pub const FACCESSAT2: usize = 439;
+#[allow(missing_docs)]
+pub const RENAMEAT2: usize = 276;
+#[allow(missing_docs)]
+pub const WAITID: usize = 95;

@@ -167,6 +167,19 @@ pub fn x87_to_f64(mantissa: u64, se: u16) -> f64 {
     f64::from_bits(bits | (sign << 63))
 }
 
+/// Stores `v` as a C `long double` (the 80-bit x87 format) at `dst`.
+///
+/// # Safety
+/// `dst` must be valid for 16 bytes.
+pub unsafe fn write_long_double(dst: *mut u8, v: f64) {
+    let (m, se) = f64_to_x87(v);
+    // SAFETY: caller contract.
+    unsafe {
+        (dst as *mut u64).write_unaligned(m);
+        (dst.add(8) as *mut u16).write_unaligned(se);
+    }
+}
+
 /// Converts an `f64` to the 80-bit x87 extended format (mantissa with
 /// explicit integer bit, and sign+exponent word).
 pub fn f64_to_x87(x: f64) -> (u64, u16) {
@@ -201,7 +214,7 @@ pub fn f64_to_x87(x: f64) -> (u64, u16) {
 /// (the one after the fixed arguments).
 #[cfg(not(test))]
 macro_rules! variadic_stub {
-    ($name:ident, $fixed:literal, $reg:literal, $target:path) => {
+    ($name:ident, $fixed:tt, $target:path) => {
         core::arch::global_asm!(
             concat!(".globl ", stringify!($name)),
             concat!(".type ", stringify!($name), ",@function"),
@@ -226,12 +239,12 @@ macro_rules! variadic_stub {
             "movaps [rsp + 144], xmm6",
             "movaps [rsp + 160], xmm7",
             "1:",
-            concat!("mov dword ptr [rsp + 176], ", $fixed, " * 8"),
+            concat!("mov dword ptr [rsp + 176], ", stringify!($fixed), " * 8"),
             "mov dword ptr [rsp + 180], 48",
             "lea rax, [rsp + 208]",
             "mov [rsp + 184], rax",
             "mov [rsp + 192], rsp",
-            concat!("lea ", $reg, ", [rsp + 176]"),
+            concat!("lea ", $crate::arch::va::arg_reg!($fixed), ", [rsp + 176]"),
             "call {target}",
             "add rsp, 200",
             "ret",
@@ -242,6 +255,53 @@ macro_rules! variadic_stub {
 }
 #[cfg(not(test))]
 pub(crate) use variadic_stub;
+
+/// The register holding integer argument number `n` (0-based) in the
+/// SysV calling convention, as an assembler operand.
+macro_rules! arg_reg {
+    (1) => {
+        "rsi"
+    };
+    (2) => {
+        "rdx"
+    };
+    (3) => {
+        "rcx"
+    };
+    (4) => {
+        "r8"
+    };
+    (5) => {
+        "r9"
+    };
+}
+#[cfg(not(test))]
+pub(crate) use arg_reg;
+
+/// Defines `$name`, a function with `$target`'s arguments that returns
+/// `$target`'s `double` result as a C `long double` (on x86_64 in
+/// `st(0)`).
+macro_rules! long_double_stub {
+    ($name:ident, $target:path) => {
+        core::arch::global_asm!(
+            concat!(".globl ", stringify!($name)),
+            concat!(".type ", stringify!($name), ",@function"),
+            concat!(stringify!($name), ":"),
+            "sub rsp, 8",
+            "call {target}",
+            "movsd qword ptr [rsp], xmm0",
+            "fld qword ptr [rsp]",
+            "add rsp, 8",
+            "ret",
+            concat!(".size ", stringify!($name), ", .-", stringify!($name)),
+            target = sym $target,
+        );
+    };
+}
+#[cfg(not(test))]
+pub(crate) use long_double_stub;
+
+
 
 #[cfg(test)]
 mod tests {

@@ -39,7 +39,11 @@ typedef union epoll_data {
 struct epoll_event {
     uint32_t events;
     epoll_data_t data;
-} __attribute__((packed));
+}
+#if defined(__x86_64__)
+__attribute__((packed))
+#endif
+;
 
 __BEGIN_DECLS
 int epoll_create(int);

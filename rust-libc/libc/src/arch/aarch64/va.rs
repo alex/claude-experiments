@@ -11,6 +11,7 @@
 //! `long double` is IEEE binary128 here; it is passed in `q` registers
 //! and converted to `f64` on read.
 
+use crate::arch::f128::{f64_to_f128, f128_to_f64};
 use core::ffi::c_void;
 
 /// `va_list` (`struct __va_list`).
@@ -98,76 +99,21 @@ impl VaList {
     }
 }
 
-/// Converts an IEEE binary128 value to `f64` (round to nearest even).
-pub fn f128_to_f64(bits: u128) -> f64 {
-    let sign = ((bits >> 127) as u64) << 63;
-    let exp = ((bits >> 112) & 0x7fff) as i32;
-    let mant = bits & ((1u128 << 112) - 1);
-    if exp == 0x7fff {
-        return f64::from_bits(sign | 0x7ff0_0000_0000_0000 | if mant != 0 { 1 << 51 } else { 0 });
-    }
-    if exp == 0 && mant == 0 {
-        return f64::from_bits(sign);
-    }
-    // Exact value: (1.mant or 0.mant) * 2^(exp - 16383).
-    let (m, e) = if exp == 0 { (mant, -16382) } else { (mant | (1u128 << 112), exp - 16383) };
-    // Normalise so the leading one is at bit 112.
-    let shift = m.leading_zeros() as i32 - 15;
-    let m = m << shift;
-    let e = e - shift;
-    // Target: 53 significant bits; exponent range of f64.
-    let e64 = e + 1023;
-    if e64 >= 0x7ff {
-        return f64::from_bits(sign | 0x7ff0_0000_0000_0000);
-    }
-    let (keep, e64) = if e64 <= 0 { (52 + e64 as i32, 0) } else { (53, e64) };
-    if keep <= 0 {
-        return f64::from_bits(sign);
-    }
-    let drop = 113 - keep;
-    let mut frac = (m >> drop) as u64;
-    let rem = m & ((1u128 << drop) - 1);
-    let half = 1u128 << (drop - 1);
-    if rem > half || (rem == half && frac & 1 == 1) {
-        frac += 1;
-    }
-    let bits = if e64 == 0 {
-        // Subnormal (a carry into bit 52 becomes the smallest normal).
-        frac
-    } else {
-        ((e64 as u64) << 52) | (frac & ((1 << 52) - 1)) + (((frac >> 53) & 1) << 52) * 0
-    };
-    let bits = if e64 != 0 && frac >> 53 != 0 { ((e64 as u64 + 1) << 52) | 0 } else { bits };
-    f64::from_bits(sign | bits)
+/// Stores `v` as a C `long double` (IEEE binary128) at `dst`.
+///
+/// # Safety
+/// `dst` must be valid for 16 bytes.
+pub unsafe fn write_long_double(dst: *mut u8, v: f64) {
+    // SAFETY: caller contract.
+    unsafe { (dst as *mut u128).write_unaligned(f64_to_f128(v)) }
 }
 
-/// Converts an `f64` to IEEE binary128 bits (exact).
-pub fn f64_to_f128(x: f64) -> u128 {
-    let b = x.to_bits();
-    let sign = ((b >> 63) as u128) << 127;
-    let exp = ((b >> 52) & 0x7ff) as i32;
-    let mant = (b & ((1 << 52) - 1)) as u128;
-    if exp == 0x7ff {
-        return sign | (0x7fffu128 << 112) | if mant != 0 { 1u128 << 111 } else { 0 };
-    }
-    if exp == 0 {
-        if mant == 0 {
-            return sign;
-        }
-        // Subnormal double: normalise.
-        let shift = mant.leading_zeros() as i32 - (128 - 53);
-        let m = (mant << shift) & ((1u128 << 52) - 1);
-        let e = 1 - 1023 - shift + 16383;
-        return sign | ((e as u128) << 112) | (m << 60);
-    }
-    sign | (((exp - 1023 + 16383) as u128) << 112) | (mant << 60)
-}
 
 /// Generates a variadic C entry point `$name` with `$fixed` fixed integer
 /// arguments that calls `$target` with a `va_list` pointer in `$reg`.
 #[cfg(not(test))]
 macro_rules! variadic_stub {
-    ($name:ident, $fixed:literal, $reg:literal, $target:path) => {
+    ($name:ident, $fixed:tt, $target:path) => {
         core::arch::global_asm!(
             concat!(".globl ", stringify!($name)),
             concat!(".type ", stringify!($name), ",%function"),
@@ -193,11 +139,12 @@ macro_rules! variadic_stub {
             "str x9, [sp, #216]",
             "add x9, sp, #208",
             "str x9, [sp, #224]",
-            concat!("mov w9, #-(8 - ", $fixed, ") * 8"),
+            concat!("mov w9, #-((8 - ", stringify!($fixed), ") * 8)"),
             "str w9, [sp, #232]",
             "mov w9, #-128",
             "str w9, [sp, #236]",
-            concat!("add ", $reg, ", sp, #208"),
+            // The va_list parameter is argument number `fixed`.
+            concat!("add x", stringify!($fixed), ", sp, #208"),
             "bl {target}",
             "ldp x29, x30, [sp], #240",
             "ret",
@@ -209,22 +156,46 @@ macro_rules! variadic_stub {
 #[cfg(not(test))]
 pub(crate) use variadic_stub;
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+/// Two halves of a binary128 value, returned in `x0:x1`.
+#[repr(C)]
+pub struct F128Halves {
+    /// Low 64 bits.
+    pub lo: u64,
+    /// High 64 bits.
+    pub hi: u64,
+}
 
-    #[test]
-    fn f128_conversions_round_trip() {
-        for x in [0.0, -0.0, 1.0, -2.5, 3.141592653589793, 1e300, 1e-300, 5e-324, f64::MAX, f64::MIN_POSITIVE, f64::INFINITY, f64::NEG_INFINITY] {
-            let back = f128_to_f64(f64_to_f128(x));
-            assert_eq!(back.to_bits(), x.to_bits(), "{x}");
-        }
-        assert!(f128_to_f64(f64_to_f128(f64::NAN)).is_nan());
-        // One third in binary128 (more precise than a double) rounds to 1/3.
-        let third: u128 = 0x3ffd5555555555555555555555555555;
-        assert_eq!(f128_to_f64(third), 1.0 / 3.0);
-        // Overflow and underflow saturate.
-        assert_eq!(f128_to_f64(0x43ff << 112), f64::INFINITY);
-        assert_eq!(f128_to_f64(0x0001 << 112), 0.0);
+/// Converts a `double` to the halves of the equal binary128 value.
+pub extern "C" fn __rustlibc_f128_halves(x: f64) -> F128Halves {
+    let bits = f64_to_f128(x);
+    F128Halves {
+        lo: bits as u64,
+        hi: (bits >> 64) as u64,
     }
 }
+
+/// Defines `$name`, a function with `$target`'s arguments that returns
+/// `$target`'s `double` result as a C `long double` (on AArch64 an IEEE
+/// binary128 in `q0`).
+macro_rules! long_double_stub {
+    ($name:ident, $target:path) => {
+        core::arch::global_asm!(
+            concat!(".globl ", stringify!($name)),
+            concat!(".type ", stringify!($name), ",%function"),
+            concat!(stringify!($name), ":"),
+            "stp x29, x30, [sp, #-16]!",
+            "mov x29, sp",
+            "bl {target}",
+            "bl {halves}",
+            "ldp x29, x30, [sp], #16",
+            "fmov d0, x0",
+            "mov v0.d[1], x1",
+            "ret",
+            concat!(".size ", stringify!($name), ", .-", stringify!($name)),
+            target = sym $target,
+            halves = sym $crate::arch::va::__rustlibc_f128_halves,
+        );
+    };
+}
+#[cfg(not(test))]
+pub(crate) use long_double_stub;

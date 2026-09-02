@@ -55,9 +55,10 @@ impl Image {
         align: 1,
     };
 
-    /// Size of the TLS block as seen by the linker.
+    /// Size of the TLS block as seen by the linker (variant I adds the
+    /// header, rounded to the block's alignment).
     fn block_size(&self) -> usize {
-        round_up(self.memsz, self.align)
+        round_up(self.memsz, self.align) + round_up(TP_HEADER, self.align)
     }
 
     /// Alignment of the whole region (TLS block plus TCB).
@@ -68,8 +69,10 @@ impl Image {
     /// Number of bytes a caller must provide to [`install`].
     pub fn region_size(&self) -> usize {
         // One `region_align` of slack to align the start, another so the
-        // TCB can be rounded up to `region_align` as well.
-        2 * self.region_align() + self.block_size() + core::mem::size_of::<Tcb>()
+        // TCB (variant II) or the thread pointer (variant I) can be
+        // rounded up to `region_align` as well, plus the variant I
+        // header.
+        2 * self.region_align() + self.block_size() + core::mem::size_of::<Tcb>() + TP_HEADER
     }
 }
 
@@ -113,11 +116,48 @@ pub fn region_size() -> usize {
     image().region_size()
 }
 
+/// Size of the header at the thread pointer in the variant I layout
+/// (two words, conventionally the DTV pointer and a reserved word).
+#[cfg(target_arch = "x86_64")]
+const TP_HEADER: usize = 0;
+#[cfg(not(target_arch = "x86_64"))]
+const TP_HEADER: usize = 16;
+
+/// The thread pointer register value for a TCB: the TCB itself in the
+/// variant II layout, the header right after it in variant I.
+#[inline(always)]
+pub fn thread_pointer_of(tcb: *mut Tcb) -> *mut u8 {
+    #[cfg(target_arch = "x86_64")]
+    {
+        tcb as *mut u8
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        (tcb as usize + core::mem::size_of::<Tcb>()) as *mut u8
+    }
+}
+
+/// The TCB behind a thread pointer register value (the inverse of
+/// [`thread_pointer_of`]).
+#[inline(always)]
+pub fn tcb_of(tp: *mut u8) -> *mut Tcb {
+    #[cfg(target_arch = "x86_64")]
+    {
+        tp as *mut Tcb
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        (tp as usize - core::mem::size_of::<Tcb>()) as *mut Tcb
+    }
+}
+
 /// Lays out a TLS block and TCB inside `region`, which must hold at least
-/// [`region_size`] bytes, and returns the thread pointer.
+/// [`region_size`] bytes, and returns the TCB (see [`thread_pointer_of`]
+/// for the register value).
 ///
 /// # Safety
 /// `region` must be valid for writes of `len` bytes and unused.
+#[cfg(target_arch = "x86_64")]
 pub unsafe fn install(region: *mut u8, len: usize, canary: usize) -> *mut Tcb {
     let image = image();
     assert!(len >= image.region_size(), "TLS region too small");
@@ -131,6 +171,39 @@ pub unsafe fn install(region: *mut u8, len: usize, canary: usize) -> *mut Tcb {
         core::ptr::copy_nonoverlapping(image.addr, block, image.filesz);
         core::ptr::write_bytes(block.add(image.filesz), 0, image.memsz - image.filesz);
         let tcb = tp as *mut Tcb;
+        Tcb::init(tcb, canary);
+        tcb
+    }
+}
+
+/// Variant I (AArch64): the thread pointer addresses a 16-byte header
+/// and the TLS block follows it at `round_up(16, align)`; compiled code
+/// reads a variable at `tp + round_up(16, align) + offset`. Our TCB sits
+/// immediately below the thread pointer.
+///
+/// ```text
+///  region (aligned to A)
+///  |  slack  |  Tcb  | header | TLS image (filesz) | zeroes (memsz-filesz) |
+///                    ^ tp     ^ block = tp + round_up(16, align)
+/// ```
+///
+/// # Safety
+/// `region` must be valid for writes of `len` bytes and unused.
+#[cfg(not(target_arch = "x86_64"))]
+pub unsafe fn install(region: *mut u8, len: usize, canary: usize) -> *mut Tcb {
+    let image = image();
+    assert!(len >= image.region_size(), "TLS region too small");
+    let align = image.region_align();
+    let base = round_up(region as usize, align);
+    let tp = round_up(base + core::mem::size_of::<Tcb>(), align);
+    let tcb = tcb_of(tp as *mut u8);
+    let block = (tp + round_up(TP_HEADER, image.align)) as *mut u8;
+    // SAFETY: everything lies inside `region` by construction, and the
+    // image is part of the executable so it is readable.
+    unsafe {
+        core::ptr::write_bytes(tp as *mut u8, 0, TP_HEADER);
+        core::ptr::copy_nonoverlapping(image.addr, block, image.filesz);
+        core::ptr::write_bytes(block.add(image.filesz), 0, image.memsz - image.filesz);
         Tcb::init(tcb, canary);
         tcb
     }

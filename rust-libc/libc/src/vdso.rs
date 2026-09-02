@@ -178,10 +178,10 @@ pub fn init() {
         if addr < img.base || addr >= img.base + img.len {
             continue;
         }
-        match name {
-            b"__vdso_clock_gettime" => CLOCK_GETTIME.store(addr, Ordering::Relaxed),
-            b"__vdso_getcpu" => GETCPU.store(addr, Ordering::Relaxed),
-            _ => {}
+        if name == crate::arch::VDSO_CLOCK_GETTIME {
+            CLOCK_GETTIME.store(addr, Ordering::Relaxed);
+        } else if name == crate::arch::VDSO_GETCPU {
+            GETCPU.store(addr, Ordering::Relaxed);
         }
     }
 }

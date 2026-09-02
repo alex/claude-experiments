@@ -127,8 +127,19 @@ pub extern "C" fn dup3(old: c_int, new: c_int, flags: c_int) -> c_int {
 /// `dup2(2)`.
 #[cfg_attr(not(test), unsafe(no_mangle))]
 pub extern "C" fn dup2(old: c_int, new: c_int) -> c_int {
+    if old == new {
+        // `dup3` rejects this; `dup2` just checks that `old` is open.
+        // SAFETY: F_GETFD takes no argument.
+        return match unsafe { sys::fcntl(old, sys::F_GETFD, 0) } {
+            Ok(_) => new,
+            Err(e) => {
+                e.set();
+                -1
+            }
+        };
+    }
     // SAFETY: no memory is involved.
-    let r = unsafe { crate::arch::syscall2(crate::arch::nr::DUP2, old as usize, new as usize) };
+    let r = unsafe { crate::arch::syscall3(crate::arch::nr::DUP3, old as usize, new as usize, 0) };
     sys::check(r).map(|v| v as c_int).c_ret()
 }
 
@@ -179,28 +190,30 @@ simple_syscalls! {
     getpgid(pid: c_int) = GETPGID -> c_int, -1;
     /// `setpgid(2)`.
     setpgid(pid: c_int, pgid: c_int) = SETPGID -> c_int, -1;
-    /// `getpgrp(2)`.
-    getpgrp() = GETPGRP -> c_int, -1;
     /// `setsid(2)`.
     setsid() = SETSID -> c_int, -1;
     /// `getsid(2)`.
     getsid(pid: c_int) = GETSID -> c_int, -1;
 }
 
+/// `getpgrp(2)`: `getpgid(0)` (aarch64 has no `getpgrp` call).
+#[cfg_attr(not(test), unsafe(no_mangle))]
+pub extern "C" fn getpgrp() -> c_int {
+    getpgid(0)
+}
+
 /// `seteuid(2)`, via `setresuid`.
 #[cfg_attr(not(test), unsafe(no_mangle))]
 pub extern "C" fn seteuid(uid: c_uint) -> c_int {
-    const SETRESUID: usize = 117;
     // SAFETY: no memory is involved.
-    let r = unsafe { crate::arch::syscall3(SETRESUID, usize::MAX, uid as usize, usize::MAX) };
+    let r = unsafe { crate::arch::syscall3(crate::arch::nr::SETRESUID, usize::MAX, uid as usize, usize::MAX) };
     sys::check(r).map(drop).c_ret()
 }
 
 /// `setegid(2)`, via `setresgid`.
 #[cfg_attr(not(test), unsafe(no_mangle))]
 pub extern "C" fn setegid(gid: c_uint) -> c_int {
-    const SETRESGID: usize = 119;
     // SAFETY: no memory is involved.
-    let r = unsafe { crate::arch::syscall3(SETRESGID, usize::MAX, gid as usize, usize::MAX) };
+    let r = unsafe { crate::arch::syscall3(crate::arch::nr::SETRESGID, usize::MAX, gid as usize, usize::MAX) };
     sys::check(r).map(drop).c_ret()
 }

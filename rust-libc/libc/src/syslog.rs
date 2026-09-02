@@ -211,7 +211,7 @@ impl ToOwnedArray for [u8] {
 #[cfg(not(test))]
 mod stubs {
     use crate::arch::va::variadic_stub;
-    variadic_stub!(syslog, 2, "rdx", super::vsyslog);
+    variadic_stub!(syslog, 2, super::vsyslog);
 }
 
 /// Keeps `ptr` referenced for header-facing code.
