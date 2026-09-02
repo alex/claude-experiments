@@ -337,7 +337,10 @@ pub extern "C" fn pthread_mutexattr_setpshared(_attr: *mut MutexAttr, pshared: c
 pub struct Cond {
     seq: AtomicU32,
     clock: u32,
-    _pad: [u32; 2],
+    /// Threads blocked (or about to block) in a wait, so signals with
+    /// nobody waiting skip the futex syscall.
+    waiters: AtomicU32,
+    _pad: u32,
 }
 
 /// `pthread_condattr_t`.
@@ -362,7 +365,8 @@ pub unsafe extern "C" fn pthread_cond_init(c: *mut Cond, attr: *const CondAttr) 
         c.write(Cond {
             seq: AtomicU32::new(0),
             clock,
-            _pad: [0; 2],
+            waiters: AtomicU32::new(0),
+            _pad: 0,
         });
     }
     0
@@ -396,11 +400,16 @@ unsafe fn cond_wait_clock(
     // SAFETY: caller contract.
     unsafe {
         let seq = (*c).seq.load(Ordering::Acquire);
+        // Registered while the mutex is still held, so a signaller that
+        // takes the mutex afterwards is bound to see us.
+        (*c).waiters.fetch_add(1, Ordering::SeqCst);
         let r = pthread_mutex_unlock(m);
         if r != 0 {
+            (*c).waiters.fetch_sub(1, Ordering::SeqCst);
             return r;
         }
         let result = wait(&(*c).seq, seq, deadline, clock);
+        (*c).waiters.fetch_sub(1, Ordering::SeqCst);
         pthread_mutex_lock(m);
         match result {
             Ok(()) => 0,
@@ -469,8 +478,10 @@ pub unsafe extern "C" fn pthread_cond_clockwait(
 pub unsafe extern "C" fn pthread_cond_signal(c: *mut Cond) -> c_int {
     // SAFETY: caller contract.
     unsafe {
-        (*c).seq.fetch_add(1, Ordering::Release);
-        let _ = sys::futex_wake(&(*c).seq, 1);
+        (*c).seq.fetch_add(1, Ordering::SeqCst);
+        if (*c).waiters.load(Ordering::SeqCst) != 0 {
+            let _ = sys::futex_wake(&(*c).seq, 1);
+        }
     }
     0
 }
@@ -483,8 +494,10 @@ pub unsafe extern "C" fn pthread_cond_signal(c: *mut Cond) -> c_int {
 pub unsafe extern "C" fn pthread_cond_broadcast(c: *mut Cond) -> c_int {
     // SAFETY: caller contract.
     unsafe {
-        (*c).seq.fetch_add(1, Ordering::Release);
-        wake_all(&(*c).seq);
+        (*c).seq.fetch_add(1, Ordering::SeqCst);
+        if (*c).waiters.load(Ordering::SeqCst) != 0 {
+            wake_all(&(*c).seq);
+        }
     }
     0
 }

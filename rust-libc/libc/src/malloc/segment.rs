@@ -16,7 +16,7 @@
 //! by the page-aligned block area. The bitmap makes double and invalid
 //! frees detectable.
 
-use super::classes::{CLASS_INV, CLASS_SIZE, units_for_class};
+use super::classes::{CLASS_INV, CLASS_INV_SHIFT, CLASS_SIZE, units_for_class};
 use crate::sync::{Mutex, RawMutex};
 use crate::sys::{
     self, MAP_ANONYMOUS, MAP_NORESERVE, MAP_PRIVATE, PAGE_SIZE, PROT_READ, PROT_WRITE,
@@ -57,6 +57,12 @@ pub struct Segment {
     next: *mut Segment,
     /// Bit `i` set = unit `i` is free. Protected by the pool lock.
     free_units: u64,
+    /// Free units whose pages may still be resident: single-unit spans
+    /// are released without returning their pages, because a thread that
+    /// comes and goes should not pay a TLB shootdown and a refault for
+    /// every span it touched. Once most of a segment is free they are
+    /// returned in bulk (see [`release_span`]). Protected by the pool lock.
+    resident: u64,
     /// For each unit, the index of the first unit of its span. Only
     /// meaningful for allocated units.
     span_of: [AtomicU8; UNITS],
@@ -140,7 +146,8 @@ impl Span {
         }
         // Division by multiplication (see `CLASS_INV`); the multiply-back
         // check makes the result exact for any `off`, valid or not.
-        let idx = ((off as u64).wrapping_mul(CLASS_INV[self.class as usize]) >> 40) as usize;
+        let idx = ((off as u64).wrapping_mul(CLASS_INV[self.class as usize]) >> CLASS_INV_SHIFT)
+            as usize;
         if idx >= self.bump as usize || idx * bs != off {
             None
         } else {
@@ -201,9 +208,18 @@ static POOL: Mutex<Pool> = Mutex::new(Pool {
 /// keep their contents (like any other freed memory); `calloc` zeroes
 /// them explicitly.
 struct HugeCache {
-    /// `(base, mapping length)`.
-    entries: [(usize, usize); HUGE_CACHE_SLOTS],
+    entries: [CachedMapping; HUGE_CACHE_SLOTS],
     count: usize,
+    /// Total length of the entries whose pages are still resident.
+    resident: usize,
+}
+
+#[derive(Clone, Copy)]
+struct CachedMapping {
+    base: usize,
+    len: usize,
+    /// False once the pages were returned with `MADV_DONTNEED`.
+    resident: bool,
 }
 
 const HUGE_CACHE_SLOTS: usize = 8;
@@ -211,18 +227,29 @@ const HUGE_CACHE_SLOTS: usize = 8;
 const HUGE_CACHE_MAX_LEN: usize = 64 << 20;
 
 static HUGE_CACHE: Mutex<HugeCache> = Mutex::new(HugeCache {
-    entries: [(0, 0); HUGE_CACHE_SLOTS],
+    entries: [CachedMapping {
+        base: 0,
+        len: 0,
+        resident: false,
+    }; HUGE_CACHE_SLOTS],
     count: 0,
+    resident: 0,
 });
 
+/// Cached mappings keep their pages (so reuse costs nothing) up to this
+/// many bytes in total; beyond it their pages are returned to the kernel
+/// and only the address range is kept, saving the mmap/munmap pair.
+const HUGE_CACHE_RESIDENT_MAX: usize = 32 << 20;
+
 /// Takes the smallest cached mapping of at least `len` bytes that does
-/// not waste more than half of itself.
-fn take_cached(len: usize) -> Option<(*mut u8, usize)> {
+/// not waste more than half of itself. The flag says whether its pages
+/// were returned (so it reads as zeros).
+fn take_cached(len: usize) -> Option<(*mut u8, usize, bool)> {
     let mut cache = HUGE_CACHE.lock();
     let mut best: Option<usize> = None;
     for i in 0..cache.count {
-        let l = cache.entries[i].1;
-        if l >= len && l / 2 <= len && best.is_none_or(|b| l < cache.entries[b].1) {
+        let l = cache.entries[i].len;
+        if l >= len && l / 2 <= len && best.is_none_or(|b| l < cache.entries[b].len) {
             best = Some(i);
         }
     }
@@ -230,7 +257,10 @@ fn take_cached(len: usize) -> Option<(*mut u8, usize)> {
     let entry = cache.entries[i];
     cache.count -= 1;
     cache.entries[i] = cache.entries[cache.count];
-    Some((entry.0 as *mut u8, entry.1))
+    if entry.resident {
+        cache.resident -= entry.len;
+    }
+    Some((entry.base as *mut u8, entry.len, !entry.resident))
 }
 
 /// Maps `len` bytes aligned to [`SEGMENT_SIZE`] by over-allocating and
@@ -276,6 +306,7 @@ fn new_segment() -> Option<*mut Segment> {
         });
         ptr::addr_of_mut!((*seg).next).write(ptr::null_mut());
         ptr::addr_of_mut!((*seg).free_units).write(u64::MAX);
+        ptr::addr_of_mut!((*seg).resident).write(0);
         for i in 0..UNITS {
             ptr::addr_of_mut!((*seg).span_of[i]).write(AtomicU8::new(0));
             ptr::addr_of_mut!((*seg).spans[i]).write(Span::EMPTY);
@@ -323,6 +354,7 @@ pub fn alloc_span(class: usize, owner: usize) -> Option<*mut Span> {
     // header (under the pool lock) or to the span's own memory.
     unsafe {
         (*seg).free_units &= !mask;
+        (*seg).resident &= !mask;
         for u in first..first + units {
             (*seg).span_of[u].store(first as u8, Ordering::Relaxed);
         }
@@ -383,15 +415,24 @@ pub unsafe fn release_span(span: *mut Span) {
         (*span).owner.store(0, Ordering::Relaxed);
         let mask = ((1u64 << units) - 1) << first;
         (*seg).free_units |= mask;
-        // Let the kernel reclaim the pages of large spans. The segment
-        // header at the start of unit 0 must of course be kept.
         if units > 1 {
-            let mut start = seg as usize + first * UNIT_SIZE;
-            let end = start + units * UNIT_SIZE;
-            if first == 0 {
-                start += HEADER_SIZE;
+            // Large spans hold blocks that fault their pages in anyway:
+            // return the memory right away.
+            madvise_units(seg, first, units);
+        } else {
+            (*seg).resident |= mask;
+        }
+        // Once the segment is mostly free, return everything still
+        // resident in as few calls as possible.
+        if (*seg).free_units.count_ones() >= SWEEP_FREE_UNITS && (*seg).resident != 0 {
+            let mut bits = (*seg).resident;
+            while bits != 0 {
+                let start = bits.trailing_zeros() as usize;
+                let run = (bits >> start).trailing_ones() as usize;
+                madvise_units(seg, start, run);
+                bits &= !(((1u64 << run) - 1) << start);
             }
-            madvise_dontneed(start as *mut u8, end - start);
+            (*seg).resident = 0;
         }
         if (*seg).free_units == u64::MAX && (pool.head != seg || !(*seg).next.is_null()) {
             // Unlink and unmap.
@@ -404,6 +445,24 @@ pub unsafe fn release_span(span: *mut Span) {
             let _ = sys::munmap(seg as *mut u8, SEGMENT_SIZE);
         }
     }
+}
+
+/// Free units in a segment at which the resident free pages are returned.
+const SWEEP_FREE_UNITS: u32 = 48;
+
+/// Lets the kernel reclaim the pages of units `first..first + n` (they
+/// read as zeros if reused). The segment header at the start of unit 0
+/// is kept.
+///
+/// # Safety
+/// The units must be free.
+unsafe fn madvise_units(seg: *mut Segment, first: usize, n: usize) {
+    let mut start = seg as usize + first * UNIT_SIZE;
+    let end = start + n * UNIT_SIZE;
+    if first == 0 {
+        start += HEADER_SIZE;
+    }
+    madvise_dontneed(start as *mut u8, end - start);
 }
 
 fn madvise_dontneed(addr: *mut u8, len: usize) {
@@ -510,7 +569,7 @@ pub fn alloc_huge(size: usize, align: usize) -> Option<(*mut u8, bool)> {
         .checked_add(size)?
         .checked_next_multiple_of(PAGE_SIZE)?;
     let (base, len, fresh) = match take_cached(len) {
-        Some((base, len)) => (base, len, false),
+        Some((base, len, zeroed)) => (base, len, zeroed),
         None => (map_aligned(len)?, len, true),
     };
     // SAFETY: our mapping; the header fits in the first page.
@@ -529,6 +588,74 @@ pub fn alloc_huge(size: usize, align: usize) -> Option<(*mut u8, bool)> {
         return None;
     }
     Some((data, fresh))
+}
+
+/// Resizes the huge block described by `h` to `size` bytes in place or
+/// by moving its pages with `mremap`, never by copying. Returns the new
+/// data pointer, or `None` if the kernel could not do it (the caller
+/// then falls back to allocate-copy-free).
+///
+/// # Safety
+/// `h` must be a live huge header.
+pub unsafe fn realloc_huge(h: *mut Header, size: usize) -> Option<*mut u8> {
+    // SAFETY: caller contract.
+    let (old_len, data_off) = unsafe { ((*h).map_len, (*h).data as usize - h as usize) };
+    let new_len = data_off
+        .checked_add(size)?
+        .checked_next_multiple_of(PAGE_SIZE)?;
+    if new_len == old_len {
+        // SAFETY: caller contract.
+        return Some(unsafe { (*h).data });
+    }
+    const MREMAP_MAYMOVE: usize = 1;
+    const MREMAP_FIXED: usize = 2;
+    // Shrinking, or growing into free space right after the mapping,
+    // keeps the (16 MiB aligned) base.
+    // SAFETY: our own mapping.
+    let r = unsafe {
+        crate::arch::syscall5(crate::arch::nr::MREMAP, h as usize, old_len, new_len, 0, 0)
+    };
+    let base = match sys::check(r) {
+        Ok(_) => h as usize,
+        Err(_) if new_len < old_len => return None,
+        Err(_) => {
+            // Move the pages into a fresh aligned reservation: MREMAP_FIXED
+            // replaces whatever is mapped at the destination.
+            let dest = map_aligned(new_len)? as usize;
+            // SAFETY: both ranges are our own mappings.
+            let r = unsafe {
+                crate::arch::syscall5(
+                    crate::arch::nr::MREMAP,
+                    h as usize,
+                    old_len,
+                    new_len,
+                    MREMAP_MAYMOVE | MREMAP_FIXED,
+                    dest,
+                )
+            };
+            if sys::check(r).is_err() {
+                // SAFETY: the reservation is ours and unused.
+                let _ = unsafe { sys::munmap(dest as *mut u8, new_len) };
+                return None;
+            }
+            unregister(h as usize);
+            dest
+        }
+    };
+    let nh = base as *mut Header;
+    // SAFETY: the header moved with its pages (or stayed); the registry
+    // entry is refreshed before the block is handed back.
+    unsafe {
+        (*nh).map_len = new_len;
+        (*nh).data = (base + data_off) as *mut u8;
+    }
+    if !register(base) {
+        // SAFETY: our mapping, no longer usable by the caller.
+        let _ = unsafe { sys::munmap(nh as *mut u8, new_len) };
+        return None;
+    }
+    // SAFETY: as above.
+    Some(unsafe { (*nh).data })
 }
 
 /// Usable size of the huge block described by `h`.
@@ -565,8 +692,18 @@ pub unsafe fn free_huge(h: *mut Header) {
     if len <= HUGE_CACHE_MAX_LEN {
         let mut cache = HUGE_CACHE.lock();
         if cache.count < HUGE_CACHE_SLOTS {
+            let resident = cache.resident + len <= HUGE_CACHE_RESIDENT_MAX;
+            if resident {
+                cache.resident += len;
+            } else {
+                madvise_dontneed(h as *mut u8, len);
+            }
             let n = cache.count;
-            cache.entries[n] = (h as usize, len);
+            cache.entries[n] = CachedMapping {
+                base: h as usize,
+                len,
+                resident,
+            };
             cache.count = n + 1;
             return;
         }

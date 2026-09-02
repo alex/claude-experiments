@@ -260,6 +260,22 @@ unsafe fn span_has_free(span: *const Span) -> bool {
 // Orphans.
 
 struct Orphans([*mut Span; NUM_CLASSES]);
+
+/// Whether the orphan list of `class` already holds an empty span.
+fn orphans_has_empty(orphans: &Orphans, class: usize) -> bool {
+    let mut span = orphans.0[class];
+    while !span.is_null() {
+        // SAFETY: spans on the orphan lists are live; the caller holds
+        // the lock.
+        unsafe {
+            if (*span).used == 0 {
+                return true;
+            }
+            span = (*span).next;
+        }
+    }
+    false
+}
 // SAFETY: access is serialised by the mutex.
 unsafe impl Send for Orphans {}
 static ORPHANS: Mutex<Orphans> = Mutex::new(Orphans([ptr::null_mut(); NUM_CLASSES]));
@@ -286,7 +302,11 @@ pub unsafe fn abandon(heap: *mut Heap) {
                     let span = *list;
                     list_remove(list, span);
                     span_collect_remote(span);
-                    if (*span).used == 0 {
+                    // Empty spans are kept for the next thread too (one
+                    // per class): returning their pages costs a TLB
+                    // shootdown, which short-lived threads would pay on
+                    // every exit, and page faults on the next use.
+                    if (*span).used == 0 && orphans_has_empty(&orphans, class) {
                         segment::release_span(span);
                     } else {
                         (*span).owner.store(0, Ordering::Release);
@@ -470,11 +490,39 @@ pub unsafe fn dealloc(p: *mut u8) {
                         list_remove(ptr::addr_of_mut!((*heap).full[class]), span);
                         (*span).is_full = false;
                         list_push(ptr::addr_of_mut!((*heap).avail[class]), span);
-                    } else if (*span).used == 0 && !(*span).next.is_null() {
-                        // Completely free and not the only span of its
-                        // class: give it back.
-                        list_remove(ptr::addr_of_mut!((*heap).avail[class]), span);
-                        segment::release_span(span);
+                    } else if (*span).used == 0 {
+                        // Completely free. The only span of its class is
+                        // always kept (a block freed and reallocated in a
+                        // loop must not fault every time). Otherwise a
+                        // large span, whose blocks cost page faults
+                        // anyway, is given back, and of the single-unit
+                        // spans (256 KiB) exactly one empty one is kept,
+                        // at the head of the list where the next
+                        // allocations reuse it.
+                        let avail = ptr::addr_of_mut!((*heap).avail[class]);
+                        let head = *avail;
+                        if (*span).units > 1 {
+                            if head != span || !(*span).next.is_null() {
+                                list_remove(avail, span);
+                                segment::release_span(span);
+                            }
+                        } else if head != span {
+                            list_remove(avail, span);
+                            if (*head).used == 0 {
+                                segment::release_span(span);
+                            } else {
+                                list_push(avail, span);
+                            }
+                        } else {
+                            // A span that just came back from the full
+                            // list is the head; the previous empty span
+                            // is right behind it.
+                            let next = (*span).next;
+                            if !next.is_null() && (*next).used == 0 {
+                                list_remove(avail, next);
+                                segment::release_span(next);
+                            }
+                        }
                     }
                 } else {
                     // Not ours: push on the owner's remote stack.
@@ -531,6 +579,13 @@ pub unsafe fn realloc_impl(p: *mut u8, size: usize) -> *mut u8 {
         // Keep the block if it fits and would not waste most of it.
         if size <= old && (size >= old / 4 || old <= 128) {
             return p;
+        }
+        // Huge blocks are resized by the kernel instead of copied.
+        if size > MAX_SMALL
+            && let Owner::Huge(h) = segment::lookup(p)
+            && let Some(q) = segment::realloc_huge(h, size)
+        {
+            return q;
         }
         let new = alloc(size);
         if new.is_null() {

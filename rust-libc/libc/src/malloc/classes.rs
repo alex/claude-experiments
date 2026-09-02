@@ -8,27 +8,34 @@
 //! (see [`class_for_aligned`]).
 
 /// Number of size classes.
-pub const NUM_CLASSES: usize = 48;
+pub const NUM_CLASSES: usize = 60;
 
 /// Largest size served from spans; anything bigger is a direct mapping.
-pub const MAX_SMALL: usize = 128 * 1024;
+/// Like glibc's (dynamic) mmap threshold this is large enough that the
+/// working set of most programs never pays for a system call per
+/// allocation.
+pub const MAX_SMALL: usize = 1024 * 1024;
 
 /// Block size of every class, in bytes.
 pub const CLASS_SIZE: [u32; NUM_CLASSES] = build_table();
 
-/// `ceil(2^40 / CLASS_SIZE[c])`: `(off * CLASS_INV[c]) >> 40` equals
-/// `off / CLASS_SIZE[c]` for every `off < 2^20` (the largest span), which
+/// `ceil(2^44 / CLASS_SIZE[c])`: `(off * CLASS_INV[c]) >> 44` equals
+/// `off / CLASS_SIZE[c]` for every `off < 2^22` (the largest span), which
 /// replaces a division on the free path. Proof: with `d = CLASS_SIZE[c]`,
-/// the product is `off / d + off * e / 2^40` for some `0 < e <= 1`, and
-/// the error term is below `2^-20`, less than the gap `1 / d` between
-/// `off / d` and the next integer since `d <= 2^17`.
+/// the product is `off / d + off * e / 2^44` for some `0 < e <= 1`, and
+/// the error term is below `2^-22`, less than the gap `1 / d` between
+/// `off / d` and the next integer since `d <= 2^20`. The product itself
+/// stays below `2^22 * 2^41 < 2^64`.
 pub const CLASS_INV: [u64; NUM_CLASSES] = build_inv();
+
+/// Shift matching [`CLASS_INV`].
+pub const CLASS_INV_SHIFT: u32 = 44;
 
 const fn build_inv() -> [u64; NUM_CLASSES] {
     let mut t = [0u64; NUM_CLASSES];
     let mut i = 0;
     while i < NUM_CLASSES {
-        t[i] = (1u64 << 40) / CLASS_SIZE[i] as u64 + 1;
+        t[i] = (1u64 << CLASS_INV_SHIFT) / CLASS_SIZE[i] as u64 + 1;
         i += 1;
     }
     t
@@ -77,10 +84,15 @@ pub fn class_for_aligned(size: usize, align: usize) -> Option<usize> {
     Some(class)
 }
 
-/// Number of 256 KiB units a span of this class occupies.
+/// Number of 256 KiB units a span of this class occupies: enough for a
+/// couple of blocks of the largest classes, at most 8 (2 MiB).
 #[inline]
 pub fn units_for_class(class: usize) -> usize {
-    if CLASS_SIZE[class] <= 32 * 1024 { 1 } else { 4 }
+    match CLASS_SIZE[class] {
+        0..=32_768 => 1,
+        32_769..=131_072 => 4,
+        _ => 8,
+    }
 }
 
 #[cfg(test)]
