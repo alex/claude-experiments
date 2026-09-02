@@ -5,6 +5,7 @@
 //! cargo xtask test       # build, then compile and run every tests/c/*.c
 //! cargo xtask test NAME  # only tests whose file name contains NAME
 //! cargo xtask bench      # run bench/bench.c against rustlibc and glibc
+//! cargo xtask bench alloc  # the allocator workloads in bench/alloc.c
 //! ```
 //!
 //! Each C test (or C++ test, `*.cpp`, linked with the host toolchain's
@@ -367,7 +368,13 @@ fn bench(filter: Option<&str>, release: bool) -> ExitCode {
     let root = root();
     let bindir = root.join("target/bench");
     fs::create_dir_all(&bindir).unwrap();
-    let src = root.join("bench/bench.c");
+    // "alloc" selects the allocator workload program; anything else is a
+    // section filter for the main benchmark.
+    let (src, filter) = if filter == Some("alloc") {
+        (root.join("bench/alloc.c"), None)
+    } else {
+        (root.join("bench/bench.c"), filter)
+    };
     let ours = bindir.join("bench-rustlibc");
     let theirs = bindir.join("bench-glibc");
     let extra = vec!["-fno-builtin".to_string(), "-pthread".to_string()];
@@ -419,7 +426,7 @@ fn bench(filter: Option<&str>, release: bool) -> ExitCode {
         "benchmark", "rustlibc", "glibc", "ratio"
     );
     for (o, g) in results[0].iter().zip(results[1].iter()) {
-        // Ratio > 1 means rustlibc is faster for both throughput and latency units.
+        // Ratio > 1 means rustlibc is better: faster, or (for memory) smaller.
         let ratio = if o.2 == "GB/s" { o.1 / g.1 } else { g.1 / o.1 };
         println!(
             "{:<28} {:>7.2} {:<4} {:>7.2} {:<4} {:>7.2}x",

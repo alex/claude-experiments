@@ -78,7 +78,7 @@ fn valid(sig: c_int) -> bool {
 pub(crate) fn install_internal_handler(sig: c_int, handler: usize) {
     let act = KernelSigaction {
         handler,
-        flags: (crate::sys::SA_SIGINFO as u64) | SA_RESTORER,
+        flags: crate::sys::SA_SIGINFO | SA_RESTORER,
         restorer: restorer(),
         mask: 0,
     };
