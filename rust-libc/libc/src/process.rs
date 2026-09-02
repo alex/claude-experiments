@@ -41,11 +41,13 @@ fn after_fork_child() {
 pub extern "C" fn fork() -> c_int {
     ATFORK.lock().run_prepare();
     crate::malloc::prefork();
+    crate::thread::pthread::prefork();
     crate::stdio::prefork();
     let r = sys::fork();
     // SAFETY: matched with the prefork calls above.
     unsafe {
         crate::stdio::postfork(r == Ok(0));
+        crate::thread::pthread::postfork();
         crate::malloc::postfork();
     }
     match r {

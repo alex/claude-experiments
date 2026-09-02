@@ -125,8 +125,8 @@ static void bench_malloc(void) {
     });
     report_ns("malloc churn 4 threads", s / (4 * 64 * 256));
     void *p = malloc(100);
-    MEASURE(s, p = realloc(p, 100 + (i_ & 1) * 60));
-    report_ns("realloc 100<->160", s);
+    MEASURE(s, p = realloc(p, 100 + (i_ & 1) * 900));
+    report_ns("realloc 100<->1000", s);
     free(p);
 }
 
@@ -140,8 +140,16 @@ static void bench_stdlib(void) {
     char buf[256];
     MEASURE(s, sink += (unsigned long)snprintf(buf, sizeof buf, "%d %s %x", (int)i_, "hello", 0xbeef));
     report_ns("snprintf %d %s %x", s);
-    MEASURE(s, sink += (unsigned long)snprintf(buf, sizeof buf, "%f %g", 3.14159 * (double)i_, 2.5e-7));
-    report_ns("snprintf %f %g", s);
+    MEASURE(s, sink += (unsigned long)snprintf(buf, sizeof buf, "%f", 3.14159 * (double)(i_ & 0xffff)));
+    report_ns("snprintf %f", s);
+    MEASURE(s, sink += (unsigned long)snprintf(buf, sizeof buf, "%g", 2.5e-7 * (double)(1 + (i_ & 0xff))));
+    report_ns("snprintf %g (exp form)", s);
+    MEASURE(s, sink += (unsigned long)snprintf(buf, sizeof buf, "%g", 0.25 * (double)(1 + (i_ & 0xff))));
+    report_ns("snprintf %g (fixed form)", s);
+    MEASURE(s, sink += (unsigned long)snprintf(buf, sizeof buf, "%e", 3.14159 * (double)(i_ & 0xffff)));
+    report_ns("snprintf %e", s);
+    MEASURE(s, sink += (unsigned long)snprintf(buf, sizeof buf, "%.17g", 0.1 * (double)(1 + (i_ & 0xff))));
+    report_ns("snprintf %.17g", s);
     MEASURE(s, sink += (unsigned long)strtol("-123456789", NULL, 10));
     report_ns("strtol", s);
     MEASURE(s, sink += (unsigned long)strtod("3.14159265358979", NULL));

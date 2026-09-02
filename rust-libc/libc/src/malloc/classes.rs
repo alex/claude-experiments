@@ -16,6 +16,24 @@ pub const MAX_SMALL: usize = 128 * 1024;
 /// Block size of every class, in bytes.
 pub const CLASS_SIZE: [u32; NUM_CLASSES] = build_table();
 
+/// `ceil(2^40 / CLASS_SIZE[c])`: `(off * CLASS_INV[c]) >> 40` equals
+/// `off / CLASS_SIZE[c]` for every `off < 2^20` (the largest span), which
+/// replaces a division on the free path. Proof: with `d = CLASS_SIZE[c]`,
+/// the product is `off / d + off * e / 2^40` for some `0 < e <= 1`, and
+/// the error term is below `2^-20`, less than the gap `1 / d` between
+/// `off / d` and the next integer since `d <= 2^17`.
+pub const CLASS_INV: [u64; NUM_CLASSES] = build_inv();
+
+const fn build_inv() -> [u64; NUM_CLASSES] {
+    let mut t = [0u64; NUM_CLASSES];
+    let mut i = 0;
+    while i < NUM_CLASSES {
+        t[i] = (1u64 << 40) / CLASS_SIZE[i] as u64 + 1;
+        i += 1;
+    }
+    t
+}
+
 const fn build_table() -> [u32; NUM_CLASSES] {
     let mut t = [0u32; NUM_CLASSES];
     let mut c = 0;

@@ -16,7 +16,7 @@
 //! by the page-aligned block area. The bitmap makes double and invalid
 //! frees detectable.
 
-use super::classes::{CLASS_SIZE, units_for_class};
+use super::classes::{CLASS_INV, CLASS_SIZE, units_for_class};
 use crate::sync::{Mutex, RawMutex};
 use crate::sys::{
     self, MAP_ANONYMOUS, MAP_NORESERVE, MAP_PRIVATE, PAGE_SIZE, PROT_READ, PROT_WRITE,
@@ -134,11 +134,14 @@ impl Span {
     #[inline]
     pub fn block_index(&self, p: *mut u8) -> Option<u32> {
         let off = (p as usize).wrapping_sub(self.data as usize);
-        if self.block_size == 0 || !off.is_multiple_of(self.block_size as usize) {
+        let bs = self.block_size as usize;
+        if bs == 0 {
             return None;
         }
-        let idx = off / self.block_size as usize;
-        if idx >= self.bump as usize {
+        // Division by multiplication (see `CLASS_INV`); the multiply-back
+        // check makes the result exact for any `off`, valid or not.
+        let idx = ((off as u64).wrapping_mul(CLASS_INV[self.class as usize]) >> 40) as usize;
+        if idx >= self.bump as usize || idx * bs != off {
             None
         } else {
             Some(idx as u32)
@@ -178,6 +181,44 @@ unsafe impl Send for Pool {}
 static POOL: Mutex<Pool> = Mutex::new(Pool {
     head: ptr::null_mut(),
 });
+
+/// Recently freed huge mappings, kept for reuse so that programs which
+/// repeatedly allocate and free large blocks do not pay for `mmap`,
+/// `munmap` and the page faults of a fresh mapping every time. Entries
+/// keep their contents (like any other freed memory); `calloc` zeroes
+/// them explicitly.
+struct HugeCache {
+    /// `(base, mapping length)`.
+    entries: [(usize, usize); HUGE_CACHE_SLOTS],
+    count: usize,
+}
+
+const HUGE_CACHE_SLOTS: usize = 8;
+/// Mappings larger than this always go back to the kernel.
+const HUGE_CACHE_MAX_LEN: usize = 64 << 20;
+
+static HUGE_CACHE: Mutex<HugeCache> = Mutex::new(HugeCache {
+    entries: [(0, 0); HUGE_CACHE_SLOTS],
+    count: 0,
+});
+
+/// Takes the smallest cached mapping of at least `len` bytes that does
+/// not waste more than half of itself.
+fn take_cached(len: usize) -> Option<(*mut u8, usize)> {
+    let mut cache = HUGE_CACHE.lock();
+    let mut best: Option<usize> = None;
+    for i in 0..cache.count {
+        let l = cache.entries[i].1;
+        if l >= len && l <= 2 * len && best.is_none_or(|b| l < cache.entries[b].1) {
+            best = Some(i);
+        }
+    }
+    let i = best?;
+    let entry = cache.entries[i];
+    cache.count -= 1;
+    cache.entries[i] = cache.entries[cache.count];
+    Some((entry.0 as *mut u8, entry.1))
+}
 
 /// Maps `len` bytes aligned to [`SEGMENT_SIZE`] by over-allocating and
 /// trimming. Returns the mapping's start.
@@ -394,7 +435,9 @@ pub unsafe fn lookup(p: *mut u8) -> Owner {
 }
 
 /// Maps a huge block of `size` bytes aligned to `align` (a power of two).
-pub fn alloc_huge(size: usize, align: usize) -> Option<*mut u8> {
+/// The flag is true if the memory is a fresh (zero-filled) mapping rather
+/// than a recycled one.
+pub fn alloc_huge(size: usize, align: usize) -> Option<(*mut u8, bool)> {
     let align = align.max(PAGE_SIZE);
     if align > SEGMENT_SIZE {
         return None;
@@ -403,8 +446,11 @@ pub fn alloc_huge(size: usize, align: usize) -> Option<*mut u8> {
     let len = data_off
         .checked_add(size)?
         .checked_next_multiple_of(PAGE_SIZE)?;
-    let base = map_aligned(len)?;
-    // SAFETY: fresh mapping; the header fits in the first page.
+    let (base, len, fresh) = match take_cached(len) {
+        Some((base, len)) => (base, len, false),
+        None => (map_aligned(len)?, len, true),
+    };
+    // SAFETY: our mapping; the header fits in the first page.
     unsafe {
         let data = base.add(data_off);
         (base as *mut Header).write(Header {
@@ -412,7 +458,7 @@ pub fn alloc_huge(size: usize, align: usize) -> Option<*mut u8> {
             map_len: len,
             data,
         });
-        Some(data)
+        Some((data, fresh))
     }
 }
 
@@ -434,22 +480,39 @@ pub unsafe fn huge_data(h: *const Header) -> *mut u8 {
     unsafe { (*h).data }
 }
 
-/// Unmaps a huge block.
+/// Releases a huge block: into the cache if there is room, else back to
+/// the kernel.
 ///
 /// # Safety
 /// `h` must be a live huge header that is not used afterwards.
 pub unsafe fn free_huge(h: *mut Header) {
     // SAFETY: caller contract.
-    unsafe {
+    let len = unsafe {
         let len = (*h).map_len;
         (*h).magic = 0;
-        let _ = sys::munmap(h as *mut u8, len);
+        len
+    };
+    if len <= HUGE_CACHE_MAX_LEN {
+        let mut cache = HUGE_CACHE.lock();
+        if cache.count < HUGE_CACHE_SLOTS {
+            let n = cache.count;
+            cache.entries[n] = (h as usize, len);
+            cache.count = n + 1;
+            return;
+        }
     }
+    // SAFETY: our mapping, no longer referenced.
+    let _ = unsafe { sys::munmap(h as *mut u8, len) };
 }
 
 /// A lock used to serialise allocator-global state around `fork`.
 pub fn pool_lock() -> &'static RawMutex {
     POOL.raw()
+}
+
+/// The huge-block cache lock, for `fork`.
+pub fn huge_cache_lock() -> &'static RawMutex {
+    HUGE_CACHE.raw()
 }
 
 #[cfg(test)]
@@ -494,7 +557,8 @@ mod tests {
             release_span(big);
             release_span(span);
         }
-        let p = alloc_huge(1_000_000, 16).unwrap();
+        let (p, fresh) = alloc_huge(1_000_000, 16).unwrap();
+        assert!(fresh);
         // SAFETY: valid huge block.
         unsafe {
             match lookup(p) {
@@ -507,7 +571,23 @@ mod tests {
                 _ => panic!("wrong owner"),
             }
         }
-        let p = alloc_huge(10, 1 << 20).unwrap();
+        // The freed mapping is cached and reused for a similar request
+        // (unless a concurrently running test took it first).
+        let (q, fresh) = alloc_huge(900_000, 16).unwrap();
+        if q == p {
+            assert!(!fresh);
+            // SAFETY: valid huge block; the recycled memory still holds the
+            // old bytes, which `alloc_zeroed` is responsible for clearing.
+            unsafe { assert_eq!(*q, 1) };
+        }
+        // SAFETY: valid huge block.
+        unsafe {
+            match lookup(q) {
+                Owner::Huge(h) => free_huge(h),
+                _ => panic!("wrong owner"),
+            }
+        }
+        let (p, _) = alloc_huge(10, 1 << 20).unwrap();
         assert_eq!(p as usize % (1 << 20), 0);
         // SAFETY: valid huge block.
         unsafe {

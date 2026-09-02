@@ -99,6 +99,8 @@ pub struct Tcb {
     pub map_base: *mut u8,
     /// Length of the stack mapping.
     pub map_len: usize,
+    /// Guard size at the start of the mapping (for recycling it).
+    pub map_guard: usize,
     /// `STATE_*`.
     pub state: AtomicU32,
     /// The thread's start routine.
@@ -141,6 +143,7 @@ impl Tcb {
                 tid: AtomicU32::new(0),
                 map_base: core::ptr::null_mut(),
                 map_len: 0,
+                map_guard: 0,
                 state: AtomicU32::new(STATE_JOINABLE),
                 start: None,
                 arg: core::ptr::null_mut(),

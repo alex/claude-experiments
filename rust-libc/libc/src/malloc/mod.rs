@@ -369,7 +369,7 @@ unsafe fn alloc_slow(heap: *mut Heap, class: usize) -> *mut u8 {
 /// sets `errno` on failure.
 pub fn alloc(size: usize) -> *mut u8 {
     if size > MAX_SMALL {
-        return finish(segment::alloc_huge(size, 16));
+        return finish(segment::alloc_huge(size, 16).map(|(p, _)| p));
     }
     let class = class_for(size);
     let heap = current_heap();
@@ -400,7 +400,30 @@ pub fn alloc_aligned(size: usize, align: usize) -> *mut u8 {
     {
         return alloc(CLASS_SIZE[class] as usize);
     }
-    finish(segment::alloc_huge(size, align))
+    finish(segment::alloc_huge(size, align).map(|(p, _)| p))
+}
+
+/// Allocates `size` zeroed bytes.
+pub fn alloc_zeroed(size: usize) -> *mut u8 {
+    if size > MAX_SMALL {
+        return match segment::alloc_huge(size, 16) {
+            Some((p, fresh)) => {
+                // A fresh mapping is already zero; a recycled one is not.
+                if !fresh {
+                    // SAFETY: `p` has at least `size` bytes.
+                    unsafe { ptr::write_bytes(p, 0, size) };
+                }
+                p
+            }
+            None => finish(None),
+        };
+    }
+    let p = alloc(size);
+    if !p.is_null() {
+        // SAFETY: `p` has at least `size` bytes.
+        unsafe { ptr::write_bytes(p, 0, size) };
+    }
+    p
 }
 
 fn finish(p: Option<*mut u8>) -> *mut u8 {
@@ -540,13 +563,7 @@ pub extern "C" fn calloc(n: usize, size: usize) -> *mut c_void {
         Errno::ENOMEM.set();
         return ptr::null_mut();
     };
-    let p = alloc(total);
-    // Huge blocks are fresh mappings and therefore already zero.
-    if !p.is_null() && total <= MAX_SMALL {
-        // SAFETY: `p` has at least `total` bytes.
-        unsafe { ptr::write_bytes(p, 0, total) };
-    }
-    p as *mut c_void
+    alloc_zeroed(total) as *mut c_void
 }
 
 /// `realloc(3)`.
@@ -631,6 +648,7 @@ pub unsafe extern "C" fn malloc_usable_size(p: *mut c_void) -> usize {
 /// Locks all allocator-global state (for `fork`).
 pub fn prefork() {
     segment::pool_lock().lock();
+    segment::huge_cache_lock().lock();
     ORPHANS.raw().lock();
 }
 
@@ -642,6 +660,7 @@ pub unsafe fn postfork() {
     // SAFETY: caller contract.
     unsafe {
         ORPHANS.raw().unlock();
+        segment::huge_cache_lock().unlock();
         segment::pool_lock().unlock();
     }
 }

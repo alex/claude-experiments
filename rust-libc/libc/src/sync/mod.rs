@@ -33,15 +33,27 @@ impl RawMutex {
     }
 
     /// Acquires the lock, blocking if necessary.
+    ///
+    /// While the process has a single thread no other thread can touch the
+    /// state, so a plain load and store replace the (much more expensive)
+    /// atomic read-modify-write; once a thread is created every path uses
+    /// the atomics, and the transition is ordered by the `clone` system
+    /// call itself. glibc and musl make the same optimisation.
     #[inline]
     pub fn lock(&self) {
-        if self
+        if !crate::thread::is_threaded() {
+            if self.state.load(Ordering::Relaxed) == UNLOCKED {
+                self.state.store(LOCKED, Ordering::Relaxed);
+                return;
+            }
+        } else if self
             .state
             .compare_exchange(UNLOCKED, LOCKED, Ordering::Acquire, Ordering::Relaxed)
-            .is_err()
+            .is_ok()
         {
-            self.lock_slow();
+            return;
         }
+        self.lock_slow();
     }
 
     #[cold]
@@ -105,6 +117,11 @@ impl RawMutex {
     /// The caller must hold the lock.
     #[inline]
     pub unsafe fn unlock(&self) {
+        if !crate::thread::is_threaded() {
+            // No other thread exists, so nobody can be waiting.
+            self.state.store(UNLOCKED, Ordering::Relaxed);
+            return;
+        }
         if self.state.swap(UNLOCKED, Ordering::Release) == CONTENDED {
             let _ = sys::futex_wake(&self.state, 1);
         }

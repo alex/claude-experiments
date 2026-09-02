@@ -65,6 +65,66 @@ extern "C" fn thread_start(arg: *mut c_void) -> c_int {
     exit_thread(result)
 }
 
+/// Mappings of joined threads, kept for reuse: creating a thread then
+/// costs a `clone` rather than `mmap`, `mprotect`, page faults and
+/// `munmap` as well. Only exact size matches are reused (almost every
+/// thread uses the default stack size), and the guard page is already in
+/// place. Detached threads still unmap their own stack on exit.
+struct StackCache {
+    /// `(base, length, guard)`.
+    entries: [(usize, usize, usize); STACK_CACHE_SLOTS],
+    count: usize,
+}
+
+const STACK_CACHE_SLOTS: usize = 8;
+
+static STACK_CACHE: crate::sync::Mutex<StackCache> = crate::sync::Mutex::new(StackCache {
+    entries: [(0, 0, 0); STACK_CACHE_SLOTS],
+    count: 0,
+});
+
+/// Takes a cached mapping of exactly `len` bytes with a `guard`-byte guard.
+fn take_stack(len: usize, guard: usize) -> Option<*mut u8> {
+    let mut cache = STACK_CACHE.lock();
+    let i = (0..cache.count).find(|&i| cache.entries[i].1 == len && cache.entries[i].2 == guard)?;
+    let base = cache.entries[i].0;
+    cache.count -= 1;
+    cache.entries[i] = cache.entries[cache.count];
+    Some(base as *mut u8)
+}
+
+/// Caches or unmaps the mapping of a finished thread.
+///
+/// # Safety
+/// The mapping must be ours and no longer in use.
+unsafe fn release_stack(base: *mut u8, len: usize, guard: usize) {
+    {
+        let mut cache = STACK_CACHE.lock();
+        if cache.count < STACK_CACHE_SLOTS {
+            let n = cache.count;
+            cache.entries[n] = (base as usize, len, guard);
+            cache.count = n + 1;
+            return;
+        }
+    }
+    // SAFETY: caller contract.
+    let _ = unsafe { sys::munmap(base, len) };
+}
+
+/// Locks the thread-global state for `fork`.
+pub fn prefork() {
+    STACK_CACHE.raw().lock();
+}
+
+/// Unlocks the state taken by [`prefork`].
+///
+/// # Safety
+/// Must follow a call to [`prefork`] on the same thread.
+pub unsafe fn postfork() {
+    // SAFETY: caller contract.
+    unsafe { STACK_CACHE.raw().unlock() };
+}
+
 /// `pthread_create(3)`.
 ///
 /// # Safety
@@ -88,26 +148,32 @@ pub unsafe extern "C" fn pthread_create(
     else {
         return Errno::EINVAL.0;
     };
-    // SAFETY: fresh anonymous mapping.
-    let base = match unsafe {
-        sys::mmap(
-            ptr::null_mut(),
-            len,
-            PROT_READ | PROT_WRITE,
-            MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE | MAP_STACK,
-            -1,
-            0,
-        )
-    } {
-        Ok(p) => p,
-        Err(e) => return e.0,
+    let base = match take_stack(len, guard) {
+        Some(base) => base,
+        None => {
+            // SAFETY: fresh anonymous mapping.
+            let base = match unsafe {
+                sys::mmap(
+                    ptr::null_mut(),
+                    len,
+                    PROT_READ | PROT_WRITE,
+                    MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE | MAP_STACK,
+                    -1,
+                    0,
+                )
+            } {
+                Ok(p) => p,
+                Err(e) => return e.0,
+            };
+            // SAFETY: the guard is part of our fresh mapping.
+            if guard > 0 && unsafe { sys::mprotect(base, guard, PROT_NONE) }.is_err() {
+                // SAFETY: our mapping.
+                let _ = unsafe { sys::munmap(base, len) };
+                return Errno::EAGAIN.0;
+            }
+            base
+        }
     };
-    // SAFETY: the guard is part of our fresh mapping.
-    if guard > 0 && unsafe { sys::mprotect(base, guard, PROT_NONE) }.is_err() {
-        // SAFETY: our mapping.
-        let _ = unsafe { sys::munmap(base, len) };
-        return Errno::EAGAIN.0;
-    }
     // SAFETY: the current TCB is valid.
     let canary = unsafe { (*current()).stack_guard };
     // SAFETY: the TLS region is inside the mapping.
@@ -116,6 +182,7 @@ pub unsafe extern "C" fn pthread_create(
     unsafe {
         (*tcb).map_base = base;
         (*tcb).map_len = len;
+        (*tcb).map_guard = guard;
         (*tcb).state.store(
             if attr.detached != 0 {
                 STATE_DETACHED
@@ -162,9 +229,7 @@ pub unsafe extern "C" fn pthread_create(
         Err(e) => {
             THREADS.fetch_sub(1, Ordering::Relaxed);
             // SAFETY: the thread was never created; the mapping is ours.
-            unsafe {
-                let _ = sys::munmap(base, len);
-            }
+            unsafe { release_stack(base, len, guard) };
             if e == Errno::ENOMEM {
                 Errno::EAGAIN.0
             } else {
@@ -289,7 +354,7 @@ pub unsafe extern "C" fn pthread_join(thread: PthreadT, result: *mut *mut c_void
         if !result.is_null() {
             *result = (*tcb).result;
         }
-        let _ = sys::munmap((*tcb).map_base, (*tcb).map_len);
+        release_stack((*tcb).map_base, (*tcb).map_len, (*tcb).map_guard);
     }
     0
 }
@@ -328,7 +393,7 @@ pub unsafe extern "C" fn pthread_detach(thread: PthreadT) -> c_int {
             Err(STATE_EXITED) => {
                 // Already finished: reclaim like a join would.
                 wait_for_exit(tcb);
-                let _ = sys::munmap((*tcb).map_base, (*tcb).map_len);
+                release_stack((*tcb).map_base, (*tcb).map_len, (*tcb).map_guard);
                 0
             }
             Err(_) => Errno::EINVAL.0,

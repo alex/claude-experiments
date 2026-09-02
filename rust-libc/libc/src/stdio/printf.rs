@@ -16,6 +16,7 @@ use crate::errno::Errno;
 use crate::malloc;
 use core::ffi::c_int;
 use core::fmt::Write as _;
+use core::mem::MaybeUninit;
 use core::ptr;
 
 /// Destination of formatted output.
@@ -690,17 +691,34 @@ fn fmt_int<S: Sink>(out: &mut Counting<'_, S>, spec: &Spec, magnitude: u64, nega
         _ => (10, false),
     };
     let mut v = magnitude;
-    while v != 0 {
-        let d = (v % base) as u8;
-        i -= 1;
-        buf[i] = if d < 10 {
-            b'0' + d
-        } else if upper {
-            b'A' + d - 10
-        } else {
-            b'a' + d - 10
-        };
-        v /= base;
+    // One loop per base, so the divisions are by constants.
+    match base {
+        10 => {
+            while v != 0 {
+                i -= 1;
+                buf[i] = b'0' + (v % 10) as u8;
+                v /= 10;
+            }
+        }
+        16 => {
+            let alphabet: &[u8; 16] = if upper {
+                b"0123456789ABCDEF"
+            } else {
+                b"0123456789abcdef"
+            };
+            while v != 0 {
+                i -= 1;
+                buf[i] = alphabet[(v & 15) as usize];
+                v >>= 4;
+            }
+        }
+        _ => {
+            while v != 0 {
+                i -= 1;
+                buf[i] = b'0' + (v & 7) as u8;
+                v >>= 3;
+            }
+        }
     }
     let mut digits = &buf[i..];
     // Precision: minimum digits; a zero value with precision 0 prints
@@ -791,10 +809,64 @@ unsafe fn fmt_wide_string<S: Sink>(out: &mut Counting<'_, S>, spec: &Spec, s: *c
     }
 }
 
-/// A `core::fmt::Write` over a fixed buffer that fails when full.
+/// A `core::fmt::Write` over a fixed buffer that fails when full. The
+/// buffer is uninitialised storage so that the (large) float buffers do
+/// not have to be zeroed on every call; only `[..len]` is ever read.
 struct Fixed<'a> {
-    buf: &'a mut [u8],
+    buf: &'a mut [MaybeUninit<u8>],
     len: usize,
+}
+
+impl<'a> Fixed<'a> {
+    fn new(buf: &'a mut [MaybeUninit<u8>]) -> Self {
+        Fixed { buf, len: 0 }
+    }
+
+    /// The bytes written so far.
+    fn as_bytes(&self) -> &[u8] {
+        // SAFETY: `[..len]` has been written by `write_str`/`insert`.
+        unsafe { core::slice::from_raw_parts(self.buf.as_ptr() as *const u8, self.len) }
+    }
+
+    /// Appends one byte.
+    #[inline]
+    fn push(&mut self, b: u8) -> bool {
+        if self.len == self.buf.len() {
+            return false;
+        }
+        self.buf[self.len] = MaybeUninit::new(b);
+        self.len += 1;
+        true
+    }
+
+    /// Appends the exponent suffix `e±dd` (at least two digits).
+    fn push_exponent(&mut self, e: u8, exp: i32) -> bool {
+        let mag = exp.unsigned_abs();
+        let mut digits = [0u8; 10];
+        let mut n = 0;
+        let mut v = mag;
+        while v > 0 || n < 2 {
+            digits[n] = b'0' + (v % 10) as u8;
+            v /= 10;
+            n += 1;
+        }
+        if !self.push(e) || !self.push(if exp < 0 { b'-' } else { b'+' }) {
+            return false;
+        }
+        while n > 0 {
+            n -= 1;
+            if !self.push(digits[n]) {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// Removes `[from, to)`.
+    fn remove(&mut self, from: usize, to: usize) {
+        self.buf.copy_within(to..self.len, from);
+        self.len -= to - from;
+    }
 }
 
 impl core::fmt::Write for Fixed<'_> {
@@ -802,7 +874,15 @@ impl core::fmt::Write for Fixed<'_> {
         if s.len() > self.buf.len() - self.len {
             return Err(core::fmt::Error);
         }
-        self.buf[self.len..self.len + s.len()].copy_from_slice(s.as_bytes());
+        // SAFETY: the destination is inside the buffer and does not
+        // overlap the source.
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                s.as_ptr(),
+                self.buf.as_mut_ptr().add(self.len) as *mut u8,
+                s.len(),
+            );
+        }
         self.len += s.len();
         Ok(())
     }
@@ -816,6 +896,201 @@ const MAX_SIG_DIGITS: usize = 800;
 /// Room for the longest `%f`: 309 integer digits, the point, 1074
 /// fractional digits.
 const FLOAT_BUF: usize = 1400;
+
+/// Significant digits of a finite non-negative double, and the decimal
+/// exponent of the first one. Digits past `len` read as zero.
+struct Short {
+    buf: [u8; 20],
+    len: usize,
+    exp: i32,
+}
+
+impl Short {
+    /// Parses `core::fmt`'s `{:e}` output (`d.ddde±x`) into `buf`.
+    fn parse(s: &[u8], buf: &mut [u8]) -> (usize, i32) {
+        let epos = s.iter().position(|&b| b == b'e').unwrap_or(s.len());
+        let mut len = 0;
+        for &b in &s[..epos] {
+            if b != b'.' && len < buf.len() {
+                buf[len] = b;
+                len += 1;
+            }
+        }
+        (len, parse_i32(s.get(epos + 1..).unwrap_or(b"0")))
+    }
+
+    /// Rounds to `n` significant digits the way the true binary value
+    /// rounds (which is what C requires). Returns false when that cannot
+    /// be decided from the shortest digits alone (see [`with_digits`]);
+    /// the digits are then unchanged.
+    fn round(&mut self, n: usize) -> bool {
+        if n >= self.len {
+            // Padding with zeros is exact only while a unit of the last
+            // requested digit exceeds the half-ulp uncertainty.
+            return n <= 15;
+        }
+        let dropped = &self.buf[n..self.len];
+        // Position relative to the halfway point "500...".
+        let up = match dropped[0].cmp(&b'5') {
+            core::cmp::Ordering::Greater => true,
+            core::cmp::Ordering::Less => false,
+            core::cmp::Ordering::Equal => {
+                if dropped[1..].iter().all(|&b| b == b'0') {
+                    // An exact tie in the shortest digits says nothing
+                    // about which side the true value is on.
+                    return false;
+                }
+                true
+            }
+        };
+        if self.len >= 16 {
+            // With 16 or 17 digits a unit of the last digit is below the
+            // half-ulp uncertainty of the shortest form; require a safe
+            // margin from the halfway point.
+            let m = dropped.len();
+            let value = dropped
+                .iter()
+                .fold(0u64, |a, &d| a * 10 + (d - b'0') as u64);
+            let tie = 5 * 10u64.pow(m as u32 - 1);
+            if value.abs_diff(tie) < 25 {
+                return false;
+            }
+        }
+        self.len = n;
+        if up {
+            // Increment with carry; a carry out of the first digit makes
+            // the number a power of ten with one more exponent.
+            let mut i = n;
+            loop {
+                if i == 0 {
+                    self.buf[0] = b'1';
+                    self.len = 1;
+                    self.exp += 1;
+                    break;
+                }
+                i -= 1;
+                if self.buf[i] == b'9' {
+                    self.buf[i] = b'0';
+                } else {
+                    self.buf[i] += 1;
+                    break;
+                }
+            }
+        }
+        if self.len == 0 {
+            // Rounded to zero.
+            self.exp = -1;
+        }
+        true
+    }
+}
+
+/// The digits of the shortest decimal that reads back as `x`, from
+/// `core::fmt`'s Grisu/Dragon shortest mode (much faster than its exact
+/// fixed-precision mode).
+fn short_digits(x: f64) -> Short {
+    let mut storage = [MaybeUninit::<u8>::uninit(); 32];
+    let mut tmp = Fixed::new(&mut storage);
+    // Cannot fail: the shortest form is at most 24 bytes.
+    let _ = write!(tmp, "{x:e}");
+    let mut d = Short {
+        buf: [b'0'; 20],
+        len: 0,
+        exp: 0,
+    };
+    (d.len, d.exp) = Short::parse(tmp.as_bytes(), &mut d.buf);
+    d
+}
+
+/// The digits of `x` correctly rounded to `n >= 1` significant digits
+/// (beyond [`MAX_SIG_DIGITS`] they are zeros, since no double has more),
+/// from `core::fmt`'s exact mode.
+fn exact_digits(x: f64, n: usize, out: &mut [u8; MAX_SIG_DIGITS + 1]) -> Option<(usize, i32)> {
+    let mut storage = [MaybeUninit::<u8>::uninit(); FLOAT_BUF];
+    let mut tmp = Fixed::new(&mut storage);
+    let p = n.min(MAX_SIG_DIGITS + 1) - 1;
+    write!(tmp, "{x:.p$e}").ok()?;
+    Some(Short::parse(tmp.as_bytes(), out))
+}
+
+/// Calls `f` with the digits of `x` correctly rounded to `n` significant
+/// digits (`n <= 0` means the value rounds to zero or to a power of ten)
+/// and their exponent. Returns `None` if the shortest digits cannot
+/// decide the rounding, in which case the caller must use the exact mode.
+///
+/// Rounding the shortest representation `S` is exact when no rounding
+/// boundary lies within half an ulp (`2^-53 |x|`) of `S`, because the
+/// true value is that close to `S`. With at most 15 digits a unit of the
+/// last digit already exceeds that distance, so only an exact tie is
+/// undecidable; with 16 or 17 digits [`Short::round`] additionally
+/// requires a margin of 25 units.
+fn with_digits(mut d: Short, n: i64, f: impl FnOnce(&[u8], i32) -> bool) -> Option<bool> {
+    if n < 0 {
+        // Even rounding up could not reach the first kept digit.
+        return Some(f(b"", -1));
+    }
+    if !d.round(n as usize) {
+        return None;
+    }
+    Some(f(&d.buf[..d.len], d.exp))
+}
+
+/// Writes `digits` (exponent `exp`) in fixed notation with `frac`
+/// fraction digits.
+fn build_fixed(buf: &mut Fixed<'_>, digits: &[u8], exp: i32, frac: usize, alt: bool) -> bool {
+    let at = |i: usize| digits.get(i).copied().unwrap_or(b'0');
+    let mut push = |b: u8| buf.push(b);
+    if exp >= 0 {
+        let n_int = exp as usize + 1;
+        for i in 0..n_int {
+            if !push(at(i)) {
+                return false;
+            }
+        }
+        if (frac > 0 || alt) && !push(b'.') {
+            return false;
+        }
+        for i in 0..frac {
+            if !push(at(n_int + i)) {
+                return false;
+            }
+        }
+    } else {
+        if !push(b'0') || ((frac > 0 || alt) && !push(b'.')) {
+            return false;
+        }
+        let lead = (-exp - 1) as usize;
+        for i in 0..frac {
+            let b = if i < lead { b'0' } else { at(i - lead) };
+            if !push(b) {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+/// Writes `digits` (exponent `exp`) in C's `%e` notation with `frac`
+/// fraction digits.
+fn build_exp(
+    buf: &mut Fixed<'_>,
+    digits: &[u8],
+    exp: i32,
+    frac: usize,
+    upper: bool,
+    alt: bool,
+) -> bool {
+    let at = |i: usize| digits.get(i).copied().unwrap_or(b'0');
+    if !buf.push(at(0)) || ((frac > 0 || alt) && !buf.push(b'.')) {
+        return false;
+    }
+    for i in 0..frac {
+        if !buf.push(at(1 + i)) {
+            return false;
+        }
+    }
+    buf.push_exponent(if upper { b'E' } else { b'e' }, exp)
+}
 
 /// Formats a floating-point conversion. Returns false on an internal
 /// error (which cannot happen for well-formed specs).
@@ -844,63 +1119,101 @@ fn fmt_float<S: Sink>(out: &mut Counting<'_, S>, spec: &Spec, x: f64) -> bool {
         return true;
     }
     let x = x.abs();
-    let mut storage = [0u8; FLOAT_BUF];
-    let mut buf = Fixed {
-        buf: &mut storage,
-        len: 0,
-    };
+    let mut storage = [MaybeUninit::<u8>::uninit(); FLOAT_BUF];
+    let mut buf = Fixed::new(&mut storage);
     let mut extra_zeros = 0;
+    // The shortest digits decide roundings to at most 15 significant
+    // digits; for longer requests go straight to the exact mode.
     let ok = match spec.conv {
         b'f' | b'F' => {
             let p = spec.precision.unwrap_or(6);
-            let p1 = p.min(MAX_FRAC_DIGITS);
-            extra_zeros = p - p1;
-            let ok = write!(buf, "{x:.p1$}").is_ok();
-            if ok && spec.alt && p == 0 {
-                let _ = buf.write_str(".");
+            let quick = if p <= 15 {
+                let short = short_digits(x);
+                // Significant digits kept depend on the magnitude.
+                let n = short.exp as i64 + 1 + p as i64;
+                with_digits(short, n, |d, e| build_fixed(&mut buf, d, e, p, spec.alt))
+            } else {
+                None
+            };
+            match quick {
+                Some(ok) => ok,
+                None => {
+                    let p1 = p.min(MAX_FRAC_DIGITS);
+                    extra_zeros = p - p1;
+                    let ok = write!(buf, "{x:.p1$}").is_ok();
+                    if ok && spec.alt && p == 0 {
+                        let _ = buf.write_str(".");
+                    }
+                    ok
+                }
             }
-            ok
         }
         b'e' | b'E' => {
             let p = spec.precision.unwrap_or(6);
-            fmt_exp(&mut buf, x, p, upper, spec.alt)
+            let quick = if p < 15 {
+                with_digits(short_digits(x), p as i64 + 1, |d, e| {
+                    build_exp(&mut buf, d, e, p, upper, spec.alt)
+                })
+            } else {
+                None
+            };
+            match quick {
+                Some(ok) => ok,
+                None => {
+                    let mut big = [0u8; MAX_SIG_DIGITS + 1];
+                    match exact_digits(x, p + 1, &mut big) {
+                        Some((len, e)) => build_exp(&mut buf, &big[..len], e, p, upper, spec.alt),
+                        None => false,
+                    }
+                }
+            }
         }
         b'g' | b'G' => {
             let p = spec.precision.unwrap_or(6).max(1);
-            // Exponent after rounding to `p` significant digits.
-            let exp = if x == 0.0 {
-                0
-            } else {
-                decimal_exponent(x, p - 1)
+            // Style depends on the exponent after rounding to `p` digits.
+            let general = |buf: &mut Fixed<'_>, d: &[u8], e: i32| {
+                let exp = if x == 0.0 { 0 } else { e };
+                if exp >= -4 && (exp as i64) < p as i64 {
+                    build_fixed(buf, d, e, (p as i64 - 1 - exp as i64) as usize, spec.alt)
+                } else {
+                    build_exp(buf, d, e, p - 1, upper, spec.alt)
+                }
             };
-            let ok = if exp >= -4 && (exp as i64) < p as i64 {
-                let frac = (p as i64 - 1 - exp as i64) as usize;
-                write!(buf, "{x:.frac$}").is_ok()
+            let quick = if p <= 15 {
+                with_digits(short_digits(x), p as i64, |d, e| general(&mut buf, d, e))
             } else {
-                fmt_exp(&mut buf, x, p - 1, upper, true)
+                None
+            };
+            let ok = match quick {
+                Some(ok) => ok,
+                None => {
+                    let mut big = [0u8; MAX_SIG_DIGITS + 1];
+                    match exact_digits(x, p, &mut big) {
+                        Some((len, e)) => general(&mut buf, &big[..len], e),
+                        None => false,
+                    }
+                }
             };
             if ok && !spec.alt {
                 strip_trailing_zeros(&mut buf);
-            } else if ok && spec.alt && !buf.buf[..buf.len].contains(&b'.') {
-                // `#` keeps the point even with no fraction digits.
-                let epos = buf.buf[..buf.len]
-                    .iter()
-                    .position(|&b| b == b'e' || b == b'E')
-                    .unwrap_or(buf.len);
-                buf.buf.copy_within(epos..buf.len, epos + 1);
-                buf.buf[epos] = b'.';
-                buf.len += 1;
             }
             ok
         }
         b'a' | b'A' => fmt_hex_float(&mut buf, x, spec.precision, upper, spec.alt),
         _ => false,
     };
-    if !ok {
-        return false;
-    }
-    let len = buf.len;
-    let body = &storage[..len];
+    ok && finish_float(out, spec, prefix, &buf, extra_zeros)
+}
+
+/// Pads and emits a formatted float body.
+fn finish_float<S: Sink>(
+    out: &mut Counting<'_, S>,
+    spec: &Spec,
+    prefix: &[u8],
+    buf: &Fixed<'_>,
+    extra_zeros: usize,
+) -> bool {
+    let body = buf.as_bytes();
     // For hex floats the "0x" belongs before any zero padding.
     let (radix, body) = if matches!(spec.conv, b'a' | b'A') {
         body.split_at(2)
@@ -926,23 +1239,6 @@ fn fmt_float<S: Sink>(out: &mut Counting<'_, S>, spec: &Spec, x: f64) -> bool {
     true
 }
 
-/// Decimal exponent of `x` when rounded to `p + 1` significant digits.
-fn decimal_exponent(x: f64, p: usize) -> i32 {
-    let mut storage = [0u8; FLOAT_BUF];
-    let mut tmp = Fixed {
-        buf: &mut storage,
-        len: 0,
-    };
-    let p = p.min(MAX_SIG_DIGITS);
-    if write!(tmp, "{x:.p$e}").is_err() {
-        return 0;
-    }
-    let len = tmp.len;
-    let s = &storage[..len];
-    let epos = s.iter().position(|&b| b == b'e').unwrap();
-    parse_i32(&s[epos + 1..])
-}
-
 fn parse_i32(s: &[u8]) -> i32 {
     let (neg, digits) = match s.first() {
         Some(b'-') => (true, &s[1..]),
@@ -952,45 +1248,10 @@ fn parse_i32(s: &[u8]) -> i32 {
     if neg { -v } else { v }
 }
 
-/// Writes `x` in C's `%e` form with `p` fraction digits.
-fn fmt_exp(buf: &mut Fixed<'_>, x: f64, p: usize, upper: bool, alt: bool) -> bool {
-    let p1 = p.min(MAX_SIG_DIGITS);
-    let mut storage = [0u8; FLOAT_BUF];
-    let mut tmp = Fixed {
-        buf: &mut storage,
-        len: 0,
-    };
-    if write!(tmp, "{x:.p1$e}").is_err() {
-        return false;
-    }
-    let len = tmp.len;
-    let s = &storage[..len];
-    let epos = s.iter().position(|&b| b == b'e').unwrap();
-    let mantissa = &s[..epos];
-    let exp = parse_i32(&s[epos + 1..]);
-    if buf
-        .write_str(core::str::from_utf8(mantissa).unwrap())
-        .is_err()
-    {
-        return false;
-    }
-    if alt && p == 0 && buf.write_str(".").is_err() {
-        return false;
-    }
-    for _ in 0..p - p1 {
-        if buf.write_str("0").is_err() {
-            return false;
-        }
-    }
-    let e = if upper { 'E' } else { 'e' };
-    let sign = if exp < 0 { '-' } else { '+' };
-    write!(buf, "{e}{sign}{:02}", exp.unsigned_abs()).is_ok()
-}
-
 /// Removes trailing zeros (and a bare point) from the fraction part of a
 /// `%g` result, keeping any exponent suffix.
 fn strip_trailing_zeros(buf: &mut Fixed<'_>) {
-    let s = &buf.buf[..buf.len];
+    let s = buf.as_bytes();
     let Some(point) = s.iter().position(|&b| b == b'.') else {
         return;
     };
@@ -1006,8 +1267,7 @@ fn strip_trailing_zeros(buf: &mut Fixed<'_>) {
         end = point;
     }
     if end != epos {
-        buf.buf.copy_within(epos..buf.len, end);
-        buf.len -= epos - end;
+        buf.remove(end, epos);
     }
 }
 
@@ -1082,19 +1342,26 @@ fn fmt_hex_float(
             } else {
                 b'a' + d - 10
             };
-            if buf.write_str(core::str::from_utf8(&[c]).unwrap()).is_err() {
+            if !buf.push(c) {
                 return false;
             }
         }
     }
-    let sign = if exp < 0 { '-' } else { '+' };
-    write!(
-        buf,
-        "{}{sign}{}",
-        if upper { 'P' } else { 'p' },
-        exp.unsigned_abs()
-    )
-    .is_ok()
+    // `%a` exponents have no minimum digit count.
+    let mag = exp.unsigned_abs();
+    let mut storage = [MaybeUninit::<u8>::uninit(); 16];
+    let mut tmp = Fixed::new(&mut storage);
+    let _ = write!(tmp, "{mag}");
+    if !buf.push(if upper { b'P' } else { b'p' }) || !buf.push(if exp < 0 { b'-' } else { b'+' }) {
+        return false;
+    }
+    let digits = tmp.as_bytes();
+    for &d in digits {
+        if !buf.push(d) {
+            return false;
+        }
+    }
+    true
 }
 
 // ---------------------------------------------------------------------
@@ -1278,6 +1545,43 @@ mod tests {
         // SAFETY: the fake arguments match the format.
         let n = unsafe { format(&mut sink, cfmt.as_ptr() as *const u8, &mut ap) };
         (n, String::from_utf8(sink.0).unwrap())
+    }
+
+    /// Rough per-call timings, for development: `cargo test -p rustlibc
+    /// -- --ignored --nocapture timing`.
+    #[test]
+    #[ignore]
+    fn timing() {
+        let cases: [(&str, f64); 7] = [
+            ("%f", 3.14159 * 12345.0),
+            ("%f", 0.25 * 17.0),
+            ("%e", 3.14159 * 12345.0),
+            ("%g", 2.5e-7 * 17.0),
+            ("%g", 0.25 * 17.0),
+            ("%.17g", 0.1 * 17.0),
+            ("%d", 12345.0),
+        ];
+        for (fmt, x) in cases {
+            let cfmt = std::ffi::CString::new(fmt).unwrap();
+            let word = if fmt == "%d" { x as u64 } else { x.to_bits() };
+            let n = 200_000;
+            let t = std::time::Instant::now();
+            for _ in 0..n {
+                let mut args = FakeArgs { words: vec![word] };
+                let mut ap = args.list();
+                let mut sink = VecSink(Vec::with_capacity(64));
+                // SAFETY: the fake arguments match the format.
+                let r = unsafe { format(&mut sink, cfmt.as_ptr() as *const u8, &mut ap) };
+                std::hint::black_box((r, sink));
+            }
+            let per = t.elapsed().as_nanos() as f64 / n as f64;
+            let t = std::time::Instant::now();
+            for _ in 0..n {
+                std::hint::black_box(short_digits(std::hint::black_box(x)));
+            }
+            let short = t.elapsed().as_nanos() as f64 / n as f64;
+            println!("{fmt:8} {x:<12} {per:6.0} ns  (short_digits {short:4.0} ns)");
+        }
     }
 
     fn check(fmt: &str, words: Vec<u64>, expected: &str) {
