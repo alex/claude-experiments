@@ -10,7 +10,12 @@
 #define __END_DECLS
 #endif
 
+#ifdef __cplusplus
+#define __NORETURN __attribute__((__noreturn__))
+#define __RESTRICT __restrict
+#else
 #define __NORETURN _Noreturn
 #define __RESTRICT restrict
+#endif
 
 #endif

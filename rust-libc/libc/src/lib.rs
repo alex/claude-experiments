@@ -27,6 +27,7 @@
 #![no_builtins]
 
 pub mod arch;
+pub mod compat;
 pub mod dirent;
 pub mod dl;
 pub mod errno;
@@ -36,6 +37,7 @@ pub mod fmt;
 pub mod fnmatch;
 pub mod fs;
 pub mod getopt;
+pub mod iconv;
 pub mod locale;
 pub mod malloc;
 pub mod math;

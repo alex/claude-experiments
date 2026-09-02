@@ -51,7 +51,8 @@ struct lconv {
     char int_n_sign_posn;
 };
 
-typedef struct __locale_struct *locale_t;
+typedef struct __locale_struct *__locale_t;
+typedef __locale_t locale_t;
 #define LC_GLOBAL_LOCALE ((locale_t)-1)
 
 __BEGIN_DECLS

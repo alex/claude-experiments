@@ -14,7 +14,7 @@
 
 #define offsetof(type, member) __builtin_offsetof(type, member)
 
-#if __STDC_VERSION__ >= 201112L
+#if __STDC_VERSION__ >= 201112L || defined(__cplusplus)
 typedef struct { long long __ll; long double __ld; } max_align_t;
 #endif
 

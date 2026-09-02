@@ -239,15 +239,17 @@ pub unsafe extern "C" fn mblen(s: *const c_char, n: usize) -> c_int {
     unsafe { mbtowc(ptr::null_mut(), s, n) }
 }
 
-/// `mbsrtowcs(3)`.
+/// Shared implementation of `mbsrtowcs` and `mbsnrtowcs`: converts at
+/// most `nms` bytes of `*src` into at most `n` wide characters (unlimited
+/// when `dst` is null).
 ///
 /// # Safety
-/// `src` must be valid and point to a NUL-terminated string; `dst` null
-/// or valid for `n` wide characters.
-#[cfg_attr(not(test), unsafe(no_mangle))]
-pub unsafe extern "C" fn mbsrtowcs(
+/// `src` must be valid and point to a string readable for `nms` bytes or
+/// up to its NUL; `dst` null or valid for `n` elements.
+unsafe fn mbs_to_wcs(
     dst: *mut WChar,
     src: *mut *const c_char,
+    nms: usize,
     n: usize,
     ps: *mut MbState,
 ) -> usize {
@@ -260,14 +262,16 @@ pub unsafe extern "C" fn mbsrtowcs(
     };
     // SAFETY: caller contract.
     let mut s = unsafe { *src } as *const u8;
+    let mut left = nms;
     let mut count = 0usize;
     loop {
-        if !dst.is_null() && count >= n {
+        if (!dst.is_null() && count >= n) || left == 0 {
             break;
         }
-        // SAFETY: the string is NUL-terminated; at most 4 bytes of a
-        // character are examined and the terminator stops the decoder.
-        let len = unsafe { crate::string::search::strnlen(s, 4) };
+        // SAFETY: the string is readable for `left` bytes or to its NUL; at
+        // most 4 bytes of a character are examined and the terminator stops
+        // the decoder.
+        let len = unsafe { crate::string::search::strnlen(s, left.min(4)) };
         // SAFETY: as above.
         let bytes = unsafe { core::slice::from_raw_parts(s, len.max(1)) };
         match decode(bytes, st) {
@@ -281,8 +285,15 @@ pub unsafe extern "C" fn mbsrtowcs(
                     break;
                 }
                 count += 1;
+                left -= l;
                 // SAFETY: inside the string.
                 s = unsafe { s.add(l) };
+            }
+            Decoded::Incomplete if len < 4 && len == left => {
+                // The byte limit cut a character; its prefix is in the state.
+                // SAFETY: inside the string.
+                s = unsafe { s.add(len) };
+                break;
             }
             _ => {
                 Errno::EILSEQ.set();
@@ -299,6 +310,38 @@ pub unsafe extern "C" fn mbsrtowcs(
     count
 }
 
+/// `mbsrtowcs(3)`.
+///
+/// # Safety
+/// `src` must be valid and point to a NUL-terminated string; `dst` null
+/// or valid for `n` elements.
+#[cfg_attr(not(test), unsafe(no_mangle))]
+pub unsafe extern "C" fn mbsrtowcs(
+    dst: *mut WChar,
+    src: *mut *const c_char,
+    n: usize,
+    ps: *mut MbState,
+) -> usize {
+    // SAFETY: forwarded.
+    unsafe { mbs_to_wcs(dst, src, usize::MAX, n, ps) }
+}
+
+/// `mbsnrtowcs(3)`: like [`mbsrtowcs`] but reads at most `nms` bytes.
+///
+/// # Safety
+/// As for [`mbsrtowcs`], with `nms` bounding the readable input.
+#[cfg_attr(not(test), unsafe(no_mangle))]
+pub unsafe extern "C" fn mbsnrtowcs(
+    dst: *mut WChar,
+    src: *mut *const c_char,
+    nms: usize,
+    n: usize,
+    ps: *mut MbState,
+) -> usize {
+    // SAFETY: forwarded.
+    unsafe { mbs_to_wcs(dst, src, nms, n, ps) }
+}
+
 /// `mbstowcs(3)`.
 ///
 /// # Safety
@@ -310,24 +353,21 @@ pub unsafe extern "C" fn mbstowcs(dst: *mut WChar, src: *const c_char, n: usize)
     unsafe { mbsrtowcs(dst, &mut p, n, ptr::null_mut()) }
 }
 
-/// `wcsrtombs(3)`.
+/// Shared implementation of `wcsrtombs` and `wcsnrtombs`: converts at
+/// most `nwc` wide characters of `*src` into at most `n` bytes (unlimited
+/// when `dst` is null).
 ///
 /// # Safety
-/// `src` must be valid and point to a NUL-terminated wide string; `dst`
-/// null or valid for `n` bytes.
-#[cfg_attr(not(test), unsafe(no_mangle))]
-pub unsafe extern "C" fn wcsrtombs(
-    dst: *mut c_char,
-    src: *mut *const WChar,
-    n: usize,
-    _ps: *mut MbState,
-) -> usize {
+/// `src` must be valid and point to a wide string readable for `nwc`
+/// elements or up to its NUL; `dst` null or valid for `n` bytes.
+unsafe fn wcs_to_mbs(dst: *mut c_char, src: *mut *const WChar, nwc: usize, n: usize) -> usize {
     // SAFETY: caller contract.
     let mut s = unsafe { *src };
+    let mut left = nwc;
     let mut count = 0usize;
     let mut buf = [0u8; 4];
-    loop {
-        // SAFETY: the wide string is NUL-terminated.
+    while left > 0 {
+        // SAFETY: the wide string is readable for `left` elements or to its NUL.
         let wc = unsafe { *s };
         let Some(len) = encode(wc as u32, &mut buf) else {
             Errno::EILSEQ.set();
@@ -347,6 +387,7 @@ pub unsafe extern "C" fn wcsrtombs(
             break;
         }
         count += len;
+        left -= 1;
         // SAFETY: inside the string.
         s = unsafe { s.add(1) };
     }
@@ -355,6 +396,38 @@ pub unsafe extern "C" fn wcsrtombs(
         unsafe { *src = s };
     }
     count
+}
+
+/// `wcsrtombs(3)`.
+///
+/// # Safety
+/// `src` must be valid and point to a NUL-terminated wide string; `dst`
+/// null or valid for `n` bytes.
+#[cfg_attr(not(test), unsafe(no_mangle))]
+pub unsafe extern "C" fn wcsrtombs(
+    dst: *mut c_char,
+    src: *mut *const WChar,
+    n: usize,
+    _ps: *mut MbState,
+) -> usize {
+    // SAFETY: forwarded.
+    unsafe { wcs_to_mbs(dst, src, usize::MAX, n) }
+}
+
+/// `wcsnrtombs(3)`: like [`wcsrtombs`] but reads at most `nwc` elements.
+///
+/// # Safety
+/// As for [`wcsrtombs`], with `nwc` bounding the readable input.
+#[cfg_attr(not(test), unsafe(no_mangle))]
+pub unsafe extern "C" fn wcsnrtombs(
+    dst: *mut c_char,
+    src: *mut *const WChar,
+    nwc: usize,
+    n: usize,
+    _ps: *mut MbState,
+) -> usize {
+    // SAFETY: forwarded.
+    unsafe { wcs_to_mbs(dst, src, nwc, n) }
 }
 
 /// `wcstombs(3)`.
@@ -1253,10 +1326,220 @@ pub unsafe extern "C" fn vswprintf(
     count as c_int
 }
 
+/// Narrows a wide format string (UTF-8 text with ASCII conversions) for
+/// the byte-oriented printf/scanf engines. Returns false if it does not
+/// fit.
+///
+/// # Safety
+/// `fmt` must be NUL-terminated.
+unsafe fn narrow_format(fmt: *const WChar, out: &mut [u8; 1024]) -> bool {
+    // SAFETY: caller contract.
+    let flen = unsafe { wcstombs(out.as_mut_ptr() as *mut c_char, fmt, out.len() - 1) };
+    if flen == usize::MAX || flen >= out.len() - 1 {
+        Errno::EOVERFLOW.set();
+        return false;
+    }
+    out[flen] = 0;
+    true
+}
+
+/// `vfwprintf(3)`: wide streams hold UTF-8, so the byte engine does the
+/// work after the format is narrowed. The return value counts bytes, not
+/// wide characters (a deviation for non-ASCII output).
+///
+/// # Safety
+/// `f` valid; `fmt` NUL-terminated with matching arguments.
+#[cfg_attr(not(test), unsafe(no_mangle))]
+pub unsafe extern "C" fn vfwprintf(
+    f: *mut crate::stdio::File,
+    fmt: *const WChar,
+    ap: *mut crate::arch::va::VaList,
+) -> c_int {
+    let mut nfmt = [0u8; 1024];
+    // SAFETY: forwarded.
+    if !unsafe { narrow_format(fmt, &mut nfmt) } {
+        return -1;
+    }
+    // SAFETY: forwarded.
+    unsafe { crate::stdio::printf::vfprintf(f, nfmt.as_ptr() as *const c_char, ap) }
+}
+
+/// `vwprintf(3)`.
+///
+/// # Safety
+/// As for [`vfwprintf`].
+#[cfg_attr(not(test), unsafe(no_mangle))]
+pub unsafe extern "C" fn vwprintf(fmt: *const WChar, ap: *mut crate::arch::va::VaList) -> c_int {
+    // SAFETY: forwarded.
+    unsafe { vfwprintf(crate::stdio::stdout, fmt, ap) }
+}
+
+/// `vfwscanf(3)`: like [`vfwprintf`], through the byte engine. `%n`
+/// counts bytes.
+///
+/// # Safety
+/// `f` valid; `fmt` NUL-terminated with matching arguments.
+#[cfg_attr(not(test), unsafe(no_mangle))]
+pub unsafe extern "C" fn vfwscanf(
+    f: *mut crate::stdio::File,
+    fmt: *const WChar,
+    ap: *mut crate::arch::va::VaList,
+) -> c_int {
+    let mut nfmt = [0u8; 1024];
+    // SAFETY: forwarded.
+    if !unsafe { narrow_format(fmt, &mut nfmt) } {
+        return -1;
+    }
+    // SAFETY: forwarded.
+    unsafe { crate::stdio::scanf::vfscanf(f, nfmt.as_ptr() as *const c_char, ap) }
+}
+
+/// `vwscanf(3)`.
+///
+/// # Safety
+/// As for [`vfwscanf`].
+#[cfg_attr(not(test), unsafe(no_mangle))]
+pub unsafe extern "C" fn vwscanf(fmt: *const WChar, ap: *mut crate::arch::va::VaList) -> c_int {
+    // SAFETY: forwarded.
+    unsafe { vfwscanf(crate::stdio::stdin, fmt, ap) }
+}
+
+/// `vswscanf(3)`.
+///
+/// # Safety
+/// `s` and `fmt` NUL-terminated; arguments match the format.
+#[cfg_attr(not(test), unsafe(no_mangle))]
+pub unsafe extern "C" fn vswscanf(
+    s: *const WChar,
+    fmt: *const WChar,
+    ap: *mut crate::arch::va::VaList,
+) -> c_int {
+    let mut nfmt = [0u8; 1024];
+    // SAFETY: forwarded.
+    if !unsafe { narrow_format(fmt, &mut nfmt) } {
+        return -1;
+    }
+    // SAFETY: caller contract.
+    let len = unsafe { wcslen(s) };
+    let Some(cap) = len.checked_mul(4).and_then(|v| v.checked_add(1)) else {
+        Errno::EOVERFLOW.set();
+        return -1;
+    };
+    let buf = crate::malloc::alloc(cap);
+    if buf.is_null() {
+        return -1;
+    }
+    // SAFETY: `buf` has room for the longest encoding plus the NUL.
+    let n = unsafe { wcstombs(buf as *mut c_char, s, cap - 1) };
+    if n == usize::MAX {
+        // SAFETY: our block.
+        unsafe { crate::malloc::dealloc(buf) };
+        return -1;
+    }
+    // SAFETY: `n < cap`.
+    unsafe { *buf.add(n) = 0 };
+    // SAFETY: both buffers are NUL-terminated.
+    let r = unsafe {
+        crate::stdio::scanf::vsscanf(buf as *const c_char, nfmt.as_ptr() as *const c_char, ap)
+    };
+    // SAFETY: our block.
+    unsafe { crate::malloc::dealloc(buf) };
+    r
+}
+
+/// `ungetwc(3)`: pushes back the UTF-8 encoding of `wc`.
+///
+/// # Safety
+/// `f` must be a valid stream.
+#[cfg_attr(not(test), unsafe(no_mangle))]
+pub unsafe extern "C" fn ungetwc(wc: WInt, f: *mut crate::stdio::File) -> WInt {
+    if wc == WEOF {
+        return WEOF;
+    }
+    let mut bytes = [0u8; 4];
+    // SAFETY: the buffer holds any encoding.
+    let n = unsafe {
+        wcrtomb(
+            bytes.as_mut_ptr() as *mut c_char,
+            wc as WChar,
+            core::ptr::null_mut(),
+        )
+    };
+    if n == usize::MAX {
+        return WEOF;
+    }
+    for &b in bytes[..n].iter().rev() {
+        // SAFETY: forwarded.
+        if unsafe { crate::stdio::ungetc(b as c_int, f) } == crate::stdio::EOF {
+            return WEOF;
+        }
+    }
+    wc
+}
+
+/// `wcsftime(3)`, through `strftime`.
+///
+/// # Safety
+/// `out` valid for `max` elements; `fmt` NUL-terminated; `tm` valid.
+#[cfg_attr(not(test), unsafe(no_mangle))]
+pub unsafe extern "C" fn wcsftime(
+    out: *mut WChar,
+    max: usize,
+    fmt: *const WChar,
+    tm: *const crate::time::Tm,
+) -> usize {
+    let mut nfmt = [0u8; 1024];
+    // SAFETY: forwarded.
+    if !unsafe { narrow_format(fmt, &mut nfmt) } {
+        return 0;
+    }
+    let mut bytes = [0u8; 4096];
+    // SAFETY: the buffers are valid.
+    let n = unsafe {
+        crate::time::strftime::strftime(
+            bytes.as_mut_ptr() as *mut c_char,
+            bytes.len(),
+            nfmt.as_ptr() as *const c_char,
+            tm,
+        )
+    };
+    if n == 0 {
+        return 0;
+    }
+    // SAFETY: `strftime` NUL-terminated its output.
+    let count = unsafe { mbstowcs(out, bytes.as_ptr() as *const c_char, max) };
+    if count == usize::MAX || count >= max {
+        return 0;
+    }
+    // SAFETY: `count < max`.
+    unsafe { *out.add(count) = 0 };
+    count
+}
+
 #[cfg(not(test))]
 mod stubs {
     use crate::arch::va::variadic_stub;
     variadic_stub!(swprintf, 3, "rcx", super::vswprintf);
+    variadic_stub!(fwprintf, 2, "rdx", super::vfwprintf);
+    variadic_stub!(wprintf, 1, "rsi", super::vwprintf);
+    variadic_stub!(fwscanf, 2, "rdx", super::vfwscanf);
+    variadic_stub!(wscanf, 1, "rsi", super::vwscanf);
+    variadic_stub!(swscanf, 2, "rdx", super::vswscanf);
+    // `long double` is returned in `st(0)`; these convert `wcstod`'s
+    // `double` result (`long double` is not distinguished by this
+    // library).
+    core::arch::global_asm!(
+        ".globl wcstold",
+        ".type wcstold, @function",
+        "wcstold:",
+        "sub rsp, 8",
+        "call {wcstod}",
+        "movsd qword ptr [rsp], xmm0",
+        "fld qword ptr [rsp]",
+        "add rsp, 8",
+        "ret",
+        wcstod = sym super::wcstod,
+    );
 }
 
 #[cfg(test)]

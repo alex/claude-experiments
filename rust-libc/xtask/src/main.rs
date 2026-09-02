@@ -7,7 +7,8 @@
 //! cargo xtask bench      # run bench/bench.c against rustlibc and glibc
 //! ```
 //!
-//! Each C test is compiled against the sysroot with `-static -nostdlib`
+//! Each C test (or C++ test, `*.cpp`, linked with the host toolchain's
+//! `libstdc++.a`) is compiled against the sysroot with `-static -nostdlib`
 //! and run. A test passes when its exit status matches (0 by default, or
 //! the `// expect-exit: N` / `// expect-signal: NAME` directive in the
 //! source) and, if a sibling `NAME.stdout` file exists, its standard
@@ -96,9 +97,10 @@ fn parse_cflags(src: &str) -> Vec<String> {
 
 /// Command line to compile a C program against the sysroot.
 fn compile_cmd(sysroot: &Path, src: &Path, out: &Path, extra: &[String]) -> Command {
-    let mut cmd = Command::new(cc());
+    let cxx = src.extension().is_some_and(|x| x == "cpp");
+    let mut cmd = Command::new(if cxx { cxx_compiler() } else { cc() });
     cmd.args([
-        "-std=gnu11",
+        if cxx { "-std=gnu++17" } else { "-std=gnu11" },
         "-O2",
         "-g",
         "-Wall",
@@ -111,19 +113,72 @@ fn compile_cmd(sysroot: &Path, src: &Path, out: &Path, extra: &[String]) -> Comm
         "-nostdlib",
         "-nostartfiles",
         "-nostdinc",
-        "-isystem",
-    ])
-    .arg(sysroot.join("include"))
-    .arg("-isystem")
-    .arg(compiler_include_dir())
-    .args(extra)
-    .arg(src)
-    .arg("-o")
-    .arg(out)
-    .arg("-L")
-    .arg(sysroot.join("lib"))
-    .args(["-lc", "-lgcc"]);
+        // libgcc's unwinder finds frames through PT_GNU_EH_FRAME; gcc only
+        // asks the linker for it in dynamic links.
+        "-Wl,--eh-frame-hdr",
+    ]);
+    if cxx {
+        // The host's C++ headers, before our C headers.
+        cmd.arg("-nostdinc++");
+        for dir in cxx_include_dirs() {
+            cmd.arg("-isystem").arg(dir);
+        }
+    }
+    cmd.arg("-isystem")
+        .arg(sysroot.join("include"))
+        .arg("-isystem")
+        .arg(compiler_include_dir())
+        .args(extra)
+        .arg(src)
+        .arg("-o")
+        .arg(out)
+        .arg("-L")
+        .arg(sysroot.join("lib"));
+    if cxx {
+        cmd.arg(print_file_name(&cxx_compiler(), "libstdc++.a"));
+        cmd.arg(print_file_name(&cxx_compiler(), "libgcc_eh.a"));
+    }
+    cmd.args(["-lc", "-lgcc"]);
     cmd
+}
+
+fn cxx_compiler() -> String {
+    std::env::var("CXX").unwrap_or_else(|_| "c++".to_string())
+}
+
+/// Asks the compiler where a library file lives.
+fn print_file_name(compiler: &str, name: &str) -> String {
+    let out = Command::new(compiler)
+        .arg(format!("-print-file-name={name}"))
+        .output()
+        .expect("run compiler");
+    String::from_utf8_lossy(&out.stdout).trim().to_string()
+}
+
+/// The C++ standard library's include directories, from the compiler's
+/// own search list (`-v` output between the "#include <...>" markers).
+fn cxx_include_dirs() -> Vec<String> {
+    let out = Command::new(cxx_compiler())
+        .args(["-x", "c++", "-E", "-v", "-", "-o", "/dev/null"])
+        .stdin(Stdio::null())
+        .output()
+        .expect("run c++");
+    let text = String::from_utf8_lossy(&out.stderr);
+    let mut dirs = Vec::new();
+    let mut inside = false;
+    for line in text.lines() {
+        if line.starts_with("#include <...> search starts here") {
+            inside = true;
+        } else if line.starts_with("End of search list") {
+            break;
+        } else if inside {
+            let dir = line.trim();
+            if dir.contains("c++") {
+                dirs.push(dir.to_string());
+            }
+        }
+    }
+    dirs
 }
 
 #[derive(Debug, PartialEq)]
@@ -241,7 +296,7 @@ fn test(filter: Option<&str>, release: bool) -> ExitCode {
     let mut sources: Vec<PathBuf> = fs::read_dir(root.join("tests/c"))
         .unwrap()
         .filter_map(|e| e.ok().map(|e| e.path()))
-        .filter(|p| p.extension().is_some_and(|x| x == "c"))
+        .filter(|p| p.extension().is_some_and(|x| x == "c" || x == "cpp"))
         .filter(|p| filter.is_none_or(|f| p.file_name().unwrap().to_string_lossy().contains(f)))
         .collect();
     sources.sort();

@@ -92,7 +92,7 @@ void srand48(long);
 unsigned short *seed48(unsigned short[3]);
 void lcong48(unsigned short[7]);
 int at_quick_exit(void (*)(void));
-_Noreturn void quick_exit(int);
+__NORETURN void quick_exit(int);
 char *secure_getenv(const char *);
 int getloadavg(double *, int);
 int getsubopt(char **, char *const *, char **);
@@ -102,6 +102,7 @@ int unlockpt(int);
 int ptsname_r(int, char *, size_t);
 char *ptsname(int);
 const char *getprogname(void);
+long double strtold(const char *__RESTRICT, char **__RESTRICT);
 __END_DECLS
 
 #endif

@@ -147,3 +147,17 @@ other case, and any request for more than 15 digits, uses the exact mode.
   any vector loop on current CPUs and does not pollute the cache; nearby
   overlapping moves, where `rep movsb` is slow, use destination-aligned
   vector loops.
+
+## glibc compatibility
+
+Static libraries shipped by distributions are compiled against glibc's
+headers and reference glibc-only symbols. `compat.rs` provides the ones
+that matter in practice, so that `libstdc++.a` and similar libraries
+link and work: the `_FORTIFY_SOURCE` `__*_chk` functions (which really
+check and abort), the `__isoc99_`/`__isoc23_` aliases, the `*_l` locale
+variants (there is only the C locale), `__ctype_b_loc` and friends with
+glibc's bit layout, a `locale_t` object with glibc's `struct
+__locale_struct` layout (libstdc++ reads the ctype tables out of it),
+`__libc_single_threaded`, `_dl_find_object` for libgcc's unwinder, the
+`*64` file names, `gettext` and `arc4random`. `tests/c/cxx.cpp` exercises
+exceptions, iostreams and `std::thread` through this path.

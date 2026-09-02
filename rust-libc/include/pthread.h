@@ -63,6 +63,7 @@ pthread_t pthread_self(void);
 int pthread_equal(pthread_t, pthread_t);
 int pthread_sigmask(int, const sigset_t *__RESTRICT, sigset_t *__RESTRICT);
 int pthread_kill(pthread_t, int);
+int pthread_cancel(pthread_t);
 int pthread_setname_np(pthread_t, const char *);
 int pthread_atfork(void (*)(void), void (*)(void), void (*)(void));
 
@@ -80,6 +81,7 @@ int pthread_mutex_destroy(pthread_mutex_t *);
 int pthread_mutex_lock(pthread_mutex_t *);
 int pthread_mutex_trylock(pthread_mutex_t *);
 int pthread_mutex_timedlock(pthread_mutex_t *__RESTRICT, const struct timespec *__RESTRICT);
+int pthread_mutex_clocklock(pthread_mutex_t *__RESTRICT, clockid_t, const struct timespec *__RESTRICT);
 int pthread_mutex_unlock(pthread_mutex_t *);
 int pthread_mutexattr_init(pthread_mutexattr_t *);
 int pthread_mutexattr_destroy(pthread_mutexattr_t *);
@@ -91,6 +93,7 @@ int pthread_cond_init(pthread_cond_t *__RESTRICT, const pthread_condattr_t *__RE
 int pthread_cond_destroy(pthread_cond_t *);
 int pthread_cond_wait(pthread_cond_t *__RESTRICT, pthread_mutex_t *__RESTRICT);
 int pthread_cond_timedwait(pthread_cond_t *__RESTRICT, pthread_mutex_t *__RESTRICT, const struct timespec *__RESTRICT);
+int pthread_cond_clockwait(pthread_cond_t *__RESTRICT, pthread_mutex_t *__RESTRICT, clockid_t, const struct timespec *__RESTRICT);
 int pthread_cond_signal(pthread_cond_t *);
 int pthread_cond_broadcast(pthread_cond_t *);
 int pthread_condattr_init(pthread_condattr_t *);

@@ -49,9 +49,21 @@ cargo test -p rustlibc   # host unit tests of the pure Rust code
 To compile a program against it:
 
 ```
-cc -static -nostdlib -nostartfiles -nostdinc \
+cc -static -nostdlib -nostartfiles -nostdinc -Wl,--eh-frame-hdr \
    -isystem target/sysroot/include -isystem "$(cc -print-file-name=include)" \
    hello.c -Ltarget/sysroot/lib -lc -lgcc
+```
+
+C++ works with the host toolchain's `libstdc++.a` (which is built against
+glibc: the `compat` module provides the glibc-specific symbols it needs,
+and `-Wl,--eh-frame-hdr` gives libgcc's unwinder its lookup table):
+
+```
+c++ -static -nostdlib -nostartfiles -nostdinc -nostdinc++ -Wl,--eh-frame-hdr \
+    -isystem /usr/include/c++/13 -isystem /usr/include/x86_64-linux-gnu/c++/13 \
+    -isystem target/sysroot/include -isystem "$(c++ -print-file-name=include)" \
+    hello.cpp -Ltarget/sysroot/lib \
+    "$(c++ -print-file-name=libstdc++.a)" "$(c++ -print-file-name=libgcc_eh.a)" -lc -lgcc
 ```
 
 ## What is implemented
@@ -71,8 +83,12 @@ full `printf` and `scanf` families, wide-character stdio), `stdlib.h`
 `search.h`, `termios.h` and pseudo-terminals, `syslog`, `pwd.h`/`grp.h`
 (from the files), sockets with address conversion and a minimal
 `getaddrinfo`, `poll`/`select`/`epoll`, `timerfd`/`inotify`/`eventfd`,
-`sched.h`, `sys/mman.h` including `shm_open`, `dl_iterate_phdr` and the
-C++ runtime hooks.
+`sched.h`, `sys/mman.h` including `shm_open`, `iconv` for the Unicode
+encodings, `dl_iterate_phdr` and the C++ runtime hooks, plus the glibc
+compatibility symbols (`__*_chk`, `__isoc99_*`, `_dl_find_object`,
+`__ctype_b_loc`, the `*_l` locale variants, `__libc_single_threaded`, …)
+that let static libraries built against glibc, `libstdc++.a` among them,
+link and run.
 
 Known limitations: x86_64 only; no PIE or static-pie; no DNS resolver
 (`getaddrinfo` handles numeric addresses, `localhost` and `/etc/hosts`);

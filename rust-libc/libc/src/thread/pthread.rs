@@ -824,3 +824,11 @@ mod tests {
         assert_eq!(pthread_equal(pthread_self(), pthread_self()), 1);
     }
 }
+
+/// `pthread_cancel(3)`: cancellation is not supported; the thread keeps
+/// running and `ENOSYS` is returned. Declared so that C++ runtimes that
+/// reference it weakly link.
+#[cfg_attr(not(test), unsafe(no_mangle))]
+pub extern "C" fn pthread_cancel(_t: PthreadT) -> c_int {
+    Errno::ENOSYS.0
+}

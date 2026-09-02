@@ -412,3 +412,20 @@ pub unsafe extern "C" fn ctime(t: *const i64) -> *mut c_char {
     // SAFETY: forwarded.
     unsafe { asctime(localtime(t)) }
 }
+
+/// `timespec_get(3)` (C11): only `TIME_UTC` (1) is supported.
+///
+/// # Safety
+/// `ts` must be valid.
+#[cfg_attr(not(test), unsafe(no_mangle))]
+pub unsafe extern "C" fn timespec_get(ts: *mut Timespec, base: c_int) -> c_int {
+    if base != 1 {
+        return 0;
+    }
+    // SAFETY: forwarded.
+    if unsafe { clock_gettime(sys::CLOCK_REALTIME, ts) } == 0 {
+        1
+    } else {
+        0
+    }
+}

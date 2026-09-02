@@ -120,6 +120,7 @@ int vsscanf(const char *__RESTRICT, const char *__RESTRICT, va_list);
 FILE *popen(const char *, const char *);
 int pclose(FILE *);
 char *ctermid(char *);
+char *tmpnam(char *);
 __END_DECLS
 
 #endif

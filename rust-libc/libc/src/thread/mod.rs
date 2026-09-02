@@ -42,6 +42,8 @@ pub fn is_threaded() -> bool {
 /// Marks the process as multi-threaded (before the first `clone`).
 pub fn set_threaded() {
     THREADED.store(true, Ordering::Release);
+    // SAFETY: a plain byte read by glibc-compiled code as a hint.
+    unsafe { core::ptr::write_volatile(&raw mut crate::compat::__libc_single_threaded, 0) };
 }
 
 /// Kernel thread id of the calling thread.

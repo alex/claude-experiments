@@ -215,6 +215,39 @@ pub unsafe extern "C" fn pthread_mutex_timedlock(
     0
 }
 
+/// `pthread_mutex_clocklock(3)`: like `pthread_mutex_timedlock` with an
+/// explicit clock (`CLOCK_REALTIME` or `CLOCK_MONOTONIC`).
+///
+/// # Safety
+/// `m` must be valid; `deadline` a valid `timespec`.
+#[cfg_attr(not(test), unsafe(no_mangle))]
+pub unsafe extern "C" fn pthread_mutex_clocklock(
+    m: *mut Mutex,
+    clock: c_int,
+    deadline: *const Timespec,
+) -> c_int {
+    if clock != CLOCK_REALTIME && clock != CLOCK_MONOTONIC {
+        return Errno::EINVAL.0;
+    }
+    let deadline = match check_deadline(deadline) {
+        Ok(d) => d,
+        Err(e) => return e.0,
+    };
+    // SAFETY: caller contract.
+    unsafe {
+        match lock_prologue(m) {
+            Ok(true) => return 0,
+            Ok(false) => {}
+            Err(e) => return e.0,
+        }
+        if !(*m).lock.lock_until(deadline, clock) {
+            return Errno::ETIMEDOUT.0;
+        }
+        lock_epilogue(m);
+    }
+    0
+}
+
 /// `pthread_mutex_unlock(3)`.
 ///
 /// # Safety
@@ -345,6 +378,20 @@ pub extern "C" fn pthread_cond_destroy(_c: *mut Cond) -> c_int {
 /// # Safety
 /// `c` and `m` must be valid; `m` locked by the caller.
 unsafe fn cond_wait_impl(c: *mut Cond, m: *mut Mutex, deadline: Option<&Timespec>) -> c_int {
+    // SAFETY: forwarded.
+    unsafe { cond_wait_clock(c, m, (*c).clock as c_int, deadline) }
+}
+
+/// [`cond_wait_impl`] with an explicit clock for the deadline.
+///
+/// # Safety
+/// `c` and `m` must be valid; `m` locked by the caller.
+unsafe fn cond_wait_clock(
+    c: *mut Cond,
+    m: *mut Mutex,
+    clock: c_int,
+    deadline: Option<&Timespec>,
+) -> c_int {
     // SAFETY: caller contract.
     unsafe {
         let seq = (*c).seq.load(Ordering::Acquire);
@@ -352,7 +399,7 @@ unsafe fn cond_wait_impl(c: *mut Cond, m: *mut Mutex, deadline: Option<&Timespec
         if r != 0 {
             return r;
         }
-        let result = wait(&(*c).seq, seq, deadline, (*c).clock as c_int);
+        let result = wait(&(*c).seq, seq, deadline, clock);
         pthread_mutex_lock(m);
         match result {
             Ok(()) => 0,
@@ -387,6 +434,28 @@ pub unsafe extern "C" fn pthread_cond_timedwait(
     };
     // SAFETY: forwarded.
     unsafe { cond_wait_impl(c, m, Some(deadline)) }
+}
+
+/// `pthread_cond_clockwait(3)`.
+///
+/// # Safety
+/// As for [`pthread_cond_timedwait`].
+#[cfg_attr(not(test), unsafe(no_mangle))]
+pub unsafe extern "C" fn pthread_cond_clockwait(
+    c: *mut Cond,
+    m: *mut Mutex,
+    clock: c_int,
+    deadline: *const Timespec,
+) -> c_int {
+    if clock != CLOCK_REALTIME && clock != CLOCK_MONOTONIC {
+        return Errno::EINVAL.0;
+    }
+    let deadline = match check_deadline(deadline) {
+        Ok(d) => d,
+        Err(e) => return e.0,
+    };
+    // SAFETY: forwarded.
+    unsafe { cond_wait_clock(c, m, clock, Some(deadline)) }
 }
 
 /// `pthread_cond_signal(3)`.

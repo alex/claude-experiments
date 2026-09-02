@@ -1157,3 +1157,42 @@ pub unsafe extern "C" fn utimes(path: *const c_char, times: *const crate::time::
 /// Keeps the wide types referenced.
 #[allow(dead_code)]
 fn _types(_: c_ushort, _: c_ulong) {}
+
+static TMPNAM_BUF: crate::sync::Mutex<[u8; 20]> = crate::sync::Mutex::new([0; 20]);
+
+/// `tmpnam(3)`: a random name under `/tmp` that does not exist at the
+/// time of the call (inherently racy; prefer `mkstemp`).
+///
+/// # Safety
+/// `s` must be null or valid for `L_tmpnam` bytes.
+#[cfg_attr(not(test), unsafe(no_mangle))]
+pub unsafe extern "C" fn tmpnam(s: *mut c_char) -> *mut c_char {
+    const ALPHABET: &[u8; 62] = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+    let mut name = [0u8; 20];
+    name[..9].copy_from_slice(b"/tmp/tmp.");
+    for _ in 0..100 {
+        let mut rnd = [0u8; 8];
+        // SAFETY: valid buffer.
+        if unsafe { crate::fs::getentropy(rnd.as_mut_ptr() as *mut c_void, rnd.len()) } != 0 {
+            return ptr::null_mut();
+        }
+        for (i, r) in rnd.iter().enumerate() {
+            name[9 + i] = ALPHABET[(*r % 62) as usize];
+        }
+        name[17] = 0;
+        // SAFETY: NUL-terminated.
+        if unsafe { crate::fs::access(name.as_ptr() as *const c_char, 0) } != 0 {
+            let out = if s.is_null() {
+                let mut g = TMPNAM_BUF.lock();
+                *g = name;
+                g.as_mut_ptr()
+            } else {
+                // SAFETY: caller contract.
+                unsafe { ptr::copy_nonoverlapping(name.as_ptr(), s as *mut u8, 20) };
+                s as *mut u8
+            };
+            return out as *mut c_char;
+        }
+    }
+    ptr::null_mut()
+}

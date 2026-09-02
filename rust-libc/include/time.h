@@ -47,9 +47,12 @@ struct itimerspec {
 #define CLOCK_BOOTTIME 7
 #define TIMER_ABSTIME 1
 
+#define TIME_UTC 1
+
 __BEGIN_DECLS
 
 int clock_gettime(clockid_t, struct timespec *);
+int timespec_get(struct timespec *, int);
 int clock_getres(clockid_t, struct timespec *);
 int clock_settime(clockid_t, const struct timespec *);
 int clock_nanosleep(clockid_t, int, const struct timespec *, struct timespec *);

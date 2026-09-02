@@ -179,11 +179,12 @@ fn is_utf8(name: &[u8]) -> bool {
     !(name == b"C" || name == b"POSIX")
 }
 
-/// `locale_t` handles: an opaque non-null pointer is enough since there
-/// is only one locale.
+/// `locale_t` handles: there is only one locale, so every handle is the
+/// same object, laid out like glibc's so that code built against glibc
+/// (libstdc++'s `ctype<char>`) finds the ctype tables in it.
 #[cfg_attr(not(test), unsafe(no_mangle))]
 pub extern "C" fn newlocale(_mask: c_int, _name: *const c_char, _base: *mut c_void) -> *mut c_void {
-    &C_LCONV as *const LconvCell as *mut c_void
+    &raw const crate::compat::C_LOCALE as *mut c_void
 }
 
 /// `duplocale(3)`.

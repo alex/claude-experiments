@@ -5,6 +5,7 @@
 #define __NEED_size_t
 #define __NEED_wchar_t
 #include <bits/alltypes.h>
+struct tm;
 #include <stdarg.h>
 
 typedef unsigned wint_t;
@@ -76,6 +77,19 @@ wint_t getwc(FILE *);
 wint_t getwchar(void);
 wchar_t *fgetws(wchar_t *__RESTRICT, int, FILE *__RESTRICT);
 int fwide(FILE *, int);
+wint_t ungetwc(wint_t, FILE *);
+int fwprintf(FILE *__RESTRICT, const wchar_t *__RESTRICT, ...);
+int wprintf(const wchar_t *__RESTRICT, ...);
+int vfwprintf(FILE *__RESTRICT, const wchar_t *__RESTRICT, va_list);
+int vwprintf(const wchar_t *__RESTRICT, va_list);
+int fwscanf(FILE *__RESTRICT, const wchar_t *__RESTRICT, ...);
+int wscanf(const wchar_t *__RESTRICT, ...);
+int swscanf(const wchar_t *__RESTRICT, const wchar_t *__RESTRICT, ...);
+int vfwscanf(FILE *__RESTRICT, const wchar_t *__RESTRICT, va_list);
+int vwscanf(const wchar_t *__RESTRICT, va_list);
+int vswscanf(const wchar_t *__RESTRICT, const wchar_t *__RESTRICT, va_list);
+size_t wcsftime(wchar_t *__RESTRICT, size_t, const wchar_t *__RESTRICT, const struct tm *__RESTRICT);
+long double wcstold(const wchar_t *__RESTRICT, wchar_t **__RESTRICT);
 int swprintf(wchar_t *__RESTRICT, size_t, const wchar_t *__RESTRICT, ...);
 int vswprintf(wchar_t *__RESTRICT, size_t, const wchar_t *__RESTRICT, va_list);
 
