@@ -777,6 +777,14 @@ pub extern "C" fn syncfs(fd: c_int) -> c_int {
 #[cfg_attr(not(test), unsafe(no_mangle))]
 pub extern "C" fn sched_getcpu() -> c_int {
     let mut cpu: c_uint = 0;
+    // SAFETY: `cpu` is a valid local.
+    if let Some(r) = unsafe { crate::vdso::getcpu(&mut cpu) } {
+        if r == 0 {
+            return cpu as c_int;
+        }
+        Errno(-r).set();
+        return -1;
+    }
     // SAFETY: valid pointer.
     let r = unsafe { crate::arch::syscall3(309, &mut cpu as *mut c_uint as usize, 0, 0) };
     sys::check(r).map(|_| cpu as c_int).c_ret_or(-1)

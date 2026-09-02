@@ -81,6 +81,15 @@ pub static mut daylight: c_int = 0;
 /// `ts` must be valid.
 #[cfg_attr(not(test), unsafe(no_mangle))]
 pub unsafe extern "C" fn clock_gettime(clock: c_int, ts: *mut Timespec) -> c_int {
+    // Straight into the vDSO with the caller's pointer when there is one.
+    // SAFETY: caller contract.
+    if let Some(r) = unsafe { crate::vdso::clock_gettime(clock, ts) } {
+        if r == 0 {
+            return 0;
+        }
+        Errno(-r).set();
+        return -1;
+    }
     match sys::clock_gettime(clock) {
         Ok(v) => {
             // SAFETY: caller contract.

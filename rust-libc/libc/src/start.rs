@@ -171,6 +171,7 @@ pub unsafe extern "C" fn start_c(sp: *const usize) -> ! {
         )
     };
 
+    crate::vdso::init();
     crate::string::simd::init();
     crate::stdio::init();
     // SAFETY: argv[0] lives on the initial stack for the whole process.

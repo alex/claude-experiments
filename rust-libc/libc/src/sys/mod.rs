@@ -270,6 +270,11 @@ pub fn futex_wait_abs(
 /// `clock_gettime(2)`.
 pub fn clock_gettime(clock: c_int) -> Result<Timespec> {
     let mut ts = Timespec::default();
+    // The vDSO answers without entering the kernel when it can.
+    // SAFETY: `ts` is a valid local.
+    if let Some(r) = unsafe { crate::vdso::clock_gettime(clock, &mut ts) } {
+        return if r == 0 { Ok(ts) } else { Err(Errno(-r)) };
+    }
     // SAFETY: `ts` is valid for the write.
     unsafe {
         check(syscall2(

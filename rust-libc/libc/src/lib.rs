@@ -60,6 +60,7 @@ pub mod thread;
 pub mod threads;
 pub mod time;
 pub mod unistd;
+pub mod vdso;
 pub mod wchar;
 
 #[cfg(not(test))]

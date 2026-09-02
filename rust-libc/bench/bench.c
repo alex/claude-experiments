@@ -175,6 +175,9 @@ static void bench_stdlib(void) {
     MEASURE(s, { rewind(m); int c; while ((c = getc(m)) != EOF) sink += (unsigned long)c; });
     report_bytes("getc 64K", 65536, s);
     fclose(m);
+    struct timespec ts;
+    MEASURE(s, clock_gettime(CLOCK_MONOTONIC, &ts); sink += (unsigned long)ts.tv_nsec);
+    report_ns("clock_gettime", s);
     pthread_mutex_t mu = PTHREAD_MUTEX_INITIALIZER;
     MEASURE(s, { pthread_mutex_lock(&mu); pthread_mutex_unlock(&mu); });
     report_ns("mutex lock+unlock", s);
