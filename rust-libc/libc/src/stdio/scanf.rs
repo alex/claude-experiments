@@ -442,7 +442,7 @@ pub unsafe fn scan<S: Source>(src: &mut S, fmt: *const u8, ap: &mut VaList) -> c
                     } else {
                         num::strtoull(buf.as_ptr() as *const c_char, &mut end, base as c_int)
                     };
-                    if end as usize == buf.as_ptr() as usize {
+                    if core::ptr::eq(end.cast_const().cast::<u8>(), buf.as_ptr()) {
                         break; // matching failure
                     }
                     if !dst.is_null() {

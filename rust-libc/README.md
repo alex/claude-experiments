@@ -5,19 +5,23 @@ A Linux libc written from scratch in Rust.
 * **Static only.** Programs link `libc.a` and talk directly to the stable
   Linux kernel ABI. There is no dynamic loader.
 * **Performance conscious.** SIMD string routines with runtime CPU
-  dispatch (SSE2 / AVX2 / AVX-512BW), a size-class allocator with
-  per-thread caches, buffered stdio, and a benchmark harness that compares
-  every hot path against the host glibc.
+  dispatch (SSE2 / AVX2 / AVX-512BW on x86_64, NEON on AArch64), a
+  size-class allocator with per-thread caches, buffered stdio, the vDSO
+  for the clock calls, and benchmark harnesses that compare every hot
+  path and several allocator workloads against the host glibc.
 * **Security conscious.** Stack protector support out of the box, no
-  in-band allocator metadata next to user data, encoded free-list links
-  and an allocation bitmap that turn double and invalid frees into aborts,
-  no `%n`, every length computation is checked, linear worst cases for
-  `memmem`/`strstr` and `qsort`.
+  in-band allocator metadata next to user data, encoded free-list links,
+  an allocation bitmap and a registry of live mappings that turn double,
+  invalid and foreign frees into aborts, no `%n`, every length
+  computation is checked, linear worst cases for `memmem`/`strstr` and
+  `qsort`, DNS replies validated field by field. The code base has been
+  through a systematic security review (see `docs/DESIGN.md`).
 * **Small and reviewable.** Assembly is confined to `libc/src/arch`, every
   `unsafe` block carries a `SAFETY` comment, and modules map one-to-one to
   C headers. The only external crate is `libm`.
 
-Currently only `x86_64` is supported.
+`x86_64` and `aarch64` are supported; the same test suite runs on both
+(natively, and cross-compiled under `qemu-aarch64`).
 
 ## Layout
 
@@ -43,8 +47,14 @@ docs/DESIGN.md   design notes
 cargo xtask build        # builds target/sysroot/{include,lib/libc.a}
 cargo xtask test         # builds, then compiles and runs tests/c/*.c
 cargo xtask bench        # builds bench/bench.c against rustlibc and glibc
+cargo xtask bench alloc  # the allocator workloads in bench/alloc.c
 cargo test -p rustlibc   # host unit tests of the pure Rust code
+cargo xtask --aarch64 test   # cross-build with aarch64-linux-gnu-gcc and
+                             # run the suite under qemu-aarch64
 ```
+
+The AArch64 build needs `rustup target add aarch64-unknown-linux-gnu`,
+`gcc-aarch64-linux-gnu` and `qemu-user`.
 
 To compile a program against it:
 
@@ -96,11 +106,13 @@ TCP fallback, search list, PTR), time zones (`TZ`, TZif files, POSIX
 rules), the vDSO for the clock calls, and `pthread_cancel` (deferred and
 asynchronous).
 
-Known limitations: x86_64 only; no PIE or static-pie; multibyte
-conversion is UTF-8 only; `long double` is treated as `double` (no `*l`
-math functions; `strtold` returns a `double`'s precision); no `dlopen`
-(static linking only); cancellation is acted on at cancellation points
-rather than at any instruction inside a system call.
+Known limitations: no PIE or static-pie; multibyte conversion is UTF-8
+only; `long double` is treated as `double` (no `*l` math functions;
+`strtold` returns a `double`'s precision, in the platform's `long double`
+format); no `dlopen` (static linking only); cancellation is acted on at
+cancellation points rather than at any instruction inside a system call;
+the page size is assumed to be 4 KiB (AArch64 kernels configured for
+16 or 64 KiB pages are not supported).
 
 ## Performance
 
@@ -117,7 +129,7 @@ after the current round of work:
 | strlen 64 B / 64 KiB | 30 / 137 GB/s | 25 / 97 GB/s | 1.19x / 1.42x |
 | strcmp 4 KiB / 64 KiB | 80 / 71 GB/s | 81 / 47 GB/s | 0.98x / 1.51x |
 | memmem 64 KiB | 32 GB/s | 9.5 GB/s | 3.35x |
-| malloc+free 64 B / 4 KiB / 1 MiB | 12.7 / 13.8 / 9.1 ns | 8.4 / 21.1 / 22.1 ns | 0.66x / 1.53x / 2.43x |
+| malloc+free 64 B / 4 KiB / 1 MiB | 13.4 / 15.6 / 16.0 ns | 8.4 / 21.5 / 23.6 ns | 0.63x / 1.38x / 1.48x |
 | snprintf `%d %s %x` / `%f` / `%e` | 92 / 197 / 208 ns | 93 / 267 / 216 ns | 1.01x / 1.36x / 1.04x |
 | snprintf `%g` | 189–232 ns | 143 ns | 0.62–0.76x |
 | strtod / sscanf `%d %d` | 42 / 81 ns | 83 / 107 ns | 1.98x / 1.33x |
@@ -129,6 +141,26 @@ hand-written assembly saves about 2 ns per call), `%g` (bounded by
 `core::fmt`'s digit generation) and the tiny-block `malloc` fast path
 (glibc's tcache does no integrity checks; ours validates the free-list
 link and the allocation bitmap on every operation).
+
+`cargo xtask bench alloc` runs allocator workloads modelled on real
+programs (`bench/alloc.c`). The single-threaded ones are stable on the
+shared machine used here; the threaded ones vary by 2-3x between runs
+and are quoted as ranges:
+
+| workload | rustlibc | glibc | ratio |
+|---|---|---|---|
+| live set of 4096 blocks, 16-256 B | 30 ns/op | 24 ns/op | 0.8x |
+| live set of 2048 blocks, 256 B-8 KiB | 64 ns/op | 160 ns/op | 2.5x |
+| live set of 64 blocks, 64 KiB-1 MiB | 1.5-1.7 µs/op | 1.3 µs/op | 0.8-0.9x |
+| realloc doubling 16 B to 1 MiB | 3.1 µs/op | 1.0 µs/op | 0.33x |
+| tree build/teardown, 200k nodes | 9-10 ns/op | 20 ns/op | 2.0-2.7x |
+| larson, 4 threads | 30-85 ns/op | 25-32 ns/op | 0.3-1.1x |
+| producer/consumer, 400k blocks | 1.4-4.2 µs/block | 1.0-1.7 µs/block | 0.25-1.15x |
+| resident memory after everything is freed | 14 MiB | 18 MiB | 1.3x |
+
+The realloc row is glibc extending the sole live chunk in place at the
+top of its heap, which a size-class allocator cannot do; blocks above
+1 MiB are resized with `mremap` instead of copied.
 
 ## Dependencies
 
