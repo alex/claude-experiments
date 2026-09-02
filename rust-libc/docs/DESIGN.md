@@ -161,3 +161,34 @@ __locale_struct` layout (libstdc++ reads the ctype tables out of it),
 `__libc_single_threaded`, `_dl_find_object` for libgcc's unwinder, the
 `*64` file names, `gettext` and `arc4random`. `tests/c/cxx.cpp` exercises
 exceptions, iostreams and `std::thread` through this path.
+
+## Resolver
+
+`resolv.rs` is a stub resolver in the musl style: every lookup re-reads
+`/etc/resolv.conf`, sends the A and AAAA queries to all nameservers at
+once over UDP with random IDs, takes the first valid reply per type,
+retries after the timeout and re-asks over TCP when a reply is
+truncated. A reply counts only if it comes from a configured server,
+carries an outstanding ID and echoes the question; records count only
+along the CNAME chain from the queried name; name decompression bounds
+its pointer chase. `getaddrinfo` consults `/etc/hosts` first, then the
+resolver with the search list and `ndots` rule; `getnameinfo` and
+`gethostbyaddr` do PTR lookups.
+
+## Time zones
+
+`time/tz.rs` resolves `TZ` (a zone name under `/usr/share/zoneinfo`, a
+`:path`, `/etc/localtime` when unset, or a POSIX rule string) into a
+transition table and a rule for later years, cached until `TZ` changes.
+TZif parsing is bounds-checked and keeps the most recent 2048
+transitions; zone names may not escape the zoneinfo directory.
+
+## Cancellation
+
+`pthread_cancel` sets a flag in the target's TCB and sends it an internal
+signal (33, reserved from user masks and handlers) so that a blocking
+system call returns. Deferred cancellation is acted on at cancellation
+points (`thread::cancel_point`, called at the entry and exit of the
+blocking calls POSIX lists); asynchronous cancellation acts in the
+signal handler. Either way the thread exits through the normal
+`pthread_exit` path with `PTHREAD_CANCELED`, running cleanup handlers.

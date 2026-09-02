@@ -64,8 +64,43 @@ fn restorer() -> usize {
     0
 }
 
+/// Signals reserved for the implementation (thread cancellation and one
+/// spare, as in glibc and musl): programs cannot install handlers for
+/// them or block them.
+const RESERVED_MASK: u64 = 0b11 << 31; // signals 32 and 33
+
 fn valid(sig: c_int) -> bool {
-    (1..NSIG).contains(&sig)
+    (1..NSIG).contains(&sig) && RESERVED_MASK & (1u64 << (sig - 1)) == 0
+}
+
+/// Installs a handler for an internal signal (`SA_SIGINFO`, no
+/// `SA_RESTART` so that blocking calls return `EINTR`).
+pub(crate) fn install_internal_handler(sig: c_int, handler: usize) {
+    let act = KernelSigaction {
+        handler,
+        flags: (crate::sys::SA_SIGINFO as u64) | SA_RESTORER,
+        restorer: restorer(),
+        mask: 0,
+    };
+    // SAFETY: valid action structure.
+    let _ = unsafe { sys::rt_sigaction(sig, &act, ptr::null_mut()) };
+}
+
+/// A copy of `set` with the reserved signals cleared, for `SIG_BLOCK`
+/// and `SIG_SETMASK` (null stays null).
+///
+/// # Safety
+/// `set` must be null or valid.
+pub(crate) unsafe fn strip_internal(how: c_int, set: *const u64) -> Option<u64> {
+    if set.is_null() {
+        return None;
+    }
+    // SAFETY: caller contract.
+    let mut v = unsafe { *set };
+    if how != SIG_UNBLOCK {
+        v &= !RESERVED_MASK;
+    }
+    Some(v)
 }
 
 /// `sigemptyset(3)`.
@@ -234,11 +269,15 @@ pub unsafe extern "C" fn sigprocmask(how: c_int, set: *const SigSet, old: *mut S
     }
     // SAFETY: caller contract; the kernel only reads/writes 8 bytes.
     unsafe {
-        let set_ptr = if set.is_null() {
-            ptr::null()
-        } else {
-            &(*set).bits[0] as *const u64
-        };
+        let stripped = strip_internal(
+            how,
+            if set.is_null() {
+                ptr::null()
+            } else {
+                &(*set).bits[0]
+            },
+        );
+        let set_ptr = stripped.as_ref().map_or(ptr::null(), |s| s as *const u64);
         let mut kold = 0u64;
         let r = sys::rt_sigprocmask(
             how,
@@ -282,6 +321,7 @@ pub extern "C" fn raise(sig: c_int) -> c_int {
 /// `pause(2)`.
 #[cfg_attr(not(test), unsafe(no_mangle))]
 pub extern "C" fn pause() -> c_int {
+    crate::thread::cancel_point();
     // SAFETY: no memory is involved.
     let r = unsafe { crate::arch::syscall0(crate::arch::nr::PAUSE) };
     sys::check(r).map(drop).c_ret()
@@ -293,6 +333,7 @@ pub extern "C" fn pause() -> c_int {
 /// `mask` must be valid.
 #[cfg_attr(not(test), unsafe(no_mangle))]
 pub unsafe extern "C" fn sigsuspend(mask: *const SigSet) -> c_int {
+    crate::thread::cancel_point();
     // SAFETY: caller contract; the kernel reads 8 bytes.
     let r = unsafe {
         crate::arch::syscall2(
@@ -374,6 +415,7 @@ pub unsafe extern "C" fn sigwaitinfo(set: *const SigSet, info: *mut c_void) -> c
 /// Both pointers must be valid.
 #[cfg_attr(not(test), unsafe(no_mangle))]
 pub unsafe extern "C" fn sigwait(set: *const SigSet, sig: *mut c_int) -> c_int {
+    crate::thread::cancel_point();
     loop {
         // SAFETY: forwarded.
         let r = unsafe { sigtimedwait(set, ptr::null_mut(), ptr::null()) };

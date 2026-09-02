@@ -16,7 +16,13 @@
 //! thread itself when detached (which has to unmap its own stack from
 //! assembly, see `arch`).
 //!
-//! Cancellation (`pthread_cancel`) is not implemented.
+//! Cancellation is deferred by default: `pthread_cancel` records the
+//! request and interrupts the target with an internal signal so that a
+//! blocking call returns, and the target acts on it at its next
+//! cancellation point (see `thread::cancel_point`). Asynchronous
+//! cancellation acts in the signal handler itself. Cancellation is
+//! delivered as `exit_thread(PTHREAD_CANCELED)`, running the cleanup
+//! handlers and key destructors like `pthread_exit`.
 
 use super::{
     CleanupRecord, KEYS_MAX, STATE_DETACHED, STATE_EXITED, STATE_JOINABLE, Tcb, current, tls,
@@ -326,6 +332,7 @@ unsafe fn wait_for_exit(tcb: *mut Tcb) {
     // SAFETY: caller contract.
     let tid = unsafe { &(*tcb).tid };
     loop {
+        super::cancel_point();
         let t = tid.load(Ordering::Acquire);
         if t == 0 {
             return;
@@ -427,7 +434,9 @@ pub extern "C" fn sched_yield() -> c_int {
 #[cfg_attr(not(test), unsafe(no_mangle))]
 pub unsafe extern "C" fn pthread_sigmask(how: c_int, set: *const u64, old: *mut u64) -> c_int {
     // SAFETY: forwarded.
-    match unsafe { sys::rt_sigprocmask(how, set, old) } {
+    let set = unsafe { crate::signal::strip_internal(how, set) };
+    // SAFETY: forwarded.
+    match unsafe { sys::rt_sigprocmask(how, set.as_ref().map_or(ptr::null(), |s| s), old) } {
         Ok(()) => 0,
         Err(e) => e.0,
     }
@@ -825,10 +834,128 @@ mod tests {
     }
 }
 
-/// `pthread_cancel(3)`: cancellation is not supported; the thread keeps
-/// running and `ENOSYS` is returned. Declared so that C++ runtimes that
-/// reference it weakly link.
+/// The signal used to interrupt a thread being cancelled (glibc and musl
+/// use the same number; it is reserved from user signal masks).
+pub const SIGCANCEL: c_int = 33;
+/// `PTHREAD_CANCELED`.
+pub const CANCELED: *mut c_void = usize::MAX as *mut c_void;
+
+static CANCEL_HANDLER_INSTALLED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+/// The `SIGCANCEL` handler: acts immediately under asynchronous
+/// cancellation; otherwise its only job was interrupting a system call.
+extern "C" fn cancel_handler(_sig: c_int, _info: *mut c_void, _ctx: *mut c_void) {
+    let tcb = current();
+    // SAFETY: the TCB is valid for the life of the thread.
+    unsafe {
+        if (*tcb).cancel_pending.load(Ordering::Acquire) != 0
+            && (*tcb).cancel_disabled.load(Ordering::Relaxed) == 0
+            && (*tcb).cancel_async.load(Ordering::Relaxed) != 0
+        {
+            cancel_self();
+        }
+    }
+}
+
+fn install_cancel_handler() {
+    if CANCEL_HANDLER_INSTALLED.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    crate::signal::install_internal_handler(SIGCANCEL, cancel_handler as *const () as usize);
+}
+
+/// Terminates the calling thread with `PTHREAD_CANCELED`. Cancellation is
+/// disabled first so cleanup handlers are not interrupted again.
+pub(crate) fn cancel_self() -> ! {
+    let tcb = current();
+    // SAFETY: the TCB is valid for the life of the thread.
+    unsafe {
+        (*tcb).cancel_disabled.store(1, Ordering::Relaxed);
+        (*tcb).cancel_pending.store(0, Ordering::Relaxed);
+    }
+    exit_thread(CANCELED)
+}
+
+/// `pthread_cancel(3)`.
 #[cfg_attr(not(test), unsafe(no_mangle))]
-pub extern "C" fn pthread_cancel(_t: PthreadT) -> c_int {
-    Errno::ENOSYS.0
+pub extern "C" fn pthread_cancel(thread: PthreadT) -> c_int {
+    let tcb = thread as *mut Tcb;
+    // SAFETY: a valid thread handle.
+    unsafe {
+        (*tcb).cancel_pending.store(1, Ordering::Release);
+        if tcb == current() {
+            if (*tcb).cancel_disabled.load(Ordering::Relaxed) == 0
+                && (*tcb).cancel_async.load(Ordering::Relaxed) != 0
+            {
+                cancel_self();
+            }
+            return 0;
+        }
+        let tid = (*tcb).tid.load(Ordering::Acquire);
+        if tid == 0 {
+            // Already finished: nothing to interrupt.
+            return 0;
+        }
+        install_cancel_handler();
+        match sys::tgkill(sys::getpid(), tid as c_int, SIGCANCEL) {
+            Ok(()) | Err(Errno::ESRCH) => 0,
+            Err(e) => e.0,
+        }
+    }
+}
+
+/// `pthread_setcancelstate(3)`.
+///
+/// # Safety
+/// `old` must be null or valid.
+#[cfg_attr(not(test), unsafe(no_mangle))]
+pub unsafe extern "C" fn pthread_setcancelstate(state: c_int, old: *mut c_int) -> c_int {
+    if !(0..=1).contains(&state) {
+        return Errno::EINVAL.0;
+    }
+    let tcb = current();
+    // SAFETY: the TCB is valid; `old` per caller contract.
+    unsafe {
+        let prev = (*tcb).cancel_disabled.swap(state as u8, Ordering::Relaxed);
+        if !old.is_null() {
+            *old = prev as c_int;
+        }
+    }
+    // Re-enabling with a request pending acts on it at the next point,
+    // as POSIX allows; asynchronous mode acts now.
+    // SAFETY: as above.
+    if state == 0 && unsafe { (*tcb).cancel_async.load(Ordering::Relaxed) } != 0 {
+        super::cancel_point();
+    }
+    0
+}
+
+/// `pthread_setcanceltype(3)`.
+///
+/// # Safety
+/// `old` must be null or valid.
+#[cfg_attr(not(test), unsafe(no_mangle))]
+pub unsafe extern "C" fn pthread_setcanceltype(kind: c_int, old: *mut c_int) -> c_int {
+    if !(0..=1).contains(&kind) {
+        return Errno::EINVAL.0;
+    }
+    let tcb = current();
+    // SAFETY: the TCB is valid; `old` per caller contract.
+    unsafe {
+        let prev = (*tcb).cancel_async.swap(kind as u8, Ordering::Relaxed);
+        if !old.is_null() {
+            *old = prev as c_int;
+        }
+    }
+    if kind == 1 {
+        super::cancel_point();
+    }
+    0
+}
+
+/// `pthread_testcancel(3)`.
+#[cfg_attr(not(test), unsafe(no_mangle))]
+pub extern "C" fn pthread_testcancel() {
+    super::cancel_point();
 }

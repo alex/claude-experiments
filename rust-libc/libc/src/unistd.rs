@@ -10,8 +10,11 @@ use core::ffi::{c_int, c_uint, c_void};
 /// `buf` must be valid for reads of `count` bytes.
 #[cfg_attr(not(test), unsafe(no_mangle))]
 pub unsafe extern "C" fn write(fd: c_int, buf: *const c_void, count: usize) -> isize {
+    crate::thread::cancel_point();
     // SAFETY: forwarded from the caller.
-    unsafe { sys::write(fd, buf as *const u8, count) }.c_ret()
+    let r = unsafe { sys::write(fd, buf as *const u8, count) };
+    crate::thread::cancel_point();
+    r.c_ret()
 }
 
 /// `read(2)`.
@@ -20,8 +23,11 @@ pub unsafe extern "C" fn write(fd: c_int, buf: *const c_void, count: usize) -> i
 /// `buf` must be valid for writes of `count` bytes.
 #[cfg_attr(not(test), unsafe(no_mangle))]
 pub unsafe extern "C" fn read(fd: c_int, buf: *mut c_void, count: usize) -> isize {
+    crate::thread::cancel_point();
     // SAFETY: forwarded from the caller.
-    unsafe { sys::read(fd, buf as *mut u8, count) }.c_ret()
+    let r = unsafe { sys::read(fd, buf as *mut u8, count) };
+    crate::thread::cancel_point();
+    r.c_ret()
 }
 
 /// `close(2)`.
@@ -48,6 +54,7 @@ pub extern "C" fn gettid() -> c_int {
 /// `buf` must be valid for writes of `count` bytes.
 #[cfg_attr(not(test), unsafe(no_mangle))]
 pub unsafe extern "C" fn pread(fd: c_int, buf: *mut c_void, count: usize, off: i64) -> isize {
+    crate::thread::cancel_point();
     // SAFETY: forwarded from the caller.
     unsafe { sys::pread(fd, buf as *mut u8, count, off) }.c_ret()
 }
@@ -58,6 +65,7 @@ pub unsafe extern "C" fn pread(fd: c_int, buf: *mut c_void, count: usize, off: i
 /// `buf` must be valid for reads of `count` bytes.
 #[cfg_attr(not(test), unsafe(no_mangle))]
 pub unsafe extern "C" fn pwrite(fd: c_int, buf: *const c_void, count: usize, off: i64) -> isize {
+    crate::thread::cancel_point();
     // SAFETY: forwarded from the caller.
     unsafe { sys::pwrite(fd, buf as *const u8, count, off) }.c_ret()
 }

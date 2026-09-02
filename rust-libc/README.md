@@ -83,18 +83,24 @@ full `printf` and `scanf` families, wide-character stdio), `stdlib.h`
 `search.h`, `termios.h` and pseudo-terminals, `syslog`, `pwd.h`/`grp.h`
 (from the files), sockets with address conversion and a minimal
 `getaddrinfo`, `poll`/`select`/`epoll`, `timerfd`/`inotify`/`eventfd`,
-`sched.h`, `sys/mman.h` including `shm_open`, `iconv` for the Unicode
+`sched.h`, `sys/mman.h` including `shm_open`, `netdb.h` with a real
+resolver, `iconv` for the Unicode
 encodings, `dl_iterate_phdr` and the C++ runtime hooks, plus the glibc
 compatibility symbols (`__*_chk`, `__isoc99_*`, `_dl_find_object`,
 `__ctype_b_loc`, the `*_l` locale variants, `__libc_single_threaded`, …)
 that let static libraries built against glibc, `libstdc++.a` among them,
 link and run.
 
-Known limitations: x86_64 only; no PIE or static-pie; no DNS resolver
-(`getaddrinfo` handles numeric addresses, `localhost` and `/etc/hosts`);
-`localtime` is UTC; multibyte conversion is UTF-8 only; `long double` is
-treated as `double` (no `*l` math functions, no `strtold`); no
-`pthread_cancel`; no `dlopen`.
+Also: a DNS stub resolver (`/etc/resolv.conf`, parallel UDP queries,
+TCP fallback, search list, PTR), time zones (`TZ`, TZif files, POSIX
+rules), the vDSO for the clock calls, and `pthread_cancel` (deferred and
+asynchronous).
+
+Known limitations: x86_64 only; no PIE or static-pie; multibyte
+conversion is UTF-8 only; `long double` is treated as `double` (no `*l`
+math functions; `strtold` returns a `double`'s precision); no `dlopen`
+(static linking only); cancellation is acted on at cancellation points
+rather than at any instruction inside a system call.
 
 ## Performance
 

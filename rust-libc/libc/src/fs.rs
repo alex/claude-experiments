@@ -179,6 +179,7 @@ syscalls! {
 /// `path` must be NUL-terminated.
 #[cfg_attr(not(test), unsafe(no_mangle))]
 pub unsafe extern "C" fn open(path: *const c_char, flags: c_int, mode: c_uint) -> c_int {
+    crate::thread::cancel_point();
     // SAFETY: forwarded.
     unsafe { openat(AT_FDCWD, path, flags, mode) }
 }

@@ -982,6 +982,9 @@ unsafe fn sem_wait_impl(s: *mut Sem, deadline: Option<&Timespec>, try_only: bool
     // SAFETY: caller contract.
     let s = unsafe { &*s };
     loop {
+        if !try_only {
+            crate::thread::cancel_point();
+        }
         let v = s.value.load(Ordering::Relaxed);
         if v > 0 {
             if s.value

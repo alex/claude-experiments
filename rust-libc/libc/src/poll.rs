@@ -25,8 +25,10 @@ pub struct PollFd {
 /// `fds` must point to `n` entries.
 #[cfg_attr(not(test), unsafe(no_mangle))]
 pub unsafe extern "C" fn poll(fds: *mut PollFd, n: c_uint, timeout: c_int) -> c_int {
+    crate::thread::cancel_point();
     // SAFETY: caller contract.
     let r = unsafe { crate::arch::syscall3(nr::POLL, fds as usize, n as usize, timeout as usize) };
+    crate::thread::cancel_point();
     sys::check(r).map(|v| v as c_int).c_ret_or(-1)
 }
 
@@ -41,6 +43,7 @@ pub unsafe extern "C" fn ppoll(
     timeout: *const Timespec,
     mask: *const u64,
 ) -> c_int {
+    crate::thread::cancel_point();
     // The kernel modifies the timeout; pass a copy as glibc does.
     let mut ts = if timeout.is_null() {
         Timespec::default()
@@ -93,6 +96,7 @@ pub unsafe extern "C" fn pselect(
     timeout: *const Timespec,
     mask: *const u64,
 ) -> c_int {
+    crate::thread::cancel_point();
     let mut ts = if timeout.is_null() {
         Timespec::default()
     } else {
@@ -142,6 +146,7 @@ pub unsafe extern "C" fn select(
     e: *mut FdSet,
     timeout: *mut Timeval,
 ) -> c_int {
+    crate::thread::cancel_point();
     let mut ts = Timespec::default();
     let tsp = if timeout.is_null() {
         ptr::null_mut()

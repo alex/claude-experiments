@@ -92,6 +92,7 @@ syscalls! {
 /// `addr` and `len` must be null or valid.
 #[cfg_attr(not(test), unsafe(no_mangle))]
 pub unsafe extern "C" fn accept(fd: c_int, addr: *mut c_void, len: *mut Socklen) -> c_int {
+    crate::thread::cancel_point();
     // SAFETY: forwarded.
     unsafe { accept4(fd, addr, len, 0) }
 }
@@ -102,6 +103,7 @@ pub unsafe extern "C" fn accept(fd: c_int, addr: *mut c_void, len: *mut Socklen)
 /// `buf` must be valid for `len` bytes.
 #[cfg_attr(not(test), unsafe(no_mangle))]
 pub unsafe extern "C" fn send(fd: c_int, buf: *const c_void, len: usize, flags: c_int) -> isize {
+    crate::thread::cancel_point();
     // SAFETY: forwarded.
     unsafe { sendto(fd, buf, len, flags, ptr::null(), 0) }
 }
@@ -112,6 +114,7 @@ pub unsafe extern "C" fn send(fd: c_int, buf: *const c_void, len: usize, flags: 
 /// `buf` must be valid for `len` bytes.
 #[cfg_attr(not(test), unsafe(no_mangle))]
 pub unsafe extern "C" fn recv(fd: c_int, buf: *mut c_void, len: usize, flags: c_int) -> isize {
+    crate::thread::cancel_point();
     // SAFETY: forwarded.
     unsafe { recvfrom(fd, buf, len, flags, ptr::null_mut(), ptr::null_mut()) }
 }

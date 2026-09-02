@@ -335,6 +335,7 @@ pub unsafe extern "C" fn wait4(
     options: c_int,
     rusage: *mut c_void,
 ) -> c_int {
+    crate::thread::cancel_point();
     // SAFETY: forwarded.
     unsafe { sys::wait4(pid, status, options, rusage) }.c_ret()
 }
@@ -345,6 +346,7 @@ pub unsafe extern "C" fn wait4(
 /// `status` must be null or valid.
 #[cfg_attr(not(test), unsafe(no_mangle))]
 pub unsafe extern "C" fn waitpid(pid: c_int, status: *mut c_int, options: c_int) -> c_int {
+    crate::thread::cancel_point();
     // SAFETY: forwarded.
     unsafe { wait4(pid, status, options, ptr::null_mut()) }
 }

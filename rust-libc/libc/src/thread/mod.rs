@@ -1,6 +1,7 @@
 //! Threads: the thread control block, static TLS and (later) pthreads.
 
 use core::ffi::c_int;
+use core::sync::atomic::AtomicU8;
 use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 pub mod pthread;
@@ -117,6 +118,12 @@ pub struct Tcb {
     pub keys: [*mut core::ffi::c_void; KEYS_MAX],
     /// C++ `thread_local` destructors (`__cxa_thread_atexit_impl`).
     pub thread_dtors: *mut crate::dl::ThreadDtor,
+    /// `PTHREAD_CANCEL_DISABLE` (1) or enable (0).
+    pub cancel_disabled: AtomicU8,
+    /// `PTHREAD_CANCEL_ASYNCHRONOUS` (1) or deferred (0).
+    pub cancel_async: AtomicU8,
+    /// A cancellation request is waiting to be acted on.
+    pub cancel_pending: AtomicU8,
 }
 
 impl Tcb {
@@ -153,6 +160,9 @@ impl Tcb {
                 cleanup: core::ptr::null_mut(),
                 keys: [core::ptr::null_mut(); KEYS_MAX],
                 thread_dtors: core::ptr::null_mut(),
+                cancel_disabled: AtomicU8::new(0),
+                cancel_async: AtomicU8::new(0),
+                cancel_pending: AtomicU8::new(0),
             });
         }
     }
@@ -214,5 +224,21 @@ mod tests {
     fn canary_low_byte_is_zero() {
         assert_eq!(canary_from_random([0xff; 8]) & 0xff, 0);
         assert_ne!(canary_from_random([0xff; 8]), 0);
+    }
+}
+
+/// A cancellation point: acts on a pending `pthread_cancel` if
+/// cancellation is enabled. Called at the entry (and, for calls that can
+/// block, the exit) of the functions POSIX lists as cancellation points.
+#[inline]
+pub fn cancel_point() {
+    let tcb = current();
+    // SAFETY: the TCB is valid for the life of the thread.
+    unsafe {
+        if (*tcb).cancel_pending.load(Ordering::Acquire) != 0
+            && (*tcb).cancel_disabled.load(Ordering::Relaxed) == 0
+        {
+            pthread::cancel_self();
+        }
     }
 }

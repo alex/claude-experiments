@@ -142,6 +142,7 @@ pub unsafe extern "C" fn clock_nanosleep(
     req: *const Timespec,
     rem: *mut Timespec,
 ) -> c_int {
+    crate::thread::cancel_point();
     // SAFETY: caller contract.
     let r = unsafe {
         crate::arch::syscall4(
@@ -166,6 +167,7 @@ pub unsafe extern "C" fn clock_nanosleep(
 pub unsafe extern "C" fn nanosleep(req: *const Timespec, rem: *mut Timespec) -> c_int {
     // SAFETY: forwarded.
     let r = unsafe { clock_nanosleep(sys::CLOCK_REALTIME, 0, req, rem) };
+    crate::thread::cancel_point();
     if r == 0 {
         0
     } else {
