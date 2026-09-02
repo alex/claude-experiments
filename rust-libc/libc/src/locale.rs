@@ -101,17 +101,20 @@ pub unsafe extern "C" fn setlocale(category: c_int, locale: *const c_char) -> *m
     if !(0..=6).contains(&category) {
         return ptr::null_mut();
     }
-    let mut name = NAME.lock();
     if locale.is_null() {
-        return name.as_mut_ptr() as *mut c_char;
+        return NAME.lock().as_mut_ptr() as *mut c_char;
     }
+    // Copy the request before locking: the common save/restore idiom
+    // passes a pointer into `NAME` itself.
+    let mut given = [0u8; 64];
     // SAFETY: caller contract.
-    let mut requested = unsafe {
-        core::slice::from_raw_parts(
-            locale as *const u8,
-            crate::string::search::strlen(locale as *const u8),
-        )
+    let given_len = unsafe {
+        let n = crate::string::search::strlen(locale as *const u8).min(given.len() - 1);
+        ptr::copy_nonoverlapping(locale as *const u8, given.as_mut_ptr(), n);
+        n
     };
+    let mut requested: &[u8] = &given[..given_len];
+    let mut name = NAME.lock();
     let mut env_name = [0u8; 64];
     if requested.is_empty() {
         // From the environment: LC_ALL, then LANG.

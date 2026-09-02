@@ -43,7 +43,12 @@ pub unsafe extern "C" fn popen(cmd: *const c_char, mode: *const c_char) -> *mut 
     if pid == 0 {
         // SAFETY: child: wire the pipe to stdin/stdout and run the shell.
         unsafe {
-            if crate::unistd::dup2(child_end, child_fd) < 0 {
+            if child_end == child_fd {
+                // `dup2` onto itself would keep the close-on-exec flag.
+                if sys::fcntl(child_fd, sys::F_SETFD, 0).is_err() {
+                    crate::exit::_exit(127);
+                }
+            } else if crate::unistd::dup2(child_end, child_fd) < 0 {
                 crate::exit::_exit(127);
             }
             let argv = [c"sh".as_ptr(), c"-c".as_ptr(), cmd, ptr::null()];
@@ -758,7 +763,10 @@ pub extern "C" fn ualarm(value: c_uint, interval: c_uint) -> c_uint {
     {
         return c_uint::MAX;
     }
-    (old.value.tv_sec * 1_000_000 + old.value.tv_usec) as c_uint
+    old.value
+        .tv_sec
+        .saturating_mul(1_000_000)
+        .saturating_add(old.value.tv_usec) as c_uint
 }
 
 /// `syncfs(2)`.
@@ -1146,18 +1154,21 @@ pub unsafe extern "C" fn utimes(path: *const c_char, times: *const crate::time::
         return unsafe { crate::fs::utimensat(sys::AT_FDCWD, path, ptr::null(), 0) };
     }
     // SAFETY: caller contract.
-    let ts = unsafe {
-        [
-            Timespec {
-                tv_sec: (*times).tv_sec,
-                tv_nsec: (*times).tv_usec * 1000,
-            },
-            Timespec {
-                tv_sec: (*times.add(1)).tv_sec,
-                tv_nsec: (*times.add(1)).tv_usec * 1000,
-            },
-        ]
-    };
+    let (a, b) = unsafe { (*times, *times.add(1)) };
+    if !(0..1_000_000).contains(&a.tv_usec) || !(0..1_000_000).contains(&b.tv_usec) {
+        Errno::EINVAL.set();
+        return -1;
+    }
+    let ts = [
+        Timespec {
+            tv_sec: a.tv_sec,
+            tv_nsec: a.tv_usec * 1000,
+        },
+        Timespec {
+            tv_sec: b.tv_sec,
+            tv_nsec: b.tv_usec * 1000,
+        },
+    ];
     // SAFETY: forwarded.
     unsafe { crate::fs::utimensat(sys::AT_FDCWD, path, ts.as_ptr(), 0) }
 }

@@ -255,13 +255,17 @@ impl Args<'_> {
 }
 
 /// Reads a decimal number from the format (used for widths, precisions
-/// and `n$`). Returns `None` on overflow.
+/// and `n$`). Returns `None` above `INT_MAX`, which also keeps the
+/// `usize::MAX` "from argument" marker unambiguous.
 fn parse_num(p: &mut *const u8) -> Option<usize> {
     let mut n = 0usize;
     // SAFETY: the format is NUL-terminated; digits never include NUL.
     unsafe {
         while (**p).is_ascii_digit() {
             n = n.checked_mul(10)?.checked_add((**p - b'0') as usize)?;
+            if n > c_int::MAX as usize {
+                return None;
+            }
             *p = p.add(1);
         }
     }
@@ -479,24 +483,31 @@ pub unsafe fn format<S: Sink>(sink: &mut S, fmt: *const u8, ap: &mut VaList) -> 
         count: 0,
         failed: false,
     };
-    // Positional arguments (`%2$d`) need all arguments fetched up front;
-    // a single scan for '$' decides. The table is only filled in then.
+    // Positional arguments (`%2$d`) need all arguments fetched up front.
+    // A '$' anywhere is the cheap hint to pre-scan the conversions; only
+    // an actual `n$` makes the format positional (a literal "$5" must
+    // not).
     let mut vals: [u64; MAX_POS];
     // SAFETY: forwarded.
-    let uses_positional = unsafe { !crate::string::search::strchr_ptr(fmt, b'$').is_null() };
-    let mut args = if uses_positional {
+    let has_dollar = unsafe { !crate::string::search::strchr_ptr(fmt, b'$').is_null() };
+    let table: Option<&[u64]> = if has_dollar {
         vals = [0; MAX_POS];
-        let table = &mut vals;
         // SAFETY: forwarded.
-        match unsafe { fetch_positional(fmt, ap, table) } {
-            Some(n) => Args::Pos(&table[..n]),
+        match unsafe { fetch_positional(fmt, ap, &mut vals) } {
+            Some(0) => None,
+            Some(n) => Some(&vals[..n]),
             None => {
                 Errno::EINVAL.set();
                 return -1;
             }
         }
     } else {
-        Args::Seq(ap)
+        None
+    };
+    let uses_positional = table.is_some();
+    let mut args = match table {
+        Some(t) => Args::Pos(t),
+        None => Args::Seq(ap),
     };
     let mut p = fmt;
     // SAFETY: the format is NUL-terminated; all reads stop at NUL.
@@ -527,7 +538,13 @@ pub unsafe fn format<S: Sink>(sink: &mut S, fmt: *const u8, ap: &mut VaList) -> 
                 Errno::EINVAL.set();
                 return -1;
             };
-            if uses_positional != positions[2].is_some() && arg_kind(&spec).is_some() {
+            // Positional and sequential arguments must not be mixed
+            // (including `*` widths without a position).
+            if (uses_positional != positions[2].is_some() && arg_kind(&spec).is_some())
+                || (uses_positional
+                    && ((spec.width == usize::MAX && positions[0].is_none())
+                        || (spec.precision == Some(usize::MAX) && positions[1].is_none())))
+            {
                 Errno::EINVAL.set();
                 return -1;
             }
@@ -1158,9 +1175,13 @@ fn fmt_float<S: Sink>(out: &mut Counting<'_, S>, spec: &Spec, x: f64) -> bool {
             match quick {
                 Some(ok) => ok,
                 None => {
+                    // Digits past the exact expansion are zeros and are
+                    // emitted by `finish_float` rather than buffered.
+                    let p1 = p.min(MAX_SIG_DIGITS);
+                    extra_zeros = p - p1;
                     let mut big = [0u8; MAX_SIG_DIGITS + 1];
-                    match exact_digits(x, p + 1, &mut big) {
-                        Some((len, e)) => build_exp(&mut buf, &big[..len], e, p, upper, spec.alt),
+                    match exact_digits(x, p1 + 1, &mut big) {
+                        Some((len, e)) => build_exp(&mut buf, &big[..len], e, p1, upper, spec.alt),
                         None => false,
                     }
                 }
@@ -1169,16 +1190,29 @@ fn fmt_float<S: Sink>(out: &mut Counting<'_, S>, spec: &Spec, x: f64) -> bool {
         b'g' | b'G' => {
             let p = spec.precision.unwrap_or(6).max(1);
             // Style depends on the exponent after rounding to `p` digits.
-            let general = |buf: &mut Fixed<'_>, d: &[u8], e: i32| {
+            // Returns the number of trailing zeros left for `finish_float`
+            // to emit when the precision exceeds the buffer.
+            let general = |buf: &mut Fixed<'_>, d: &[u8], e: i32| -> Option<usize> {
                 let exp = if x == 0.0 { 0 } else { e };
                 if exp >= -4 && (exp as i64) < p as i64 {
-                    build_fixed(buf, d, e, (p as i64 - 1 - exp as i64) as usize, spec.alt)
+                    let frac = (p as i64 - 1 - exp as i64) as usize;
+                    let f1 = frac.min(MAX_FRAC_DIGITS);
+                    build_fixed(buf, d, e, f1, spec.alt).then_some(frac - f1)
                 } else {
-                    build_exp(buf, d, e, p - 1, upper, spec.alt)
+                    let f1 = (p - 1).min(MAX_SIG_DIGITS);
+                    build_exp(buf, d, e, f1, upper, spec.alt).then_some(p - 1 - f1)
                 }
             };
+            let mut zeros = 0;
+            let mut run = |buf: &mut Fixed<'_>, d: &[u8], e: i32| match general(buf, d, e) {
+                Some(z) => {
+                    zeros = z;
+                    true
+                }
+                None => false,
+            };
             let quick = if p <= 15 {
-                with_digits(short_digits(x), p as i64, |d, e| general(&mut buf, d, e))
+                with_digits(short_digits(x), p as i64, |d, e| run(&mut buf, d, e))
             } else {
                 None
             };
@@ -1187,17 +1221,29 @@ fn fmt_float<S: Sink>(out: &mut Counting<'_, S>, spec: &Spec, x: f64) -> bool {
                 None => {
                     let mut big = [0u8; MAX_SIG_DIGITS + 1];
                     match exact_digits(x, p, &mut big) {
-                        Some((len, e)) => general(&mut buf, &big[..len], e),
+                        Some((len, e)) => run(&mut buf, &big[..len], e),
                         None => false,
                     }
                 }
             };
             if ok && !spec.alt {
+                // The unbuffered digits are all zeros, so dropping them
+                // and stripping the buffer is the same as stripping all.
                 strip_trailing_zeros(&mut buf);
+            } else {
+                extra_zeros = zeros;
             }
             ok
         }
-        b'a' | b'A' => fmt_hex_float(&mut buf, x, spec.precision, upper, spec.alt),
+        b'a' | b'A' => {
+            // 13 hex digits show the whole mantissa; the rest are zeros.
+            let precision = spec.precision.map(|p| {
+                let p1 = p.min(13);
+                extra_zeros = p - p1;
+                p1
+            });
+            fmt_hex_float(&mut buf, x, precision, upper, spec.alt)
+        }
         _ => false,
     };
     ok && finish_float(out, spec, prefix, &buf, extra_zeros)
@@ -1218,7 +1264,15 @@ fn finish_float<S: Sink>(
     } else {
         (&b""[..], body)
     };
-    // `extra_zeros` belong at the end of the fraction (only for %f).
+    // `extra_zeros` belong at the end of the fraction, i.e. before any
+    // exponent.
+    let split = if extra_zeros > 0 {
+        body.iter()
+            .position(|&b| matches!(b, b'e' | b'E' | b'p' | b'P'))
+            .unwrap_or(body.len())
+    } else {
+        body.len()
+    };
     let width_body = radix.len() + body.len() + extra_zeros;
     let pad = spec.width.saturating_sub(prefix.len() + width_body);
     if !spec.left && !spec.zero {
@@ -1229,8 +1283,9 @@ fn finish_float<S: Sink>(
     if !spec.left && spec.zero {
         out.pad(pad, b'0');
     }
-    out.put(body);
+    out.put(&body[..split]);
     out.pad(extra_zeros, b'0');
+    out.put(&body[split..]);
     if spec.left {
         out.pad(pad, b' ');
     }
@@ -1793,6 +1848,40 @@ mod tests {
         check("%2$f %1$d", vec![5, f(1.5)], "1.500000 5");
         let (n, _) = run("%1$d %d", vec![1, 2]);
         assert_eq!(n, -1, "mixing positional and sequential is rejected");
+        let (n, _) = run("%1$*d", vec![1, 2]);
+        assert_eq!(n, -1, "a width from an unnumbered argument is rejected");
+        // A literal '$' does not make the format positional.
+        check("cost: $%d, %s", vec![5, s("ok")], "cost: $5, ok");
+        check("$%2$d$%1$d$", vec![1, 2], "$2$1$");
+    }
+
+    #[test]
+    fn huge_precision() {
+        let (n, out) = run("%.1500e", vec![f(1.0)]);
+        assert_eq!(n, 1506);
+        assert!(out.starts_with("1.000") && out.ends_with("0e+00"));
+        assert_eq!(out.len(), 1506);
+        let (n, out) = run("%#.1500g", vec![f(1.5)]);
+        assert_eq!(n, 1501);
+        assert!(out.starts_with("1.5000") && out.ends_with("0"));
+        check("%.1500g", vec![f(1.5)], "1.5");
+        let (n, out) = run("%#.1500g", vec![f(1e100)]);
+        assert_eq!(n, 1501, "fixed form: 101 integer digits and 1399 zeros");
+        assert!(out.starts_with("10000") && out.ends_with("0"));
+        let (n, out) = run("%#.1500g", vec![f(1e-10)]);
+        assert_eq!(n, 1505);
+        assert!(out.starts_with("1.000") && out.ends_with("0e-10"));
+        let (n, out) = run("%.100a", vec![f(1.0)]);
+        assert_eq!(n, 107);
+        assert!(out.starts_with("0x1.000") && out.ends_with("0p+0"));
+        let (n, out) = run("%.2000f", vec![f(0.5)]);
+        assert_eq!(n, 2002);
+        assert!(out.starts_with("0.500") && out.ends_with("0"));
+        // Widths above INT_MAX are rejected rather than read as `*`.
+        let (n, _) = run("%18446744073709551615d", vec![5]);
+        assert_eq!(n, -1);
+        let (n, _) = run("%3000000000d", vec![5]);
+        assert_eq!(n, -1);
     }
 
     #[test]

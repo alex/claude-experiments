@@ -161,18 +161,22 @@ unsafe fn getpw(
             // SAFETY: the fields are NUL-terminated inside `buf`.
             let num = |p: *mut c_char| unsafe {
                 let len = crate::string::search::strlen(p as *const u8);
-                parse_uint(core::slice::from_raw_parts(p as *const u8, len)).unwrap_or(0)
+                parse_uint(core::slice::from_raw_parts(p as *const u8, len))
             };
             if f[6].is_null() {
                 return Errno::EINVAL.0;
             }
+            // A malformed id must not turn into root's.
+            let (Some(uid), Some(gid)) = (num(f[2]), num(f[3])) else {
+                return Errno::EINVAL.0;
+            };
             // SAFETY: caller contract.
             unsafe {
                 *pwd = Passwd {
                     pw_name: f[0],
                     pw_passwd: f[1],
-                    pw_uid: num(f[2]),
-                    pw_gid: num(f[3]),
+                    pw_uid: uid,
+                    pw_gid: gid,
                     pw_gecos: f[4],
                     pw_dir: f[5],
                     pw_shell: f[6],
@@ -362,7 +366,10 @@ unsafe fn getgr(
         *list.add(n) = ptr::null_mut();
         let gid = {
             let len = crate::string::search::strlen(f[2] as *const u8);
-            parse_uint(core::slice::from_raw_parts(f[2] as *const u8, len)).unwrap_or(0)
+            match parse_uint(core::slice::from_raw_parts(f[2] as *const u8, len)) {
+                Some(g) => g,
+                None => return Errno::EINVAL.0,
+            }
         };
         *grp = Group {
             gr_name: f[0],

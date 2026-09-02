@@ -120,39 +120,75 @@ unsafe fn getopt_core(
             return -1;
         }
         let opts = cstr(optstring);
-        let (posix, opts) = match opts.first() {
-            Some(b'+') => (true, &opts[1..]),
-            Some(b'-') => (false, &opts[1..]), // treated as GNU default
-            _ => (
-                !crate::stdlib::env::getenv(c"POSIXLY_CORRECT".as_ptr()).is_null(),
-                opts,
-            ),
+        let posix = match opts.first() {
+            Some(b'+') => true,
+            Some(b'-') => false, // treated as GNU default
+            _ => !crate::stdlib::env::getenv(c"POSIXLY_CORRECT".as_ptr()).is_null(),
         };
-        let colon_mode = opts.first() == Some(&b':');
-        let opts = if colon_mode { &opts[1..] } else { opts };
-
-        // Find the next option, permuting non-options behind it.
         let is_option = |i: usize| {
             let a = cstr(*argv.add(i));
             a.len() >= 2 && a[0] == b'-'
         };
-        let mut i = optind as usize;
-        if OPTPOS == 0 && !is_option(i) {
+        // GNU permutation: parse the next option wherever it is, then
+        // move it (with any argument it consumed) in front of the
+        // non-options skipped to reach it. A partially consumed cluster
+        // stays where it is until it is finished, so it is found again
+        // by the same scan.
+        let start = optind as usize;
+        let mut resumed = start;
+        if !is_option(start) {
             if posix {
                 return -1;
             }
-            let mut j = i;
+            let mut j = start;
             while j < argc as usize && !(*argv.add(j)).is_null() && !is_option(j) {
                 j += 1;
             }
             if j >= argc as usize || (*argv.add(j)).is_null() {
                 return -1;
             }
-            permute(argv, j, i);
-            // Shift the remaining non-options right by one, keeping order.
-            i = optind as usize;
+            resumed = j;
+            optind = j as c_int;
         }
+        let ret = getopt_parse(argc, argv, opts, longopts, longindex, long_only);
+        if resumed > start {
+            let consumed = (optind as usize).saturating_sub(resumed);
+            for k in 0..consumed {
+                permute(argv, resumed + k, start + k);
+            }
+            optind = (start + consumed) as c_int;
+        }
+        ret
+    }
+}
+
+/// Parses the option at `argv[optind]`, which must be an option (or
+/// `--`). Advances `optind` past every argument it consumes.
+///
+/// # Safety
+/// As for [`getopt_core`].
+unsafe fn getopt_parse(
+    argc: c_int,
+    argv: *mut *mut c_char,
+    opts: &[u8],
+    longopts: *const LongOption,
+    longindex: *mut c_int,
+    long_only: bool,
+) -> c_int {
+    // SAFETY: as for `getopt_core`.
+    unsafe {
+        let opts = match opts.first() {
+            Some(b'+') | Some(b'-') => &opts[1..],
+            _ => opts,
+        };
+        let colon_mode = opts.first() == Some(&b':');
+        let opts = if colon_mode { &opts[1..] } else { opts };
+        let i = optind as usize;
         let arg = cstr(*argv.add(i));
+        if OPTPOS >= arg.len() {
+            // A position left over from a parse the caller abandoned.
+            OPTPOS = 0;
+        }
         if arg == b"--" {
             optind += 1;
             return -1;

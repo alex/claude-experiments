@@ -144,6 +144,11 @@ pub fn x87_to_f64(mantissa: u64, se: u16) -> f64 {
     }
     let mut e = e;
     if kept >> keep == 1 {
+        if keep < 53 {
+            // A subnormal that carried into the next bit already has the
+            // right encoding (possibly DBL_MIN).
+            return f64::from_bits(kept | (sign << 63));
+        }
         kept >>= 1;
         e += 1;
         if e > 1023 {
@@ -290,6 +295,15 @@ mod tests {
             f64::from_bits(1)
         );
         assert_eq!(x87_to_f64(0x8000_0000_0000_0000, 16383 - 1076), 0.0);
+        // A subnormal that rounds up to DBL_MIN (2^-1022 - 2^-1086).
+        assert_eq!(
+            x87_to_f64(0xffff_ffff_ffff_ffff, 16383 - 1023),
+            f64::MIN_POSITIVE
+        );
+        assert_eq!(
+            x87_to_f64(0xffff_ffff_ffff_ffff, (16383 - 1023) | 0x8000),
+            -f64::MIN_POSITIVE
+        );
         // Round half to even at the 53-bit boundary: 1 + 2^-53 -> 1.0,
         // 1 + 2^-53 + 2^-63 -> 1 + 2^-52.
         assert_eq!(x87_to_f64(0x8000_0000_0000_0400, 16383), 1.0);

@@ -284,6 +284,9 @@ unsafe fn scan_k<L: Lanes>(s: *const u8, needle: Option<u8>, limit: usize) -> us
     let zero = L::splat(0);
     let nd = L::splat(needle.unwrap_or(0));
     let wn = needle.is_some();
+    if limit == 0 {
+        return 0;
+    }
 
     // First vector: aligned, with the bytes before `start` ignored.
     let mut p = start & !(n - 1);

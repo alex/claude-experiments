@@ -384,10 +384,14 @@ pub unsafe fn scan_float(s: *const u8, single: bool) -> FloatScan {
         // Optional "(n-char-sequence)".
         if c.peek() == b'(' {
             let mut i = 1;
-            while c.peek_at(i).is_ascii_alphanumeric() || c.peek_at(i) == b'_' {
+            // SAFETY: every byte before offset `i` is non-NUL (an
+            // alphanumeric or the parenthesis), so the reads stay inside
+            // the string.
+            let at = |i: usize| unsafe { *c.ptr.add(c.pos + i) };
+            while at(i).is_ascii_alphanumeric() || at(i) == b'_' {
                 i += 1;
             }
-            if c.peek_at(i) == b')' {
+            if at(i) == b')' {
                 c.pos += i + 1;
             }
         }
@@ -571,6 +575,11 @@ fn hex_to_f64(mant: u64, sticky: bool, exp: i64) -> f64 {
     // Rounding may have carried into a new bit.
     let mut e = e;
     if kept >> keep == 1 {
+        if keep < 53 {
+            // A subnormal that carried into the next bit: the pattern is
+            // already the correct (sub)normal encoding, possibly DBL_MIN.
+            return f64::from_bits(kept);
+        }
         kept >>= 1;
         e += 1;
         if e > 1023 {
@@ -775,6 +784,11 @@ mod tests {
         assert_eq!(d("0x1p-1075"), (0.0, 9));
         assert_eq!(d("0x1.8p-1075"), (f64::from_bits(1), 11));
         assert_eq!(d("0x1p-1022"), (f64::MIN_POSITIVE, 9));
+        // Rounding a subnormal up to DBL_MIN (and to a larger subnormal).
+        assert_eq!(d("0x1.fffffffffffffffp-1023").0, f64::MIN_POSITIVE);
+        assert_eq!(d("0x1.fffffffffffffffp-1026").0, f64::from_bits(1 << 49));
+        assert_eq!(d("0x1.fffffffffffffffp-1030").0, f64::from_bits(1 << 45));
+        assert_eq!(d("0x1.ffffffffffffffffp-1075").0, f64::from_bits(1));
         // Round half to even on the 53-bit boundary.
         assert_eq!(d("0x1.00000000000008p0").0, 1.0);
         assert_eq!(d("0x1.00000000000018p0").0, 1.0 + 2.0 * f64::EPSILON);

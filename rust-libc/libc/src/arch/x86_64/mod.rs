@@ -184,14 +184,14 @@ global_asm!(
     "jz setjmp",
     "pop rsi",              // our return address
     "mov [rdi + 64], rsi",  // stash it in the spare slot
-    "mov [rdi + 72], rbx",  // stash rbx in the first mask slot (restored
-                            // before the tail overwrites it with the mask)
+    "mov [rdi + 80], rbx",  // stash rbx in the second mask slot; the tail
+                            // writes the 8-byte mask into the first one
     "mov rbx, rdi",
     "call setjmp",
     "push qword ptr [rbx + 64]",
     "mov rdi, rbx",
     "mov esi, eax",
-    "mov rbx, [rbx + 72]",
+    "mov rbx, [rbx + 80]",
     "jmp {tail}",
     ".size setjmp, .-setjmp",
     tail = sym crate::signal::__sigsetjmp_tail,

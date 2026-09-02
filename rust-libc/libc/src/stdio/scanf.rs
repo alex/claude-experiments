@@ -305,6 +305,11 @@ fn decode_utf8<S: Source>(r: &mut Reader<'_, S>, first: u8) -> Option<u32> {
         }
         cp = (cp << 6) | (b & 0x3f) as u32;
     }
+    // Reject overlong encodings and surrogates.
+    let min = [0, 0x80, 0x800, 0x10000][len];
+    if cp < min {
+        return None;
+    }
     char::from_u32(cp).map(|c| c as u32)
 }
 

@@ -75,8 +75,6 @@ syscalls! {
     pub unsafe fn fstatat(dirfd: c_int, path: *const c_char, st: *mut Stat, flags: c_int) = nr::NEWFSTATAT => c_int, -1;
     /// `fstat(2)`.
     pub unsafe fn fstat(fd: c_int, st: *mut Stat) = nr::FSTAT => c_int, -1;
-    /// `faccessat(2)`.
-    pub unsafe fn faccessat(dirfd: c_int, path: *const c_char, mode: c_int, flags: c_int) = nr::FACCESSAT2 => c_int, -1;
     /// `chdir(2)`.
     pub unsafe fn chdir(path: *const c_char) = nr::CHDIR => c_int, -1;
     /// `fchdir(2)`.
@@ -229,6 +227,28 @@ pub unsafe extern "C" fn lstat(path: *const c_char, st: *mut Stat) -> c_int {
 pub unsafe extern "C" fn access(path: *const c_char, mode: c_int) -> c_int {
     // SAFETY: forwarded.
     unsafe { faccessat(AT_FDCWD, path, mode, 0) }
+}
+
+/// `faccessat(2)`: `faccessat2` where the kernel has it, else the
+/// original call (which takes no flags).
+///
+/// # Safety
+/// `path` must be NUL-terminated.
+#[cfg_attr(not(test), unsafe(no_mangle))]
+pub unsafe extern "C" fn faccessat(
+    dirfd: c_int,
+    path: *const c_char,
+    mode: c_int,
+    flags: c_int,
+) -> c_int {
+    let args = [dirfd as usize, path as usize, mode as usize, flags as usize];
+    // SAFETY: caller contract.
+    let mut r = unsafe { crate::arch::syscall_n(nr::FACCESSAT2, &args) };
+    if sys::check(r) == Err(Errno::ENOSYS) && flags == 0 {
+        // SAFETY: as above.
+        r = unsafe { crate::arch::syscall_n(nr::FACCESSAT, &args[..3]) };
+    }
+    sys::check(r).map(|v| v as c_int).c_ret_or(-1)
 }
 
 /// `mkdir(2)`.
@@ -466,7 +486,7 @@ pub extern "C" fn getpriority(which: c_int, who: c_int) -> c_int {
 #[cfg_attr(not(test), unsafe(no_mangle))]
 pub extern "C" fn nice(inc: c_int) -> c_int {
     let cur = getpriority(0, 0);
-    let new = (cur + inc).clamp(-20, 19);
+    let new = cur.saturating_add(inc).clamp(-20, 19);
     // SAFETY: no memory is involved.
     if unsafe { setpriority(0, 0, new) } < 0 {
         -1
@@ -808,7 +828,10 @@ pub unsafe extern "C" fn mkostemp(template: *mut c_char, flags: c_int) -> c_int 
             openat(
                 AT_FDCWD,
                 template,
-                flags | sys::O_RDWR | sys::O_CREAT | sys::O_EXCL,
+                (flags & (sys::O_APPEND | sys::O_CLOEXEC | sys::O_SYNC))
+                    | sys::O_RDWR
+                    | sys::O_CREAT
+                    | sys::O_EXCL,
                 0o600,
             )
         };

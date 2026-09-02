@@ -419,6 +419,9 @@ pub extern "C" fn nanf(_tag: *const crate::c_char) -> f32 {
 /// `significand(3)`.
 #[cfg_attr(not(test), unsafe(no_mangle))]
 pub extern "C" fn significand(x: f64) -> f64 {
+    if x == 0.0 || !x.is_finite() {
+        return x;
+    }
     libm::scalbn(x, -libm::ilogb(x))
 }
 

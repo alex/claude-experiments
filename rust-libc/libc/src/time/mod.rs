@@ -402,17 +402,17 @@ pub unsafe extern "C" fn mktime(tm: *mut Tm) -> i64 {
 pub unsafe extern "C" fn asctime_r(tm: *const Tm, buf: *mut c_char) -> *mut c_char {
     // SAFETY: caller contract.
     let tm = unsafe { &*tm };
-    // SAFETY: the buffer holds 26 bytes.
-    let out = unsafe { core::slice::from_raw_parts_mut(buf as *mut u8, 26) };
-    let mut w = crate::fmt::SliceWriter::new(out);
-    let wday = calendar::WDAY_NAMES
-        .get(tm.tm_wday as usize)
-        .copied()
-        .unwrap_or("???");
-    let mon = calendar::MON_NAMES
-        .get(tm.tm_mon as usize)
-        .copied()
-        .unwrap_or("???");
+    let (Some(wday), Some(mon)) = (
+        calendar::WDAY_NAMES.get(tm.tm_wday as usize),
+        calendar::MON_NAMES.get(tm.tm_mon as usize),
+    ) else {
+        Errno::EINVAL.set();
+        return ptr::null_mut();
+    };
+    // Format into a local: the fixed 26-byte layout cannot represent a
+    // year outside four digits or fields wider than their columns.
+    let mut tmp = [0u8; 64];
+    let mut w = crate::fmt::SliceWriter::new(&mut tmp);
     let _ = core::fmt::write(
         &mut w,
         format_args!(
@@ -425,7 +425,15 @@ pub unsafe extern "C" fn asctime_r(tm: *const Tm, buf: *mut c_char) -> *mut c_ch
         ),
     );
     let len = w.len();
-    out[len] = 0;
+    if len != 25 {
+        Errno::EOVERFLOW.set();
+        return ptr::null_mut();
+    }
+    // SAFETY: the buffer holds 26 bytes.
+    unsafe {
+        ptr::copy_nonoverlapping(tmp.as_ptr(), buf as *mut u8, len);
+        *buf.add(len) = 0;
+    }
     buf
 }
 
@@ -464,7 +472,13 @@ pub unsafe extern "C" fn ctime_r(t: *const i64, buf: *mut c_char) -> *mut c_char
 #[cfg_attr(not(test), unsafe(no_mangle))]
 pub unsafe extern "C" fn ctime(t: *const i64) -> *mut c_char {
     // SAFETY: forwarded.
-    unsafe { asctime(localtime(t)) }
+    unsafe {
+        let tm = localtime(t);
+        if tm.is_null() {
+            return ptr::null_mut();
+        }
+        asctime(tm)
+    }
 }
 
 /// `timespec_get(3)` (C11): only `TIME_UTC` (1) is supported.

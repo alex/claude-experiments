@@ -66,9 +66,13 @@ unsafe fn find(name: *const u8, len: usize) -> Option<usize> {
                 return None;
             }
             let e = entry as *const u8;
-            if crate::string::mem::memcmp(e as *const c_void, name as *const c_void, len) == 0
-                && *e.add(len) == b'='
-            {
+            // The entry may be shorter than `name`, so compare byte by
+            // byte and stop at its terminator.
+            let mut k = 0;
+            while k < len && *e.add(k) == *name.add(k) {
+                k += 1;
+            }
+            if k == len && *e.add(len) == b'=' {
                 return Some(i);
             }
             i += 1;
@@ -156,7 +160,9 @@ unsafe fn put(string: *mut c_char, name_len: usize, owned_string: bool) -> c_int
             let env = environ;
             let old = *env.add(i);
             *env.add(i) = string;
-            free_if_ours(old);
+            if old != string {
+                free_if_ours(old);
+            }
             return 0;
         }
         let env = ensure_owned(&mut owned);
@@ -211,8 +217,13 @@ impl PtrList {
     }
 
     fn iter(&self) -> impl Iterator<Item = &usize> {
-        // SAFETY: `len` elements are initialised.
-        unsafe { core::slice::from_raw_parts(self.ptr, self.len) }.iter()
+        let items: &[usize] = if self.len == 0 {
+            &[]
+        } else {
+            // SAFETY: `ptr` is our own block with `len` initialised elements.
+            unsafe { core::slice::from_raw_parts(self.ptr, self.len) }
+        };
+        items.iter()
     }
 
     fn push(&mut self, v: usize) -> bool {

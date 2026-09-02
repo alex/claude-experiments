@@ -11,7 +11,7 @@ use crate::errno::Errno;
 use crate::sync::RawMutex;
 use crate::sys::{self, CLOCK_MONOTONIC, CLOCK_REALTIME, Timespec};
 use core::ffi::{c_int, c_uint, c_void};
-use core::sync::atomic::{AtomicI32, AtomicU32, Ordering};
+use core::sync::atomic::{AtomicI32, AtomicU32, AtomicU64, Ordering};
 
 const MUTEX_NORMAL: u32 = 0;
 const MUTEX_RECURSIVE: u32 = 1;
@@ -650,6 +650,11 @@ unsafe fn wrlock_impl(l: *mut RwLock, deadline: Option<&Timespec>, try_only: boo
             continue;
         }
         if let Err(e) = wait(state, announced, deadline, CLOCK_REALTIME) {
+            // Leaving without the lock: withdraw the announcement so
+            // readers are not held back for a writer that is gone.
+            // Another waiting writer re-announces when it wakes.
+            state.fetch_and(!WRITER_WAITING, Ordering::Relaxed);
+            wake_all(state);
             return e.0;
         }
     }
@@ -829,9 +834,19 @@ pub unsafe extern "C" fn pthread_spin_unlock(l: *mut AtomicI32) -> c_int {
 #[repr(C)]
 pub struct Barrier {
     count: u32,
-    waiting: AtomicU32,
-    generation: AtomicU32,
     _pad: u32,
+    /// Arrivals in the current round (low half) and the round number
+    /// (high half), packed so an arrival and the round it belongs to are
+    /// one atomic step. Waiters sleep on the high half.
+    state: AtomicU64,
+}
+
+impl Barrier {
+    fn generation(&self) -> &AtomicU32 {
+        // SAFETY: the high half of the little-endian `u64` is a naturally
+        // aligned `u32` inside the same object.
+        unsafe { &*((self as *const Barrier as *const u8).add(12) as *const AtomicU32) }
+    }
 }
 
 /// `pthread_barrierattr_t`.
@@ -860,9 +875,8 @@ pub unsafe extern "C" fn pthread_barrier_init(
     unsafe {
         b.write(Barrier {
             count,
-            waiting: AtomicU32::new(0),
-            generation: AtomicU32::new(0),
             _pad: 0,
+            state: AtomicU64::new(0),
         })
     };
     0
@@ -882,15 +896,19 @@ pub extern "C" fn pthread_barrier_destroy(_b: *mut Barrier) -> c_int {
 pub unsafe extern "C" fn pthread_barrier_wait(b: *mut Barrier) -> c_int {
     // SAFETY: caller contract.
     let b = unsafe { &*b };
-    let generation = b.generation.load(Ordering::Acquire);
-    if b.waiting.fetch_add(1, Ordering::AcqRel) + 1 == b.count {
-        b.waiting.store(0, Ordering::Relaxed);
-        b.generation.fetch_add(1, Ordering::Release);
-        wake_all(&b.generation);
+    let s = b.state.fetch_add(1, Ordering::AcqRel);
+    let generation = (s >> 32) as u32;
+    if (s as u32) + 1 == b.count {
+        // Start the next round: clear the arrivals and bump the round in
+        // one step, then release everyone sleeping on the old round.
+        b.state
+            .fetch_add((1u64 << 32) - b.count as u64, Ordering::AcqRel);
+        wake_all(b.generation());
         return BARRIER_SERIAL_THREAD;
     }
-    while b.generation.load(Ordering::Acquire) == generation {
-        let _ = sys::futex_wait(&b.generation, generation, None);
+    let gen_word = b.generation();
+    while gen_word.load(Ordering::Acquire) == generation {
+        let _ = sys::futex_wait(gen_word, generation, None);
     }
     0
 }
@@ -999,9 +1017,12 @@ unsafe fn sem_wait_impl(s: *mut Sem, deadline: Option<&Timespec>, try_only: bool
             Errno::EAGAIN.set();
             return -1;
         }
-        s.waiters.fetch_add(1, Ordering::Relaxed);
+        // The waiter count must be visible before the value is rechecked
+        // (in the futex), and a poster's increment before it reads the
+        // count: a Dekker handshake, hence SeqCst.
+        s.waiters.fetch_add(1, Ordering::SeqCst);
         let r = wait(&s.value, 0, deadline, CLOCK_REALTIME);
-        s.waiters.fetch_sub(1, Ordering::Relaxed);
+        s.waiters.fetch_sub(1, Ordering::SeqCst);
         if let Err(e) = r {
             e.set();
             return -1;
@@ -1060,13 +1081,13 @@ pub unsafe extern "C" fn sem_post(s: *mut Sem) -> c_int {
             return -1;
         }
         if s.value
-            .compare_exchange_weak(v, v + 1, Ordering::Release, Ordering::Relaxed)
+            .compare_exchange_weak(v, v + 1, Ordering::SeqCst, Ordering::Relaxed)
             .is_ok()
         {
             break;
         }
     }
-    if s.waiters.load(Ordering::Relaxed) > 0 {
+    if s.waiters.load(Ordering::SeqCst) > 0 {
         let _ = sys::futex_wake(&s.value, 1);
     }
     0

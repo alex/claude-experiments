@@ -18,7 +18,7 @@ typedef int pthread_spinlock_t;
 typedef struct { unsigned __s[4]; } pthread_mutex_t;
 typedef struct { unsigned __s[4]; } pthread_cond_t;
 typedef struct { unsigned __s[4]; } pthread_rwlock_t;
-typedef struct { unsigned __s[4]; } pthread_barrier_t;
+typedef struct { unsigned long __s[2]; } pthread_barrier_t;
 typedef struct { unsigned __type; } pthread_mutexattr_t;
 typedef struct { unsigned __clock; } pthread_condattr_t;
 typedef struct { unsigned __x; } pthread_rwlockattr_t;

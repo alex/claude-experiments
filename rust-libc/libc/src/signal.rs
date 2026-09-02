@@ -123,7 +123,7 @@ pub unsafe extern "C" fn sigfillset(set: *mut SigSet) -> c_int {
     // SAFETY: caller contract.
     unsafe {
         (*set).bits = [0; 16];
-        (*set).bits[0] = u64::MAX;
+        (*set).bits[0] = !RESERVED_MASK;
     }
     0
 }
@@ -203,7 +203,8 @@ pub unsafe extern "C" fn sigaction(
         handler: a.handler,
         flags: (a.flags as u32 as u64) | SA_RESTORER,
         restorer: restorer(),
-        mask: a.mask.bits[0],
+        // The internal signals must stay deliverable inside handlers.
+        mask: a.mask.bits[0] & !RESERVED_MASK,
     });
     let knew_ptr = knew
         .as_ref()

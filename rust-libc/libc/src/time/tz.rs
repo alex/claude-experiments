@@ -109,6 +109,7 @@ impl Zone {
     fn reset_utc(&mut self) {
         self.ntrans = 0;
         self.ntypes = 1;
+        self.idx[0] = 0;
         self.types[0] = Ttype {
             utoff: 0,
             isdst: false,
@@ -191,6 +192,18 @@ impl Zone {
         };
         let Some(file) = file else {
             return;
+        };
+        // A set-user-ID program must not open arbitrary files named by
+        // its environment: only the zone database is trusted then.
+        let secure = crate::start::auxval(crate::start::auxv::AT_SECURE).unwrap_or(0) != 0;
+        let file = if secure
+            && file.starts_with(b"/")
+            && !file.starts_with(b"/usr/share/zoneinfo/")
+            && file != b"/etc/localtime"
+        {
+            &b"/etc/localtime"[..]
+        } else {
+            file
         };
         let full: &[u8] = if file.starts_with(b"/") {
             file
@@ -354,7 +367,7 @@ impl Zone {
         let ttype = if self.ntrans == 0 {
             match self.rule {
                 Some(r) => return self.rule_lookup(&r, t),
-                None => self.types[self.idx.first().copied().unwrap_or(0) as usize],
+                None => self.types[0],
             }
         } else if t < self.trans[0] {
             // Before the first transition: the first standard-time type.
@@ -389,7 +402,7 @@ impl Zone {
         };
         // Transition instants (UTC) for the year of `t` (by standard time).
         let (year, _, _) =
-            calendar::civil_from_days((t + r.std_off as i64).div_euclid(SECS_PER_DAY));
+            calendar::civil_from_days(t.saturating_add(r.std_off as i64).div_euclid(SECS_PER_DAY));
         let start = rule_instant(year, dst.start, r.std_off as i64);
         let end = rule_instant(year, dst.end, dst.off as i64);
         let in_dst = if start <= end {
@@ -441,7 +454,9 @@ fn rule_instant(year: i64, (date, time): (RuleDate, i32), off: i64) -> i64 {
             day
         }
     };
-    day * SECS_PER_DAY + time as i64 - off
+    day.saturating_mul(SECS_PER_DAY)
+        .saturating_add(time as i64)
+        .saturating_sub(off)
 }
 
 // ---------------------------------------------------------------------

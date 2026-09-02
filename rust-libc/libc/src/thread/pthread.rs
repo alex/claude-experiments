@@ -35,7 +35,7 @@ use crate::sys::{
 };
 use core::ffi::{c_int, c_void};
 use core::ptr;
-use core::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicPtr, AtomicU32, AtomicUsize, Ordering};
 
 /// `pthread_t`.
 pub type PthreadT = usize;
@@ -120,6 +120,7 @@ unsafe fn release_stack(base: *mut u8, len: usize, guard: usize) {
 /// Locks the thread-global state for `fork`.
 pub fn prefork() {
     STACK_CACHE.raw().lock();
+    KEY_LOCK.raw().lock();
 }
 
 /// Unlocks the state taken by [`prefork`].
@@ -128,7 +129,10 @@ pub fn prefork() {
 /// Must follow a call to [`prefork`] on the same thread.
 pub unsafe fn postfork() {
     // SAFETY: caller contract.
-    unsafe { STACK_CACHE.raw().unlock() };
+    unsafe {
+        KEY_LOCK.raw().unlock();
+        STACK_CACHE.raw().unlock();
+    }
 }
 
 /// `pthread_create(3)`.
@@ -145,8 +149,15 @@ pub unsafe extern "C" fn pthread_create(
     // SAFETY: caller contract.
     let attr = unsafe { attr.as_ref().copied() }.unwrap_or(DEFAULT_ATTR);
     let tls_len = tls::round_up(tls::region_size(), 16);
-    let guard = tls::round_up(attr.guard_size, PAGE_SIZE);
-    let stack = tls::round_up(attr.stack_size.max(16 * 1024), PAGE_SIZE);
+    let (Some(guard), Some(stack)) = (
+        attr.guard_size.checked_next_multiple_of(PAGE_SIZE),
+        attr.stack_size.max(16 * 1024).checked_next_multiple_of(PAGE_SIZE),
+    ) else {
+        return Errno::EINVAL.0;
+    };
+    // The cancellation signal handler must exist before any thread that
+    // could be cancelled does.
+    install_cancel_handler();
     let Some(len) = guard
         .checked_add(stack)
         .and_then(|v| v.checked_add(tls_len))
@@ -303,6 +314,10 @@ fn exit_thread(result: *mut c_void) -> ! {
         {
             sys::exit_thread(0);
         }
+        // Between the unmap and the exit the thread has no stack, so a
+        // signal delivered then could not be handled: block them all.
+        let all = u64::MAX;
+        let _ = sys::rt_sigprocmask(sys::SIG_BLOCK, &all, ptr::null_mut());
         unmap_self((*tcb).map_base, (*tcb).map_len)
     }
 }
@@ -625,6 +640,11 @@ pub unsafe extern "C" fn pthread_attr_getguardsize(attr: *const Attr, size: *mut
 /// Registry of keys: a destructor pointer per key, with `KEY_FREE` /
 /// `KEY_NO_DTOR` sentinels.
 static KEYS: [AtomicPtr<c_void>; KEYS_MAX] = [const { AtomicPtr::new(KEY_FREE) }; KEYS_MAX];
+/// Generation of each key slot, bumped on every `pthread_key_create`.
+/// A thread's value is only valid if it was stored under the current
+/// generation, so a deleted and reused key never yields stale values
+/// (or runs the new destructor on them).
+static KEY_SEQ: [AtomicU32; KEYS_MAX] = [const { AtomicU32::new(0) }; KEYS_MAX];
 const KEY_FREE: *mut c_void = ptr::null_mut();
 const KEY_NO_DTOR: *mut c_void = ptr::without_provenance_mut(1);
 static KEY_LOCK: Mutex<()> = Mutex::new(());
@@ -645,6 +665,7 @@ pub unsafe extern "C" fn pthread_key_create(
     };
     for (i, slot) in KEYS.iter().enumerate() {
         if slot.load(Ordering::Relaxed) == KEY_FREE {
+            KEY_SEQ[i].fetch_add(1, Ordering::Release);
             slot.store(value, Ordering::Release);
             // SAFETY: caller contract.
             unsafe { *key = i as c_int };
@@ -673,8 +694,15 @@ pub extern "C" fn pthread_getspecific(key: c_int) -> *mut c_void {
     if key < 0 || key as usize >= KEYS_MAX {
         return ptr::null_mut();
     }
+    let k = key as usize;
     // SAFETY: the TCB is valid.
-    unsafe { (*current()).keys[key as usize] }
+    unsafe {
+        let tcb = current();
+        if (*tcb).key_seq[k] != KEY_SEQ[k].load(Ordering::Acquire) {
+            return ptr::null_mut();
+        }
+        (*tcb).keys[k]
+    }
 }
 
 /// `pthread_setspecific(3)`.
@@ -684,8 +712,13 @@ pub extern "C" fn pthread_setspecific(key: c_int, value: *const c_void) -> c_int
     {
         return Errno::EINVAL.0;
     }
+    let k = key as usize;
     // SAFETY: the TCB is valid.
-    unsafe { (*current()).keys[key as usize] = value as *mut c_void };
+    unsafe {
+        let tcb = current();
+        (*tcb).key_seq[k] = KEY_SEQ[k].load(Ordering::Acquire);
+        (*tcb).keys[k] = value as *mut c_void;
+    }
     0
 }
 
@@ -704,6 +737,13 @@ unsafe fn run_key_destructors(tcb: *mut Tcb) {
                 continue;
             }
             let dtor = slot.load(Ordering::Acquire);
+            // SAFETY: caller contract.
+            if unsafe { (*tcb).key_seq[i] } != KEY_SEQ[i].load(Ordering::Acquire) {
+                // Stored under a key that has since been deleted.
+                // SAFETY: caller contract.
+                unsafe { (*tcb).keys[i] = ptr::null_mut() };
+                continue;
+            }
             // SAFETY: caller contract.
             unsafe { (*tcb).keys[i] = ptr::null_mut() };
             if dtor != KEY_FREE && dtor != KEY_NO_DTOR {

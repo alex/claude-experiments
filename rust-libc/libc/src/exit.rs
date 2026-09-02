@@ -31,6 +31,20 @@ static ATEXIT: Mutex<AtexitTable> = Mutex::new(AtexitTable {
     len: 0,
 });
 
+/// Locks the handler table (for `fork`).
+pub fn prefork() {
+    ATEXIT.raw().lock();
+}
+
+/// Unlocks the table taken by [`prefork`].
+///
+/// # Safety
+/// Must follow a call to [`prefork`] on the same thread.
+pub unsafe fn postfork() {
+    // SAFETY: caller contract.
+    unsafe { ATEXIT.raw().unlock() };
+}
+
 fn register(h: Handler) -> c_int {
     let mut table = ATEXIT.lock();
     if table.len == MAX_ATEXIT {
@@ -110,7 +124,7 @@ fn run_fini_array() {}
 pub extern "C" fn exit(status: c_int) -> ! {
     run_atexit();
     run_fini_array();
-    crate::stdio::flush_all();
+    crate::stdio::flush_all(true);
     sys::exit_group(status)
 }
 

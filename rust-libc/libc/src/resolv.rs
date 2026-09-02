@@ -250,6 +250,22 @@ fn build_query(name: &[u8], qtype: u16, out: &mut [u8; UDP_MAX]) -> Option<usize
     Some(pos)
 }
 
+/// Whether a name from a reply is an acceptable host name: non-empty
+/// labels of letters, digits, `-` and `_` (as sent names must be), so
+/// that nothing a server chooses can smuggle NULs, spaces, slashes or
+/// shell metacharacters into an application's idea of a host name.
+fn valid_hostname(name: &[u8]) -> bool {
+    !name.is_empty()
+        && name.len() <= 253
+        && name.split(|&b| b == b'.').all(|label| {
+            !label.is_empty()
+                && label.len() <= 63
+                && label
+                    .iter()
+                    .all(|&b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+        })
+}
+
 /// Reads a possibly compressed name at `pos`, writing it as dotted
 /// lowercase text (no trailing dot) into `out`. Returns the text length
 /// and the position just after the name's first (uncompressed) part.
@@ -356,7 +372,10 @@ fn parse_answers(
         match rtype {
             TYPE_CNAME => {
                 let mut target = [0u8; 256];
-                let (tl, _) = read_name(reply, rdata, &mut target)?;
+                let (tl, after) = read_name(reply, rdata, &mut target)?;
+                if after > rdata + rdlen || !valid_hostname(&target[..tl]) {
+                    return None;
+                }
                 canon[..tl].copy_from_slice(&target[..tl]);
                 clen = tl;
             }
@@ -373,7 +392,10 @@ fn parse_answers(
             }
             TYPE_PTR if qtype == TYPE_PTR => {
                 let mut target = [0u8; 256];
-                let (tl, _) = read_name(reply, rdata, &mut target)?;
+                let (tl, after) = read_name(reply, rdata, &mut target)?;
+                if after > rdata + rdlen || !valid_hostname(&target[..tl]) {
+                    return None;
+                }
                 out(Record::Ptr, &target[..tl]);
             }
             _ => {}
@@ -551,6 +573,9 @@ fn exchange_on(
             }
             for fd in fds.iter().filter(|f| f.revents != 0).map(|f| f.fd) {
                 loop {
+                    if now_ms() >= deadline {
+                        break;
+                    }
                     let mut buf = [0u8; UDP_MAX];
                     let mut sa = [0u8; 28];
                     let mut salen: u32 = 28;
@@ -580,7 +605,10 @@ fn exchange_on(
                         };
                         match rcode {
                             0 | 3 => {
-                                if truncated {
+                                // A reply that fills the buffer may have
+                                // been cut by the socket rather than
+                                // marked truncated by the server.
+                                if truncated || n >= UDP_MAX {
                                     p.need_tcp = Some(from);
                                     p.rcode = Some(rcode);
                                 } else {
@@ -763,21 +791,29 @@ fn query(
                     // SAFETY: the block holds `len` bytes.
                     let reply = unsafe { core::slice::from_raw_parts(buf, len) };
                     let r = match check_reply(&p.query[..p.qlen], reply) {
-                        Some((0, _)) => parse_answers(reply, t, &mut sink, canon),
-                        _ => None,
+                        Some((0, _)) => {
+                            parse_answers(reply, t, &mut sink, canon).ok_or(Error::Fail)
+                        }
+                        Some((3, _)) => Err(Error::NoName),
+                        _ => Err(Error::Fail),
                     };
                     // SAFETY: our block.
                     unsafe { crate::malloc::dealloc(buf) };
                     r
                 }
-                None => None,
+                // Could not reach the server in time: worth retrying.
+                None => Err(Error::Again),
             }
         } else {
-            parse_answers(&p.reply[..p.rlen], t, &mut sink, canon)
+            parse_answers(&p.reply[..p.rlen], t, &mut sink, canon).ok_or(Error::Fail)
         };
         match parsed {
-            Some(l) => clen = l,
-            None => return Err(Error::Fail),
+            Ok(l) => clen = l,
+            Err(Error::NoName) => {
+                nxdomain += 1;
+                continue;
+            }
+            Err(e) => return Err(e),
         }
         if count > 0 {
             found_records = true;

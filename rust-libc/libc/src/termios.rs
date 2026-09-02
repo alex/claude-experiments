@@ -140,9 +140,11 @@ pub unsafe extern "C" fn cfsetspeed(t: *mut Termios, speed: c_uint) -> c_int {
 pub unsafe extern "C" fn cfmakeraw(t: *mut Termios) {
     // SAFETY: caller contract.
     unsafe {
-        (*t).c_iflag &= !(0o1 | 0o2 | 0o4 | 0o10 | 0o40 | 0o100 | 0o400 | 0o2000); // IGNBRK BRKINT PARMRK ISTRIP INLCR IGNCR ICRNL IXON
+        // IGNBRK BRKINT PARMRK ISTRIP INLCR IGNCR ICRNL IXON
+        (*t).c_iflag &= !(0o1 | 0o2 | 0o10 | 0o40 | 0o100 | 0o200 | 0o400 | 0o2000);
         (*t).c_oflag &= !0o1; // OPOST
-        (*t).c_lflag &= !(0o10 | 0o2 | 0o1 | 0o100000 | 0o1); // ECHO ECHONL ICANON ISIG IEXTEN
+        // ECHO ECHONL ICANON ISIG IEXTEN
+        (*t).c_lflag &= !(0o10 | 0o100 | 0o2 | 0o1 | 0o100000);
         (*t).c_cflag &= !(0o60 | 0o400); // CSIZE PARENB
         (*t).c_cflag |= 0o60; // CS8
         (*t).c_cc[6] = 1; // VMIN
@@ -236,15 +238,20 @@ pub unsafe extern "C" fn ptsname_r(fd: c_int, buf: *mut c_char, len: usize) -> c
     if ioctl(fd, TIOCGPTN, &mut n as *mut c_uint as usize) < 0 {
         return Errno::get().0;
     }
-    // SAFETY: caller contract.
-    let out = unsafe { core::slice::from_raw_parts_mut(buf as *mut u8, len) };
-    let mut w = crate::fmt::SliceWriter::new(out);
+    // Format into a local first: a truncated name would be a different
+    // (and possibly existing) device.
+    let mut name = [0u8; 32];
+    let mut w = crate::fmt::SliceWriter::new(&mut name);
     let _ = core::fmt::write(&mut w, format_args!("/dev/pts/{n}"));
     let written = w.len();
-    if written + 1 > len || written < 10 {
+    if written + 1 > len {
         return Errno::ERANGE.0;
     }
-    out[written] = 0;
+    // SAFETY: caller contract; `written + 1 <= len`.
+    unsafe {
+        core::ptr::copy_nonoverlapping(name.as_ptr(), buf as *mut u8, written);
+        *buf.add(written) = 0;
+    }
     0
 }
 

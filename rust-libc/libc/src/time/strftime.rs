@@ -102,21 +102,21 @@ pub fn format(buf: &mut [u8], fmt: &[u8], tm: &Tm) -> Option<usize> {
             b'D' => write!(
                 out,
                 "{:02}/{:02}/{:02}",
-                tm.tm_mon + 1,
+                tm.tm_mon as i64 + 1,
                 tm.tm_mday,
                 year.rem_euclid(100)
             )
             .ok()?,
             b'e' => write!(out, "{:2}", tm.tm_mday).ok()?,
-            b'F' => write!(out, "{}-{:02}-{:02}", year, tm.tm_mon + 1, tm.tm_mday).ok()?,
+            b'F' => write!(out, "{}-{:02}-{:02}", year, tm.tm_mon as i64 + 1, tm.tm_mday).ok()?,
             b'G' => write!(out, "{}", iso_week(tm).0).ok()?,
             b'g' => write!(out, "{:02}", iso_week(tm).0.rem_euclid(100)).ok()?,
             b'H' => write!(out, "{:02}", tm.tm_hour).ok()?,
-            b'I' => write!(out, "{:02}", (tm.tm_hour + 11) % 12 + 1).ok()?,
-            b'j' => write!(out, "{:03}", tm.tm_yday + 1).ok()?,
+            b'I' => write!(out, "{:02}", (tm.tm_hour as i64 + 11).rem_euclid(12) + 1).ok()?,
+            b'j' => write!(out, "{:03}", tm.tm_yday as i64 + 1).ok()?,
             b'k' => write!(out, "{:2}", tm.tm_hour).ok()?,
-            b'l' => write!(out, "{:2}", (tm.tm_hour + 11) % 12 + 1).ok()?,
-            b'm' => write!(out, "{:02}", tm.tm_mon + 1).ok()?,
+            b'l' => write!(out, "{:2}", (tm.tm_hour as i64 + 11).rem_euclid(12) + 1).ok()?,
+            b'm' => write!(out, "{:02}", tm.tm_mon as i64 + 1).ok()?,
             b'M' => write!(out, "{:02}", tm.tm_min).ok()?,
             b'n' => out.write_str("\n").ok()?,
             b'p' => out
@@ -128,7 +128,7 @@ pub fn format(buf: &mut [u8], fmt: &[u8], tm: &Tm) -> Option<usize> {
             b'r' => write!(
                 out,
                 "{:02}:{:02}:{:02} {}",
-                (tm.tm_hour + 11) % 12 + 1,
+                (tm.tm_hour as i64 + 11).rem_euclid(12) + 1,
                 tm.tm_min,
                 tm.tm_sec,
                 if tm.tm_hour < 12 { "AM" } else { "PM" }
@@ -139,15 +139,15 @@ pub fn format(buf: &mut [u8], fmt: &[u8], tm: &Tm) -> Option<usize> {
             b'S' => write!(out, "{:02}", tm.tm_sec).ok()?,
             b't' => out.write_str("\t").ok()?,
             b'T' => write!(out, "{:02}:{:02}:{:02}", tm.tm_hour, tm.tm_min, tm.tm_sec).ok()?,
-            b'u' => write!(out, "{}", (tm.tm_wday + 6) % 7 + 1).ok()?,
-            b'U' => write!(out, "{:02}", (tm.tm_yday + 7 - tm.tm_wday) / 7).ok()?,
+            b'u' => write!(out, "{}", (tm.tm_wday as i64 + 6).rem_euclid(7) + 1).ok()?,
+            b'U' => write!(out, "{:02}", (tm.tm_yday as i64 + 7 - tm.tm_wday as i64) / 7).ok()?,
             b'V' => write!(out, "{:02}", iso_week(tm).1).ok()?,
             b'w' => write!(out, "{}", tm.tm_wday).ok()?,
-            b'W' => write!(out, "{:02}", (tm.tm_yday + 7 - (tm.tm_wday + 6) % 7) / 7).ok()?,
+            b'W' => write!(out, "{:02}", (tm.tm_yday as i64 + 7 - (tm.tm_wday as i64 + 6).rem_euclid(7)) / 7).ok()?,
             b'x' => write!(
                 out,
                 "{:02}/{:02}/{:02}",
-                tm.tm_mon + 1,
+                tm.tm_mon as i64 + 1,
                 tm.tm_mday,
                 year.rem_euclid(100)
             )
@@ -158,7 +158,7 @@ pub fn format(buf: &mut [u8], fmt: &[u8], tm: &Tm) -> Option<usize> {
             b'z' => {
                 let off = tm.tm_gmtoff;
                 let sign = if off < 0 { '-' } else { '+' };
-                let off = off.abs();
+                let off = off.unsigned_abs();
                 write!(out, "{sign}{:02}{:02}", off / 3600, off % 3600 / 60).ok()?
             }
             b'Z' => {
@@ -201,7 +201,7 @@ pub unsafe extern "C" fn strftime(
     // SAFETY: caller contract.
     let (out, fmt, tm) = unsafe {
         (
-            core::slice::from_raw_parts_mut(buf as *mut u8, max - 1),
+            core::slice::from_raw_parts_mut(buf as *mut u8, max),
             core::slice::from_raw_parts(
                 fmt as *const u8,
                 crate::string::search::strlen(fmt as *const u8),
@@ -209,9 +209,10 @@ pub unsafe extern "C" fn strftime(
             &*tm,
         )
     };
-    match format(out, fmt, tm) {
+    // The text may fill all but the last byte, which holds the NUL.
+    match format(&mut out[..max - 1], fmt, tm) {
         Some(len) => {
-            out[len.min(max - 1)] = 0;
+            out[len] = 0;
             len
         }
         None => 0,

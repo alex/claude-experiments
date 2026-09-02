@@ -253,9 +253,10 @@ unsafe fn mbs_to_wcs(
     n: usize,
     ps: *mut MbState,
 ) -> usize {
-    let mut local = MbState::default();
+    let mut global;
     let st: &mut MbState = if ps.is_null() {
-        &mut local
+        global = GLOBAL_STATE.lock();
+        &mut global
     } else {
         // SAFETY: caller contract.
         unsafe { &mut *ps }
@@ -920,24 +921,39 @@ pub unsafe extern "C" fn wcswidth(s: *const WChar, n: usize) -> c_int {
     total
 }
 
-/// Copies the numeric prefix of a wide string into a narrow buffer so
-/// the `strto*` family can parse it, and maps the end pointer back.
+/// Copies the ASCII prefix of a wide string (all a number can consist
+/// of) into a narrow NUL-terminated buffer so the `strto*` family can
+/// parse it. Short prefixes use `stack`; longer ones are `malloc`ed and
+/// the flag says so. If that fails the prefix is truncated to the stack
+/// buffer.
 ///
 /// # Safety
 /// `s` must be NUL-terminated.
-unsafe fn narrow_prefix(s: *const WChar, buf: &mut [u8; 128]) -> usize {
+unsafe fn narrow_prefix(s: *const WChar, stack: &mut [u8; 128]) -> (*mut u8, bool) {
     let mut n = 0;
-    while n < buf.len() - 1 {
-        // SAFETY: caller contract.
-        let c = unsafe { *s.add(n) };
-        if !(0..0x80).contains(&c) {
-            break;
-        }
-        buf[n] = c as u8;
+    // SAFETY: caller contract; stops at the terminator.
+    while (0..0x80).contains(&unsafe { *s.add(n) }) && unsafe { *s.add(n) } != 0 {
         n += 1;
     }
-    buf[n] = 0;
-    n
+    let (buf, owned) = if n < stack.len() {
+        (stack.as_mut_ptr(), false)
+    } else {
+        let p = crate::malloc::alloc(n + 1);
+        if p.is_null() {
+            n = stack.len() - 1;
+            (stack.as_mut_ptr(), false)
+        } else {
+            (p, true)
+        }
+    };
+    for i in 0..n {
+        // SAFETY: `i < n` characters were checked to be ASCII, and the
+        // buffer holds `n + 1` bytes.
+        unsafe { *buf.add(i) = *s.add(i) as u8 };
+    }
+    // SAFETY: as above.
+    unsafe { *buf.add(n) = 0 };
+    (buf, owned)
 }
 
 macro_rules! wide_strto {
@@ -949,16 +965,20 @@ macro_rules! wide_strto {
             /// `s` must be NUL-terminated; `end` null or valid.
             #[cfg_attr(not(test), unsafe(no_mangle))]
             pub unsafe extern "C" fn $name(s: *const WChar, end: *mut *mut WChar $(, $base: c_int)?) -> $ret {
-                let mut buf = [0u8; 128];
+                let mut stack = [0u8; 128];
                 // SAFETY: forwarded.
-                let _ = unsafe { narrow_prefix(s, &mut buf) };
+                let (buf, owned) = unsafe { narrow_prefix(s, &mut stack) };
                 let mut e: *mut c_char = ptr::null_mut();
                 // SAFETY: the buffer is NUL-terminated.
-                let v = unsafe { $narrow(buf.as_ptr() as *const c_char, &mut e $(, $base)?) };
+                let v = unsafe { $narrow(buf as *const c_char, &mut e $(, $base)?) };
                 if !end.is_null() {
-                    let consumed = e as usize - buf.as_ptr() as usize;
+                    let consumed = e as usize - buf as usize;
                     // SAFETY: caller contract; `consumed` characters were ASCII.
                     unsafe { *end = s.add(consumed) as *mut WChar };
+                }
+                if owned {
+                    // SAFETY: our block.
+                    unsafe { crate::malloc::dealloc(buf) };
                 }
                 v
             }

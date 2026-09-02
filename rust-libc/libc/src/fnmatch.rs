@@ -24,7 +24,7 @@ pub const FNM_NOMATCH: c_int = 1;
 /// Matches a bracket expression starting after `[`. Returns whether
 /// `c` matched and the index after the closing `]`, or `None` if the
 /// bracket is malformed (in which case `[` is literal).
-fn bracket(p: &[u8], c: u8, casefold: bool) -> Option<(bool, usize)> {
+fn bracket(p: &[u8], c: u8, casefold: bool, noescape: bool) -> Option<(bool, usize)> {
     let mut i = 0;
     let negate = matches!(p.first(), Some(b'!') | Some(b'^'));
     if negate {
@@ -68,7 +68,7 @@ fn bracket(p: &[u8], c: u8, casefold: bool) -> Option<(bool, usize)> {
             i = end + 2;
             continue;
         }
-        let lo = if ch == b'\\' && i + 1 < p.len() {
+        let lo = if ch == b'\\' && !noescape && i + 1 < p.len() {
             i += 1;
             p[i]
         } else {
@@ -77,7 +77,7 @@ fn bracket(p: &[u8], c: u8, casefold: bool) -> Option<(bool, usize)> {
         if p.get(i + 1) == Some(&b'-') && p.get(i + 2).is_some_and(|&n| n != b']') {
             let mut hi = p[i + 2];
             let mut skip = 3;
-            if hi == b'\\' && i + 3 < p.len() {
+            if hi == b'\\' && !noescape && i + 3 < p.len() {
                 hi = p[i + 3];
                 skip = 4;
             }
@@ -139,7 +139,7 @@ pub fn matches(pattern: &[u8], s: &[u8], flags: c_int) -> bool {
                     continue;
                 }
                 b'[' if i < s.len() && !(pathname && s[i] == b'/') && !special_period(i) => {
-                    if let Some((ok, next)) = bracket(&pattern[p + 1..], s[i], casefold) {
+                    if let Some((ok, next)) = bracket(&pattern[p + 1..], s[i], casefold, noescape) {
                         if ok {
                             p += 1 + next;
                             i += 1;

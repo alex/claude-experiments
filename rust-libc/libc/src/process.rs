@@ -40,6 +40,7 @@ fn after_fork_child() {
 #[cfg_attr(not(test), unsafe(no_mangle))]
 pub extern "C" fn fork() -> c_int {
     ATFORK.lock().run_prepare();
+    crate::exit::prefork();
     crate::malloc::prefork();
     crate::thread::pthread::prefork();
     crate::stdio::prefork();
@@ -49,6 +50,7 @@ pub extern "C" fn fork() -> c_int {
         crate::stdio::postfork(r == Ok(0));
         crate::thread::pthread::postfork();
         crate::malloc::postfork();
+        crate::exit::postfork();
     }
     match r {
         Ok(0) => {
@@ -196,6 +198,13 @@ pub unsafe extern "C" fn execvpe(
         match e {
             Errno::EACCES => seen_eacces = true,
             Errno::ENOENT | Errno::ENOTDIR => {}
+            Errno::ENOEXEC => {
+                // Not a binary and no shebang: run it through the shell.
+                // SAFETY: as above.
+                let e = unsafe { exec_via_shell(buf.as_ptr(), argv, envp) };
+                e.set();
+                return -1;
+            }
             e => {
                 e.set();
                 return -1;
@@ -209,6 +218,45 @@ pub unsafe extern "C" fn execvpe(
     })
     .set();
     -1
+}
+
+/// Executes `path` as a shell script: `/bin/sh path argv[1]...`.
+/// Returns only on failure.
+///
+/// # Safety
+/// `path` must be NUL-terminated and `argv` NULL-terminated.
+unsafe fn exec_via_shell(
+    path: *const u8,
+    argv: *const *const c_char,
+    envp: *const *const c_char,
+) -> Errno {
+    // SAFETY: caller contract.
+    unsafe {
+        let mut argc = 0;
+        while !(*argv.add(argc)).is_null() {
+            argc += 1;
+        }
+        // sh, the script, its arguments (all but argv[0]), NULL.
+        let n = argc.max(1) + 2;
+        let new = crate::malloc::alloc(n * core::mem::size_of::<*const c_char>())
+            as *mut *const c_char;
+        if new.is_null() {
+            return Errno::ENOMEM;
+        }
+        *new = c"sh".as_ptr();
+        *new.add(1) = path as *const c_char;
+        for k in 1..argc {
+            *new.add(1 + k) = *argv.add(k);
+        }
+        *new.add(n - 1) = ptr::null();
+        let e = sys::execve(
+            c"/bin/sh".as_ptr() as *const u8,
+            new as *const *const u8,
+            envp as *const *const u8,
+        );
+        crate::malloc::dealloc(new as *mut u8);
+        e
+    }
 }
 
 /// `execvp(3)`.

@@ -20,10 +20,18 @@ struct Node {
     priority: u32,
 }
 
-static PRIO: Mutex<u64> = Mutex::new(0x9e37_79b9_7f4a_7c15);
+/// Xorshift state for treap priorities, seeded from the kernel on first
+/// use so an adversary choosing the insertion order cannot predict them
+/// and degrade the tree to a list.
+static PRIO: Mutex<u64> = Mutex::new(0);
 
 fn next_priority() -> u32 {
     let mut s = PRIO.lock();
+    if *s == 0 {
+        let mut seed = [0u8; 8];
+        let _ = crate::sys::getrandom_exact(&mut seed);
+        *s = u64::from_ne_bytes(seed) | 0x9e37_79b9_7f4a_7c15;
+    }
     *s ^= *s << 13;
     *s ^= *s >> 7;
     *s ^= *s << 17;
@@ -309,11 +317,16 @@ pub unsafe extern "C" fn hcreate_r(nel: usize, htab: *mut HsearchData) -> c_int 
         Errno::EINVAL.set();
         return 0;
     }
-    let size = (nel.max(8) * 2).next_power_of_two();
-    let Ok(size32) = c_uint::try_from(size) else {
+    let Some(size32) = nel
+        .max(8)
+        .checked_mul(2)
+        .and_then(usize::checked_next_power_of_two)
+        .and_then(|n| c_uint::try_from(n).ok())
+    else {
         Errno::ENOMEM.set();
         return 0;
     };
+    let size = size32 as usize;
     let table = malloc::alloc(size * core::mem::size_of::<Entry>()) as *mut Entry;
     if table.is_null() {
         return 0;

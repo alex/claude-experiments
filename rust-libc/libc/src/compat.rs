@@ -626,10 +626,10 @@ mod stubs {
         "ret",
         strtod = sym crate::stdlib::num::strtod,
     );
-    variadic_stub!(__sprintf_chk, 3, "rcx", super::__vsprintf_chk);
-    variadic_stub!(__snprintf_chk, 4, "r8", super::__vsnprintf_chk);
-    variadic_stub!(__printf_chk, 1, "rsi", super::__vprintf_chk);
-    variadic_stub!(__fprintf_chk, 2, "rdx", super::__vfprintf_chk);
+    variadic_stub!(__sprintf_chk, 4, "r8", super::__vsprintf_chk);
+    variadic_stub!(__snprintf_chk, 5, "r9", super::__vsnprintf_chk);
+    variadic_stub!(__printf_chk, 2, "rdx", super::__vprintf_chk);
+    variadic_stub!(__fprintf_chk, 3, "rcx", super::__vfprintf_chk);
     variadic_stub!(__isoc99_sscanf, 2, "rdx", crate::stdio::scanf::vsscanf);
     variadic_stub!(__isoc99_fscanf, 2, "rdx", crate::stdio::scanf::vfscanf);
     variadic_stub!(__isoc99_scanf, 1, "rsi", crate::stdio::scanf::vscanf);

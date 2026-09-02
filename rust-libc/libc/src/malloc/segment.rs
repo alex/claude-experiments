@@ -22,7 +22,7 @@ use crate::sys::{
     self, MAP_ANONYMOUS, MAP_NORESERVE, MAP_PRIVATE, PAGE_SIZE, PROT_READ, PROT_WRITE,
 };
 use core::ptr;
-use core::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicU8, AtomicU64, AtomicUsize, Ordering};
 
 /// Size of one unit.
 pub const UNIT_SIZE: usize = 256 * 1024;
@@ -209,7 +209,7 @@ fn take_cached(len: usize) -> Option<(*mut u8, usize)> {
     let mut best: Option<usize> = None;
     for i in 0..cache.count {
         let l = cache.entries[i].1;
-        if l >= len && l <= 2 * len && best.is_none_or(|b| l < cache.entries[b].1) {
+        if l >= len && l / 2 <= len && best.is_none_or(|b| l < cache.entries[b].1) {
             best = Some(i);
         }
     }
@@ -267,6 +267,11 @@ fn new_segment() -> Option<*mut Segment> {
             ptr::addr_of_mut!((*seg).span_of[i]).write(AtomicU8::new(0));
             ptr::addr_of_mut!((*seg).spans[i]).write(Span::EMPTY);
         }
+    }
+    if !register(seg as usize) {
+        // SAFETY: our own fresh mapping, not yet linked anywhere.
+        let _ = unsafe { sys::munmap(seg as *mut u8, SEGMENT_SIZE) };
+        return None;
     }
     Some(seg)
 }
@@ -382,6 +387,7 @@ pub unsafe fn release_span(span: *mut Span) {
                 link = ptr::addr_of_mut!((**link).next);
             }
             *link = (*seg).next;
+            unregister(seg as usize);
             let _ = sys::munmap(seg as *mut u8, SEGMENT_SIZE);
         }
     }
@@ -411,15 +417,19 @@ pub enum Owner {
     Invalid,
 }
 
-/// Classifies `p`. Reading the header is only sound if `p` really came
-/// from this allocator (the header page of a foreign pointer's "segment"
-/// may not be mapped), which is the same contract C's `free` has.
-///
-/// # Safety
-/// `p` must have been returned by this allocator and not yet freed.
-pub unsafe fn lookup(p: *mut u8) -> Owner {
+/// Classifies `p`. The header is only read after the registry confirms
+/// that a live mapping of ours starts there, so a foreign pointer, an
+/// already unmapped block or an interior pointer of a huge block is
+/// `Invalid` rather than a misread header.
+pub fn lookup(p: *mut u8) -> Owner {
     let header = segment_of(p);
-    // SAFETY: caller contract.
+    if !is_registered(header as usize) {
+        return Owner::Invalid;
+    }
+    // SAFETY: the registry says a mapping of ours with a header lives
+    // there; registration happens after the header is written and
+    // unregistration before the mapping is released (both under the
+    // respective locks), and the atomics order those writes.
     unsafe {
         match (*header).magic {
             MAGIC_HUGE => Owner::Huge(header as *mut Header),
@@ -432,6 +442,46 @@ pub unsafe fn lookup(p: *mut u8) -> Owner {
             _ => Owner::Invalid,
         }
     }
+}
+
+// ---------------------------------------------------------------------
+// Registry of live mappings.
+
+/// One bit per possible 16 MiB-aligned mapping base in the 48-bit
+/// address space (2 MiB of `.bss`, of which only the pages for bases in
+/// use are ever touched). [`lookup`] consults it before reading a
+/// header, so a pointer that never came from this allocator, or that
+/// points into the middle of a huge block (whose interior 16 MiB
+/// boundaries hold user data), is reported invalid instead of having its
+/// "header" interpreted.
+const REGISTRY_WORDS: usize = (1 << 48) / SEGMENT_SIZE / 64;
+static REGISTRY: [AtomicU64; REGISTRY_WORDS] = [const { AtomicU64::new(0) }; REGISTRY_WORDS];
+
+fn registry_slot(base: usize) -> Option<(&'static AtomicU64, u64)> {
+    let idx = base / SEGMENT_SIZE;
+    Some((REGISTRY.get(idx / 64)?, 1 << (idx % 64)))
+}
+
+/// Records a new live mapping at `base`. Fails only for addresses above
+/// the 48-bit space, which the kernel does not hand out without a hint.
+fn register(base: usize) -> bool {
+    match registry_slot(base) {
+        Some((word, bit)) => {
+            word.fetch_or(bit, Ordering::Release);
+            true
+        }
+        None => false,
+    }
+}
+
+fn unregister(base: usize) {
+    if let Some((word, bit)) = registry_slot(base) {
+        word.fetch_and(!bit, Ordering::Release);
+    }
+}
+
+fn is_registered(base: usize) -> bool {
+    registry_slot(base).is_some_and(|(word, bit)| word.load(Ordering::Acquire) & bit != 0)
 }
 
 /// Maps a huge block of `size` bytes aligned to `align` (a power of two).
@@ -451,15 +501,21 @@ pub fn alloc_huge(size: usize, align: usize) -> Option<(*mut u8, bool)> {
         None => (map_aligned(len)?, len, true),
     };
     // SAFETY: our mapping; the header fits in the first page.
-    unsafe {
+    let data = unsafe {
         let data = base.add(data_off);
         (base as *mut Header).write(Header {
             magic: MAGIC_HUGE,
             map_len: len,
             data,
         });
-        Some((data, fresh))
+        data
+    };
+    if !register(base as usize) {
+        // SAFETY: our own mapping, not yet handed out.
+        let _ = unsafe { sys::munmap(base, len) };
+        return None;
     }
+    Some((data, fresh))
 }
 
 /// Usable size of the huge block described by `h`.
@@ -492,6 +548,7 @@ pub unsafe fn free_huge(h: *mut Header) {
         (*h).magic = 0;
         len
     };
+    unregister(h as usize);
     if len <= HUGE_CACHE_MAX_LEN {
         let mut cache = HUGE_CACHE.lock();
         if cache.count < HUGE_CACHE_SLOTS {

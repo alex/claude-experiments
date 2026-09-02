@@ -240,7 +240,7 @@ unsafe fn span_collect_remote(span: *mut Span) -> bool {
             if !(*span).is_allocated(idx) {
                 corrupt("double free (remote)");
             }
-            let next = *(p as *const *mut u8);
+            let next = decode(*(p as *const usize), p as usize);
             span_push(span, p, idx);
             p = next;
         }
@@ -476,10 +476,13 @@ pub unsafe fn dealloc(p: *mut u8) {
                     }
                 } else {
                     // Not ours: push on the owner's remote stack.
+                    // Links are encoded like the local list's, so a
+                    // use-after-free write cannot redirect the owner's
+                    // collection at an arbitrary block.
                     let remote = &(*span).remote;
                     let mut head = remote.load(Ordering::Relaxed);
                     loop {
-                        *(p as *mut usize) = head;
+                        *(p as *mut usize) = encode(head as *mut u8, p as usize);
                         match remote.compare_exchange_weak(
                             head,
                             p as usize,
@@ -647,9 +650,11 @@ pub unsafe extern "C" fn malloc_usable_size(p: *mut c_void) -> usize {
 
 /// Locks all allocator-global state (for `fork`).
 pub fn prefork() {
+    // Same order as a thread exiting with a free span: `abandon` holds
+    // ORPHANS while `release_span` takes the pool lock.
+    ORPHANS.raw().lock();
     segment::pool_lock().lock();
     segment::huge_cache_lock().lock();
-    ORPHANS.raw().lock();
 }
 
 /// Unlocks the state taken by [`prefork`].
@@ -659,9 +664,9 @@ pub fn prefork() {
 pub unsafe fn postfork() {
     // SAFETY: caller contract.
     unsafe {
-        ORPHANS.raw().unlock();
         segment::huge_cache_lock().unlock();
         segment::pool_lock().unlock();
+        ORPHANS.raw().unlock();
     }
 }
 

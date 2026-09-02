@@ -144,8 +144,17 @@ impl FileLock {
             return true;
         }
         let real = crate::thread::is_threaded();
-        if real && (!self.raw.try_lock() || self.owner.load(Ordering::Acquire) != 0) {
-            return false;
+        if real {
+            if !self.raw.try_lock() {
+                return false;
+            }
+            if self.owner.load(Ordering::Acquire) != 0 {
+                // Taken without the raw mutex before the process became
+                // multi-threaded.
+                // SAFETY: we just took `raw`.
+                unsafe { self.raw.unlock() };
+                return false;
+            }
         }
         self.owner.store(me, Ordering::Relaxed);
         self.count.set(1);
@@ -153,8 +162,16 @@ impl FileLock {
         true
     }
 
-    /// Resets the lock in a forked child (see `postfork`).
-    fn reset(&self) {
+    /// Fixes up the lock in a forked child (see `postfork`): the
+    /// forking thread's own holds survive with its new tid; a lock held by
+    /// any other thread of the parent is simply released.
+    fn after_fork(&self, old_tid: u32, new_tid: u32) {
+        if self.owner.load(Ordering::Relaxed) == old_tid && self.count.get() > 1 {
+            // One level was `prefork`'s; the rest are the caller's.
+            self.count.set(self.count.get() - 1);
+            self.owner.store(new_tid, Ordering::Relaxed);
+            return;
+        }
         self.count.set(0);
         self.real.set(false);
         self.owner.store(0, Ordering::Relaxed);
@@ -622,6 +639,21 @@ pub unsafe fn lock<'a>(f: *mut File) -> Locked<'a> {
     }
 }
 
+/// Like [`lock`] but gives up if another thread holds the stream.
+///
+/// # Safety
+/// `f` must be a valid open stream.
+pub unsafe fn try_lock<'a>(f: *mut File) -> Option<Locked<'a>> {
+    // SAFETY: as for `lock`.
+    unsafe {
+        if (*f).lock.try_lock() {
+            Some(Locked { file: &mut *f })
+        } else {
+            None
+        }
+    }
+}
+
 // ---------------------------------------------------------------------
 // The standard streams and the open-file list.
 
@@ -718,28 +750,37 @@ unsafe fn unregister(f: *mut File) {
 }
 
 /// Flushes every open output stream. Used by `exit` and `fflush(NULL)`.
-pub fn flush_all() -> c_int {
-    // Snapshot the list under the lock, then flush each stream under its
-    // own lock (a flush may block).
+///
+/// The list lock is held for the whole walk so no stream can be closed
+/// (and freed) underneath it: `fclose` unregisters a stream before
+/// locking it, and registration never happens under a stream lock, so
+/// the only way to wait here is a stream another thread holds while it
+/// opens or closes a file, which glibc's `_IO_flush_all` accepts too.
+/// At `exit`, streams held by other threads (typically one blocked in a
+/// read) are skipped instead of waited for, since those threads never
+/// get to release them.
+pub fn flush_all(at_exit: bool) -> c_int {
     let mut result = 0;
-    let mut f = FILES.lock().0;
+    let list = FILES.lock();
+    let mut f = list.0;
     while !f.is_null() {
-        // SAFETY: streams stay valid while on the list; the list is only
-        // modified under its lock which we re-take for each step.
+        // SAFETY: streams on the list are valid while the list lock is
+        // held.
         unsafe {
-            let mut guard = lock(f);
-            if guard.flush().is_err() {
+            let guard = if at_exit {
+                try_lock(f)
+            } else {
+                Some(lock(f))
+            };
+            if let Some(mut guard) = guard
+                && guard.flush().is_err()
+            {
                 result = EOF;
             }
-            drop(guard);
-            f = FILES
-                .lock()
-                .0
-                .is_null()
-                .then(ptr::null_mut)
-                .unwrap_or((*f).next);
+            f = (*f).next;
         }
     }
+    drop(list);
     result
 }
 
@@ -762,12 +803,14 @@ pub fn prefork() {
 /// # Safety
 /// Must follow [`prefork`] on the same thread.
 pub unsafe fn postfork(child: bool) {
+    let old_tid = crate::thread::tid();
+    let new_tid = if child { sys::gettid() as u32 } else { old_tid };
     let mut f = FILES.lock_unchecked_head();
     while !f.is_null() {
         // SAFETY: as in `prefork`.
         unsafe {
             if child {
-                (*f).lock.reset();
+                (*f).lock.after_fork(old_tid, new_tid);
             } else {
                 (*f).lock.unlock();
             }
@@ -895,7 +938,10 @@ pub unsafe extern "C" fn fdopen(fd: c_int, mode: *const c_char) -> *mut File {
         // SAFETY: F_SETFL takes an int.
         let _ = unsafe { sys::fcntl(fd, sys::F_SETFL, (cur | O_APPEND) as usize) };
     }
-    let _ = oflags;
+    if oflags & sys::O_CLOEXEC != 0 {
+        // SAFETY: F_SETFD takes an int.
+        let _ = unsafe { sys::fcntl(fd, sys::F_SETFD, sys::FD_CLOEXEC as usize) };
+    }
     let f = File::alloc(fd, flags, &FD_OPS, ptr::null_mut());
     if f.is_null() {
         Errno::ENOMEM.set();
@@ -961,12 +1007,12 @@ pub unsafe extern "C" fn freopen(
             }
         }
     } else {
-        if g.fd >= 0 {
-            // SAFETY: the ops are valid for this stream.
-            let _ = unsafe { (g.ops.close)(&mut g) };
-        }
+        // Open first, then move the new descriptor onto the stream's old
+        // number so `fileno` (and anything inherited by children) stays
+        // the same. Memory streams have no descriptor; their cookie is
+        // released.
         // SAFETY: forwarded.
-        let fd = match unsafe {
+        let newfd = match unsafe {
             sys::openat(
                 sys::AT_FDCWD,
                 path as *const u8,
@@ -976,12 +1022,34 @@ pub unsafe extern "C" fn freopen(
         } {
             Ok(fd) => fd,
             Err(e) => {
+                if g.fd >= 0 {
+                    // SAFETY: the ops are valid for this stream.
+                    let _ = unsafe { (g.ops.close)(&mut g) };
+                }
                 g.fd = -1;
                 e.set();
                 return ptr::null_mut();
             }
         };
-        g.fd = fd;
+        if g.fd >= 0 && newfd != g.fd {
+            // SAFETY: both descriptors are ours.
+            let r = unsafe {
+                crate::arch::syscall3(crate::arch::nr::DUP3, newfd as usize, g.fd as usize, 0)
+            };
+            let _ = sys::close(newfd);
+            if let Err(e) = sys::check(r) {
+                let _ = sys::close(g.fd);
+                g.fd = -1;
+                e.set();
+                return ptr::null_mut();
+            }
+        } else {
+            if g.fd < 0 {
+                // SAFETY: the ops are valid for this stream.
+                let _ = unsafe { (g.ops.close)(&mut g) };
+            }
+            g.fd = newfd;
+        }
     }
     g.flags = (g.flags & (F_STATIC | F_OWN_BUF)) | flags;
     g.mode = MODE_IDLE;
@@ -998,6 +1066,10 @@ pub unsafe extern "C" fn freopen(
 /// `f` must be a valid open stream, not used afterwards.
 #[cfg_attr(not(test), unsafe(no_mangle))]
 pub unsafe extern "C" fn fclose(f: *mut File) -> c_int {
+    // Leave the list first so `flush_all`, which walks it under the list
+    // lock, can never reach a stream that is being freed.
+    // SAFETY: forwarded.
+    unsafe { unregister(f) };
     // SAFETY: forwarded.
     let mut g = unsafe { lock(f) };
     let mut result = if g.flush().is_err() { EOF } else { 0 };
@@ -1009,9 +1081,8 @@ pub unsafe extern "C" fn fclose(f: *mut File) -> c_int {
     let flags = g.flags;
     let base = g.base;
     drop(g);
-    // SAFETY: the stream is on the list and nobody else may use it now.
+    // SAFETY: nobody else may use the stream now.
     unsafe {
-        unregister(f);
         if flags & F_OWN_BUF != 0 {
             malloc::dealloc(base);
         }
@@ -1032,7 +1103,7 @@ pub unsafe extern "C" fn fclose(f: *mut File) -> c_int {
 #[cfg_attr(not(test), unsafe(no_mangle))]
 pub unsafe extern "C" fn fflush(f: *mut File) -> c_int {
     if f.is_null() {
-        return flush_all();
+        return flush_all(false);
     }
     // SAFETY: forwarded.
     let mut g = unsafe { lock(f) };
@@ -1060,7 +1131,13 @@ pub unsafe extern "C" fn setvbuf(
     match mode {
         IOFBF => {}
         IOLBF => g.flags |= F_LINE,
-        IONBF => g.flags |= F_NOBUF,
+        IONBF => {
+            g.flags |= F_NOBUF;
+            // Reads must not pull ahead into the buffer either.
+            if !g.base.is_null() {
+                g.cap = 1;
+            }
+        }
         _ => {
             Errno::EINVAL.set();
             return -1;
@@ -1775,7 +1852,14 @@ unsafe fn mem_write(f: &mut File, data: &[u8]) -> sys::Result<usize> {
         c.size = new_size;
     }
     // SAFETY: fits in the buffer.
-    unsafe { ptr::copy_nonoverlapping(data.as_ptr(), c.buf.add(c.pos), data.len()) };
+    unsafe {
+        if c.pos > c.len {
+            // A seek past the end: the gap reads as zeros, never as
+            // whatever the block held before.
+            ptr::write_bytes(c.buf.add(c.len), 0, c.pos - c.len);
+        }
+        ptr::copy_nonoverlapping(data.as_ptr(), c.buf.add(c.pos), data.len());
+    }
     c.pos = end;
     if c.pos > c.len {
         c.len = c.pos;
@@ -1937,7 +2021,7 @@ pub unsafe extern "C" fn open_memstream(
     }
     // SAFETY: fresh blocks.
     unsafe {
-        *buf = 0;
+        ptr::write_bytes(buf, 0, 64);
         cookie.write(MemCookie {
             buf,
             size: 64,
