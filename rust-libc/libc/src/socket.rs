@@ -3,7 +3,7 @@
 //! The socket calls are thin syscall wrappers. Address conversion
 //! (`inet_pton`/`inet_ntop`) is implemented here. Name resolution is
 //! deliberately minimal: `getaddrinfo` handles numeric addresses,
-//! `localhost` and `/etc/hosts`; there is no DNS resolver.
+//! `localhost`, `/etc/hosts` and then DNS (see `resolv.rs`).
 
 use crate::c_char;
 use crate::errno::{CReturnOr, Errno};
@@ -570,9 +570,11 @@ pub const EAI_SYSTEM: c_int = -11;
 pub const EAI_OVERFLOW: c_int = -12;
 
 /// An address found for a name.
-#[derive(Clone, Copy)]
-enum Addr {
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Addr {
+    /// IPv4, network order.
     V4([u8; 4]),
+    /// IPv6.
     V6([u8; 16]),
 }
 
@@ -616,7 +618,7 @@ fn resolve_service(service: &[u8], numeric_only: bool) -> Result<u16, c_int> {
 }
 
 /// Looks `name` up in `/etc/hosts`, appending matches to `out`.
-fn lookup_hosts(name: &[u8], out: &mut [Option<Addr>; 8], count: &mut usize) {
+fn lookup_hosts(name: &[u8], out: &mut [Option<Addr>], count: &mut usize) {
     // SAFETY: NUL-terminated literals.
     let f = unsafe { crate::stdio::fopen(c"/etc/hosts".as_ptr(), c"re".as_ptr()) };
     if f.is_null() {
@@ -672,6 +674,63 @@ fn lookup_hosts(name: &[u8], out: &mut [Option<Addr>; 8], count: &mut usize) {
     unsafe { crate::stdio::fclose(f) };
 }
 
+/// Finds the first name for `addr` in `/etc/hosts`.
+fn reverse_hosts(addr: Addr, out: &mut [u8; 256]) -> Option<usize> {
+    // SAFETY: NUL-terminated literals.
+    let f = unsafe { crate::stdio::fopen(c"/etc/hosts".as_ptr(), c"re".as_ptr()) };
+    if f.is_null() {
+        return None;
+    }
+    // SAFETY: the stream is open.
+    let mut g = unsafe { crate::stdio::lock(f) };
+    let mut line = [0u8; 512];
+    let mut result = None;
+    'lines: loop {
+        let mut len = 0;
+        let mut eof = false;
+        loop {
+            match g.getc() {
+                Some(b'\n') => break,
+                Some(b) => {
+                    if len < line.len() {
+                        line[len] = b;
+                        len += 1;
+                    }
+                }
+                None => {
+                    eof = true;
+                    break;
+                }
+            }
+        }
+        let l = &line[..len];
+        let l = l.split(|&b| b == b'#').next().unwrap_or(b"");
+        let mut fields = l
+            .split(|b| matches!(b, b' ' | b'\t'))
+            .filter(|f| !f.is_empty());
+        if let Some(a) = fields.next() {
+            let parsed = parse_ipv4(a)
+                .map(Addr::V4)
+                .or_else(|| parse_ipv6(a).map(Addr::V6));
+            if parsed == Some(addr)
+                && let Some(h) = fields.next()
+                && h.len() < out.len()
+            {
+                out[..h.len()].copy_from_slice(h);
+                result = Some(h.len());
+                break 'lines;
+            }
+        }
+        if eof {
+            break;
+        }
+    }
+    drop(g);
+    // SAFETY: the stream is open.
+    unsafe { crate::stdio::fclose(f) };
+    result
+}
+
 /// `getaddrinfo(3)`.
 ///
 /// # Safety
@@ -713,8 +772,9 @@ pub unsafe extern "C" fn getaddrinfo(
         Err(e) => return e,
     };
 
-    let mut addrs: [Option<Addr>; 8] = [None; 8];
+    let mut addrs: [Option<Addr>; 16] = [None; 16];
     let mut count = 0;
+    let mut canon_buf = [0u8; 256];
     let mut canon: &[u8] = b"";
     if node.is_null() {
         if flags & AI_PASSIVE != 0 {
@@ -749,7 +809,23 @@ pub unsafe extern "C" fn getaddrinfo(
         } else {
             lookup_hosts(name, &mut addrs, &mut count);
             if count == 0 {
-                return EAI_NONAME;
+                match crate::resolv::lookup(
+                    name,
+                    family != AF_INET6,
+                    family != AF_INET,
+                    &mut addrs,
+                    &mut canon_buf,
+                ) {
+                    Ok((n, clen)) => {
+                        count = n;
+                        if clen > 0 {
+                            canon = &canon_buf[..clen];
+                        }
+                    }
+                    Err(crate::resolv::Error::NoName) => return EAI_NONAME,
+                    Err(crate::resolv::Error::Again) => return EAI_AGAIN,
+                    Err(crate::resolv::Error::Fail) => return EAI_FAIL,
+                }
             }
         }
     }
@@ -889,46 +965,65 @@ pub unsafe extern "C" fn getnameinfo(
     hostlen: Socklen,
     serv: *mut c_char,
     servlen: Socklen,
-    _flags: c_int,
+    flags: c_int,
 ) -> c_int {
+    const NI_NUMERICHOST: c_int = 1;
+    const NI_NOFQDN: c_int = 4;
+    const NI_NAMEREQD: c_int = 8;
     if sa.is_null() || salen < 2 {
         return EAI_FAMILY;
     }
     // SAFETY: caller contract.
     let family = unsafe { *(sa as *const u16) } as c_int;
-    let (port, ok) = match family {
+    let (port, addr) = match family {
         AF_INET if salen as usize >= core::mem::size_of::<SockaddrIn>() => {
             // SAFETY: caller contract.
             let a = unsafe { *(sa as *const SockaddrIn) };
-            if !host.is_null() && hostlen > 0 {
-                // SAFETY: caller contract.
-                let out =
-                    unsafe { core::slice::from_raw_parts_mut(host as *mut u8, hostlen as usize) };
-                match format_ipv4(a.sin_addr, out) {
-                    Some(n) => out[n] = 0,
-                    None => return EAI_OVERFLOW,
-                }
-            }
-            (u16::from_be(a.sin_port), true)
+            (u16::from_be(a.sin_port), Addr::V4(a.sin_addr))
         }
         AF_INET6 if salen as usize >= core::mem::size_of::<SockaddrIn6>() => {
             // SAFETY: caller contract.
             let a = unsafe { *(sa as *const SockaddrIn6) };
-            if !host.is_null() && hostlen > 0 {
-                // SAFETY: caller contract.
-                let out =
-                    unsafe { core::slice::from_raw_parts_mut(host as *mut u8, hostlen as usize) };
-                match format_ipv6(a.sin6_addr, out) {
-                    Some(n) => out[n] = 0,
-                    None => return EAI_OVERFLOW,
-                }
-            }
-            (u16::from_be(a.sin6_port), true)
+            (u16::from_be(a.sin6_port), Addr::V6(a.sin6_addr))
         }
-        _ => (0, false),
+        _ => return EAI_FAMILY,
     };
-    if !ok {
-        return EAI_FAMILY;
+    if !host.is_null() && hostlen > 0 {
+        // SAFETY: caller contract.
+        let out = unsafe { core::slice::from_raw_parts_mut(host as *mut u8, hostlen as usize) };
+        let mut name = [0u8; 256];
+        let named = if flags & NI_NUMERICHOST != 0 {
+            0
+        } else {
+            reverse_hosts(addr, &mut name)
+                .or_else(|| crate::resolv::reverse(addr, &mut name).ok())
+                .unwrap_or(0)
+        };
+        if named > 0 {
+            let mut n = named;
+            if flags & NI_NOFQDN != 0
+                && let Some(dot) = name[..n].iter().position(|&b| b == b'.')
+            {
+                n = dot;
+            }
+            if n + 1 > out.len() {
+                return EAI_OVERFLOW;
+            }
+            out[..n].copy_from_slice(&name[..n]);
+            out[n] = 0;
+        } else {
+            if flags & NI_NAMEREQD != 0 {
+                return EAI_NONAME;
+            }
+            let formatted = match addr {
+                Addr::V4(a) => format_ipv4(a, out),
+                Addr::V6(a) => format_ipv6(a, out),
+            };
+            match formatted {
+                Some(n) => out[n] = 0,
+                None => return EAI_OVERFLOW,
+            }
+        }
     }
     if !serv.is_null() && servlen > 0 {
         // SAFETY: caller contract.
@@ -959,7 +1054,7 @@ struct HostentStatic {
     ent: Hostent,
     name: [u8; 256],
     aliases: [*mut c_char; 1],
-    addrs: [[u8; 4]; 8],
+    addrs: [[u8; 16]; 8],
     list: [*mut c_char; 9],
 }
 // SAFETY: guarded by the mutex.
@@ -974,7 +1069,7 @@ static HOSTENT: crate::sync::Mutex<HostentStatic> = crate::sync::Mutex::new(Host
     },
     name: [0; 256],
     aliases: [ptr::null_mut(); 1],
-    addrs: [[0; 4]; 8],
+    addrs: [[0; 16]; 8],
     list: [ptr::null_mut(); 9],
 });
 
@@ -983,29 +1078,11 @@ static HOSTENT: crate::sync::Mutex<HostentStatic> = crate::sync::Mutex::new(Host
 #[allow(non_upper_case_globals)]
 pub static mut h_errno: c_int = 0;
 
-/// `gethostbyname(3)` (IPv4 only, static result).
+/// Fills the static `hostent` from an address list.
 ///
 /// # Safety
-/// `name` must be NUL-terminated.
-#[cfg_attr(not(test), unsafe(no_mangle))]
-pub unsafe extern "C" fn gethostbyname(name: *const c_char) -> *mut Hostent {
-    let hints = AddrInfo {
-        ai_flags: 0,
-        ai_family: AF_INET,
-        ai_socktype: SOCK_STREAM,
-        ai_protocol: 0,
-        ai_addrlen: 0,
-        ai_addr: ptr::null_mut(),
-        ai_canonname: ptr::null_mut(),
-        ai_next: ptr::null_mut(),
-    };
-    let mut res: *mut AddrInfo = ptr::null_mut();
-    // SAFETY: forwarded.
-    if unsafe { getaddrinfo(name, ptr::null(), &hints, &mut res) } != 0 {
-        // SAFETY: single global.
-        unsafe { h_errno = 1 }; // HOST_NOT_FOUND
-        return ptr::null_mut();
-    }
+/// `name` must be NUL-terminated; `res` a list from `getaddrinfo`.
+unsafe fn fill_hostent(name: *const c_char, family: c_int, res: *mut AddrInfo) -> *mut Hostent {
     let mut s = HOSTENT.lock();
     let s = &mut *s;
     // SAFETY: caller contract.
@@ -1018,13 +1095,18 @@ pub unsafe extern "C" fn gethostbyname(name: *const c_char) -> *mut Hostent {
     while !p.is_null() && count < 8 {
         // SAFETY: entries from getaddrinfo.
         unsafe {
-            s.addrs[count] = (*((*p).ai_addr as *const SockaddrIn)).sin_addr;
+            if (*p).ai_family == family {
+                if family == AF_INET {
+                    s.addrs[count][..4]
+                        .copy_from_slice(&(*((*p).ai_addr as *const SockaddrIn)).sin_addr);
+                } else {
+                    s.addrs[count] = (*((*p).ai_addr as *const SockaddrIn6)).sin6_addr;
+                }
+                count += 1;
+            }
             p = (*p).ai_next;
         }
-        count += 1;
     }
-    // SAFETY: the list is ours.
-    unsafe { freeaddrinfo(res) };
     for i in 0..count {
         s.list[i] = s.addrs[i].as_mut_ptr() as *mut c_char;
     }
@@ -1033,11 +1115,137 @@ pub unsafe extern "C" fn gethostbyname(name: *const c_char) -> *mut Hostent {
     s.ent = Hostent {
         h_name: s.name.as_mut_ptr() as *mut c_char,
         h_aliases: s.aliases.as_mut_ptr(),
-        h_addrtype: AF_INET,
-        h_length: 4,
+        h_addrtype: family,
+        h_length: if family == AF_INET { 4 } else { 16 },
         h_addr_list: s.list.as_mut_ptr(),
     };
     &mut s.ent
+}
+
+/// Maps a `getaddrinfo` error to `h_errno`.
+fn set_h_errno(code: c_int) {
+    let v = match code {
+        EAI_AGAIN => 2,  // TRY_AGAIN
+        EAI_FAIL => 3,   // NO_RECOVERY
+        EAI_NONAME => 1, // HOST_NOT_FOUND
+        _ => 3,
+    };
+    // SAFETY: single global.
+    unsafe { h_errno = v };
+}
+
+/// `gethostbyname2(3)`.
+///
+/// # Safety
+/// `name` must be NUL-terminated.
+#[cfg_attr(not(test), unsafe(no_mangle))]
+pub unsafe extern "C" fn gethostbyname2(name: *const c_char, family: c_int) -> *mut Hostent {
+    if family != AF_INET && family != AF_INET6 {
+        set_h_errno(EAI_FAIL);
+        return ptr::null_mut();
+    }
+    let hints = AddrInfo {
+        ai_flags: AI_CANONNAME,
+        ai_family: family,
+        ai_socktype: SOCK_STREAM,
+        ai_protocol: 0,
+        ai_addrlen: 0,
+        ai_addr: ptr::null_mut(),
+        ai_canonname: ptr::null_mut(),
+        ai_next: ptr::null_mut(),
+    };
+    let mut res: *mut AddrInfo = ptr::null_mut();
+    // SAFETY: forwarded.
+    let r = unsafe { getaddrinfo(name, ptr::null(), &hints, &mut res) };
+    if r != 0 {
+        set_h_errno(r);
+        return ptr::null_mut();
+    }
+    // SAFETY: the list is ours; the canonical name is NUL-terminated.
+    let canon = unsafe { (*res).ai_canonname };
+    // SAFETY: forwarded.
+    let ent = unsafe { fill_hostent(if canon.is_null() { name } else { canon }, family, res) };
+    // SAFETY: the list is ours.
+    unsafe { freeaddrinfo(res) };
+    ent
+}
+
+/// `gethostbyname(3)`.
+///
+/// # Safety
+/// `name` must be NUL-terminated.
+#[cfg_attr(not(test), unsafe(no_mangle))]
+pub unsafe extern "C" fn gethostbyname(name: *const c_char) -> *mut Hostent {
+    // SAFETY: forwarded.
+    unsafe { gethostbyname2(name, AF_INET) }
+}
+
+/// `gethostbyaddr(3)`.
+///
+/// # Safety
+/// `addr` must be valid for `len` bytes.
+#[cfg_attr(not(test), unsafe(no_mangle))]
+pub unsafe extern "C" fn gethostbyaddr(
+    addr: *const c_void,
+    len: Socklen,
+    family: c_int,
+) -> *mut Hostent {
+    let a = match (family, len) {
+        (AF_INET, 4) => {
+            // SAFETY: caller contract.
+            Addr::V4(unsafe { *(addr as *const [u8; 4]) })
+        }
+        (AF_INET6, 16) => {
+            // SAFETY: caller contract.
+            Addr::V6(unsafe { *(addr as *const [u8; 16]) })
+        }
+        _ => {
+            set_h_errno(EAI_FAIL);
+            return ptr::null_mut();
+        }
+    };
+    let mut name = [0u8; 256];
+    let n = match reverse_hosts(a, &mut name).or_else(|| crate::resolv::reverse(a, &mut name).ok())
+    {
+        Some(n) => n,
+        None => {
+            set_h_errno(EAI_NONAME);
+            return ptr::null_mut();
+        }
+    };
+    let mut s = HOSTENT.lock();
+    let s = &mut *s;
+    s.name[..n].copy_from_slice(&name[..n]);
+    s.name[n] = 0;
+    s.addrs[0] = [0; 16];
+    match a {
+        Addr::V4(v) => s.addrs[0][..4].copy_from_slice(&v),
+        Addr::V6(v) => s.addrs[0] = v,
+    }
+    s.list[0] = s.addrs[0].as_mut_ptr() as *mut c_char;
+    s.list[1] = ptr::null_mut();
+    s.aliases[0] = ptr::null_mut();
+    s.ent = Hostent {
+        h_name: s.name.as_mut_ptr() as *mut c_char,
+        h_aliases: s.aliases.as_mut_ptr(),
+        h_addrtype: family,
+        h_length: len as c_int,
+        h_addr_list: s.list.as_mut_ptr(),
+    };
+    &mut s.ent
+}
+
+/// `hstrerror(3)`.
+#[cfg_attr(not(test), unsafe(no_mangle))]
+pub extern "C" fn hstrerror(err: c_int) -> *const c_char {
+    match err {
+        0 => c"Resolver Error 0 (no error)".as_ptr(),
+        1 => c"Unknown host".as_ptr(),
+        2 => c"Host name lookup failure".as_ptr(),
+        3 => c"Unknown server error".as_ptr(),
+        4 => c"No address associated with name".as_ptr(),
+        _ => c"Unknown resolver error".as_ptr(),
+    }
 }
 
 /// Timespec is used by callers of `select`-style APIs in `poll.rs`.

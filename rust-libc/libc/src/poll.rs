@@ -9,6 +9,7 @@ use crate::arch::nr;
 
 /// `struct pollfd`.
 #[repr(C)]
+#[derive(Clone, Copy)]
 pub struct PollFd {
     /// Descriptor.
     pub fd: c_int,

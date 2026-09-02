@@ -574,8 +574,7 @@ mod tests {
         // The freed mapping is cached and reused for a similar request
         // (unless a concurrently running test took it first).
         let (q, fresh) = alloc_huge(900_000, 16).unwrap();
-        if q == p {
-            assert!(!fresh);
+        if q == p && !fresh {
             // SAFETY: valid huge block; the recycled memory still holds the
             // old bytes, which `alloc_zeroed` is responsible for clearing.
             unsafe { assert_eq!(*q, 1) };

@@ -70,6 +70,10 @@ void freeaddrinfo(struct addrinfo *);
 const char *gai_strerror(int);
 int getnameinfo(const struct sockaddr *__RESTRICT, socklen_t, char *__RESTRICT, socklen_t, char *__RESTRICT, socklen_t, int);
 struct hostent *gethostbyname(const char *);
+struct hostent *gethostbyname2(const char *, int);
+struct hostent *gethostbyaddr(const void *, socklen_t, int);
+const char *hstrerror(int);
+int res_init(void);
 __END_DECLS
 
 #endif

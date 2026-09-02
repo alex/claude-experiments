@@ -45,6 +45,7 @@ pub mod misc;
 pub mod poll;
 pub mod process;
 pub mod pwd;
+pub mod resolv;
 pub mod search;
 pub mod signal;
 pub mod socket;
