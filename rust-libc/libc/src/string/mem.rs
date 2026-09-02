@@ -3,16 +3,21 @@
 //! Strategy (x86_64):
 //!
 //! * up to 64 bytes: branch on size and use a couple of overlapping
-//!   unaligned loads/stores, no loops;
-//! * medium sizes: 64-byte SSE2 iterations with an overlapping tail;
+//!   unaligned SSE2 loads/stores, no loops, no dispatch;
+//! * 65 to 256 bytes: two, four or eight vectors (16 or 32 bytes wide,
+//!   see [`lanes`](crate::string::lanes); 64-byte stores are avoided
+//!   because they cannot forward to the narrower loads that typically
+//!   follow a copy), all loaded before any is stored, so the same code
+//!   serves overlapping `memmove`; only SSE2 needs a loop for the upper
+//!   part of this range;
 //! * large copies/fills: `rep movsb` / `rep stosb`, which on every CPU with
 //!   ERMS (2013+) is the fastest option and does not pollute the cache
-//!   with vector stores.
-//!
-//! All loads happen before all stores in the small-size paths, which makes
-//! them usable for overlapping `memmove` as well.
+//!   with vector stores. Overlapping `memmove`s of nearby buffers, where
+//!   `rep movsb` is slow, use four-vector iterations instead.
 
+use crate::string::lanes::Lanes;
 use crate::string::search;
+use crate::string::simd::dispatch_fn_ymm;
 use core::arch::asm;
 use core::arch::x86_64::{__m128i, _mm_loadu_si128, _mm_set1_epi8, _mm_storeu_si128};
 use core::ffi::{c_int, c_void};
@@ -77,67 +82,280 @@ unsafe fn copy_small(dst: *mut u8, src: *const u8, n: usize) {
     }
 }
 
-/// Forward copy of `n > 64` bytes for non-overlapping (or `dst < src`)
-/// buffers.
+/// Copies `L::N < n <= 8 * L::N` bytes with two, four or eight vectors.
+/// Loads everything before storing, so the buffers may overlap.
+///
+/// # Safety
+/// Both pointers must be valid for `n` bytes.
+#[inline(always)]
+unsafe fn copy_vec<L: Lanes>(dst: *mut u8, src: *const u8, n: usize) {
+    let v = L::N;
+    // SAFETY: every access below stays inside `[0, n)` of both buffers.
+    unsafe {
+        if n <= 2 * v {
+            let a = L::load(src);
+            let b = L::load(src.add(n - v));
+            a.store(dst);
+            b.store(dst.add(n - v));
+        } else if n <= 4 * v {
+            let a = L::load(src);
+            let b = L::load(src.add(v));
+            let c = L::load(src.add(n - 2 * v));
+            let d = L::load(src.add(n - v));
+            a.store(dst);
+            b.store(dst.add(v));
+            c.store(dst.add(n - 2 * v));
+            d.store(dst.add(n - v));
+        } else {
+            let a = L::load(src);
+            let b = L::load(src.add(v));
+            let c = L::load(src.add(2 * v));
+            let d = L::load(src.add(3 * v));
+            let e = L::load(src.add(n - 4 * v));
+            let f = L::load(src.add(n - 3 * v));
+            let g = L::load(src.add(n - 2 * v));
+            let h = L::load(src.add(n - v));
+            a.store(dst);
+            b.store(dst.add(v));
+            c.store(dst.add(2 * v));
+            d.store(dst.add(3 * v));
+            e.store(dst.add(n - 4 * v));
+            f.store(dst.add(n - 3 * v));
+            g.store(dst.add(n - 2 * v));
+            h.store(dst.add(n - v));
+        }
+    }
+}
+
+/// Copies the remainder of a loop: `n <= 4 * L::N` bytes.
+///
+/// # Safety
+/// Both pointers must be valid for `n` bytes.
+#[inline(always)]
+unsafe fn copy_rem<L: Lanes>(dst: *mut u8, src: *const u8, n: usize) {
+    // SAFETY: forwarded; `copy_small` covers up to 64 bytes and `L::N`
+    // is at most 64.
+    unsafe {
+        if n > L::N {
+            copy_vec::<L>(dst, src, n);
+        } else if n > 0 {
+            copy_small(dst, src, n);
+        }
+    }
+}
+
+/// Forward copy of `n > L::N` bytes, four vectors per iteration; correct
+/// when `dst` is below `src` or the buffers do not overlap.
+///
+/// The loop's stores are aligned to the vector size (so none straddles a
+/// cache line): the first vector is loaded up front and stored last,
+/// and the loop starts at the next aligned destination address.
 ///
 /// # Safety
 /// Both pointers must be valid for `n` bytes; if they overlap, `dst` must
 /// be below `src`.
 #[inline(always)]
-unsafe fn copy_forward(dst: *mut u8, src: *const u8, n: usize) {
+unsafe fn copy_forward<L: Lanes>(dst: *mut u8, src: *const u8, n: usize) {
+    let v = L::N;
     // SAFETY: bounds are maintained by the loop condition; the remainder
     // is copied from where the loop stopped, which the loop's stores cannot
-    // have touched (they all lie below `dst + i <= src + i`).
+    // have touched (they all lie below `dst + i <= src + i`). The head is
+    // loaded before any store and stored after every other load.
     unsafe {
-        // `rep movsb` handles overlapping buffers correctly as long as the
-        // copy direction is forward, but it is slow when the distance is
-        // smaller than a cache line, so keep those on the vector loop.
-        if n >= REP_THRESHOLD && (src as usize).wrapping_sub(dst as usize) >= 64 {
-            asm!("rep movsb", inout("rcx") n => _, inout("rdi") dst => _, inout("rsi") src => _,
-                 options(nostack, preserves_flags));
-            return;
+        let head = L::load(src);
+        let mut i = (dst as usize).wrapping_neg() & (v - 1);
+        while i + 4 * v <= n {
+            let a = L::load(src.add(i));
+            let b = L::load(src.add(i + v));
+            let c = L::load(src.add(i + 2 * v));
+            let d = L::load(src.add(i + 3 * v));
+            a.store(dst.add(i));
+            b.store(dst.add(i + v));
+            c.store(dst.add(i + 2 * v));
+            d.store(dst.add(i + 3 * v));
+            i += 4 * v;
         }
-        let mut i = 0;
-        while i + 64 <= n {
-            let a = load16(src.add(i));
-            let b = load16(src.add(i + 16));
-            let c = load16(src.add(i + 32));
-            let d = load16(src.add(i + 48));
-            store16(dst.add(i), a);
-            store16(dst.add(i + 16), b);
-            store16(dst.add(i + 32), c);
-            store16(dst.add(i + 48), d);
-            i += 64;
-        }
-        if i < n {
-            copy_small(dst.add(i), src.add(i), n - i);
-        }
+        copy_rem::<L>(dst.add(i), src.add(i), n - i);
+        head.store(dst);
     }
 }
 
-/// Backward copy of `n > 64` bytes for overlapping buffers with `dst > src`.
+/// Backward copy of `n > L::N` bytes for overlapping buffers with
+/// `dst > src`, with the loop's stores aligned as in [`copy_forward`]
+/// (here the last vector is loaded first and stored last).
 ///
 /// # Safety
 /// Both pointers must be valid for `n` bytes.
 #[inline(always)]
-unsafe fn copy_backward(dst: *mut u8, src: *const u8, n: usize) {
+unsafe fn copy_backward<L: Lanes>(dst: *mut u8, src: *const u8, n: usize) {
+    let v = L::N;
     // SAFETY: bounds are maintained by the loop condition; the head block
-    // is copied last (loads before stores) so overlap is harmless.
+    // is copied last, and the loop's stores all lie above `src + end`.
+    // The tail is loaded before any store and stored after every load.
     unsafe {
-        let mut end = n;
-        while end >= 64 {
-            end -= 64;
-            let a = load16(src.add(end));
-            let b = load16(src.add(end + 16));
-            let c = load16(src.add(end + 32));
-            let d = load16(src.add(end + 48));
-            store16(dst.add(end), a);
-            store16(dst.add(end + 16), b);
-            store16(dst.add(end + 32), c);
-            store16(dst.add(end + 48), d);
+        let tail = L::load(src.add(n - v));
+        let mut end = n - ((dst as usize + n) & (v - 1));
+        while end >= 4 * v {
+            end -= 4 * v;
+            let a = L::load(src.add(end));
+            let b = L::load(src.add(end + v));
+            let c = L::load(src.add(end + 2 * v));
+            let d = L::load(src.add(end + 3 * v));
+            a.store(dst.add(end));
+            b.store(dst.add(end + v));
+            c.store(dst.add(end + 2 * v));
+            d.store(dst.add(end + 3 * v));
         }
-        if end > 0 {
-            copy_small(dst, src, end);
+        copy_rem::<L>(dst, src, end);
+        tail.store(dst.add(n - v));
+    }
+}
+
+/// Copies `64 < n <= 256` bytes.
+///
+/// # Safety
+/// Both pointers must be valid for `n` bytes; if they overlap, `dst` must
+/// be below `src` unless `n <= 8 * L::N`.
+#[inline(always)]
+unsafe fn copy_mid<L: Lanes>(dst: *mut u8, src: *const u8, n: usize) {
+    // SAFETY: forwarded.
+    unsafe {
+        if n <= 8 * L::N {
+            copy_vec::<L>(dst, src, n);
+        } else {
+            copy_forward::<L>(dst, src, n);
+        }
+    }
+}
+
+/// Copies `64 < n <= 256` possibly overlapping bytes.
+///
+/// # Safety
+/// Both pointers must be valid for `n` bytes.
+#[inline(always)]
+unsafe fn move_mid<L: Lanes>(dst: *mut u8, src: *const u8, n: usize) {
+    // SAFETY: forwarded; direction chosen by overlap.
+    unsafe {
+        if n <= 8 * L::N {
+            copy_vec::<L>(dst, src, n);
+        } else if forward_ok(dst, src, n) {
+            copy_forward::<L>(dst, src, n);
+        } else {
+            copy_backward::<L>(dst, src, n);
+        }
+    }
+}
+
+dispatch_fn_ymm! {
+    /// [`copy_mid`] for the detected level.
+    ///
+    /// # Safety
+    /// As for [`copy_mid`].
+    unsafe fn copy_mid_any(dst: *mut u8, src: *const u8, n: usize) -> () = copy_mid;
+}
+
+dispatch_fn_ymm! {
+    /// [`move_mid`] for the detected level.
+    ///
+    /// # Safety
+    /// As for [`move_mid`].
+    unsafe fn move_mid_any(dst: *mut u8, src: *const u8, n: usize) -> () = move_mid;
+}
+
+dispatch_fn_ymm! {
+    /// [`copy_forward`] for the detected level.
+    ///
+    /// # Safety
+    /// As for [`copy_forward`].
+    unsafe fn copy_forward_any(dst: *mut u8, src: *const u8, n: usize) -> () = copy_forward;
+}
+
+dispatch_fn_ymm! {
+    /// [`copy_backward`] for the detected level.
+    ///
+    /// # Safety
+    /// As for [`copy_backward`].
+    unsafe fn copy_backward_any(dst: *mut u8, src: *const u8, n: usize) -> () = copy_backward;
+}
+
+dispatch_fn_ymm! {
+    /// [`set_mid`] for the detected level.
+    ///
+    /// # Safety
+    /// As for [`set_mid`].
+    unsafe fn set_mid_any(dst: *mut u8, b: u8, n: usize) -> () = set_mid;
+}
+
+/// True if a forward copy is correct: `dst` is below `src`, or the buffers
+/// do not overlap.
+#[inline(always)]
+fn forward_ok(dst: *mut u8, src: *const u8, n: usize) -> bool {
+    (dst as usize).wrapping_sub(src as usize) >= n
+}
+
+/// True if a forward copy from `src` to `dst` may use `rep movsb`: it
+/// handles overlapping buffers correctly as long as the copy direction is
+/// forward, but is slow when the distance is smaller than a cache line.
+#[inline(always)]
+fn rep_ok(dst: *mut u8, src: *const u8) -> bool {
+    (src as usize).wrapping_sub(dst as usize) >= 64
+}
+
+/// Forward copy with `rep movsb`.
+///
+/// # Safety
+/// Both pointers must be valid for `n` bytes; if they overlap, `dst` must
+/// be below `src`.
+#[inline(always)]
+unsafe fn rep_movsb(dst: *mut u8, src: *const u8, n: usize) {
+    // SAFETY: caller contract.
+    unsafe {
+        asm!("rep movsb", inout("rcx") n => _, inout("rdi") dst => _, inout("rsi") src => _,
+             options(nostack, preserves_flags));
+    }
+}
+
+/// Fills `64 < n <= 256` bytes.
+///
+/// # Safety
+/// `dst` must be valid for `n` bytes.
+#[inline(always)]
+unsafe fn set_mid<L: Lanes>(dst: *mut u8, b: u8, n: usize) {
+    let v = L::N;
+    let x = L::splat(b);
+    // SAFETY: every store stays inside `[0, n)`.
+    unsafe {
+        if n <= 2 * v {
+            x.store(dst);
+            x.store(dst.add(n - v));
+        } else if n <= 4 * v {
+            x.store(dst);
+            x.store(dst.add(v));
+            x.store(dst.add(n - 2 * v));
+            x.store(dst.add(n - v));
+        } else if n <= 8 * v {
+            x.store(dst);
+            x.store(dst.add(v));
+            x.store(dst.add(2 * v));
+            x.store(dst.add(3 * v));
+            x.store(dst.add(n - 4 * v));
+            x.store(dst.add(n - 3 * v));
+            x.store(dst.add(n - 2 * v));
+            x.store(dst.add(n - v));
+        } else {
+            // Only reached with 16-byte vectors.
+            let mut i = 0;
+            while i + 4 * v <= n {
+                x.store(dst.add(i));
+                x.store(dst.add(i + v));
+                x.store(dst.add(i + 2 * v));
+                x.store(dst.add(i + 3 * v));
+                i += 4 * v;
+            }
+            x.store(dst.add(n - 4 * v));
+            x.store(dst.add(n - 3 * v));
+            x.store(dst.add(n - 2 * v));
+            x.store(dst.add(n - v));
         }
     }
 }
@@ -153,8 +371,12 @@ pub unsafe extern "C" fn memcpy(dst: *mut c_void, src: *const c_void, n: usize) 
     unsafe {
         if n <= 64 {
             copy_small(d, s, n);
+        } else if n <= REP_THRESHOLD {
+            copy_mid_any(d, s, n);
+        } else if rep_ok(d, s) {
+            rep_movsb(d, s, n);
         } else {
-            copy_forward(d, s, n);
+            copy_forward_any(d, s, n);
         }
     }
     dst
@@ -171,11 +393,16 @@ pub unsafe extern "C" fn memmove(dst: *mut c_void, src: *const c_void, n: usize)
     unsafe {
         if n <= 64 {
             copy_small(d, s, n);
-        } else if (d as usize).wrapping_sub(s as usize) >= n {
-            // dst is below src, or the buffers do not overlap.
-            copy_forward(d, s, n);
+        } else if n <= REP_THRESHOLD {
+            move_mid_any(d, s, n);
+        } else if forward_ok(d, s, n) {
+            if rep_ok(d, s) {
+                rep_movsb(d, s, n);
+            } else {
+                copy_forward_any(d, s, n);
+            }
         } else {
-            copy_backward(d, s, n);
+            copy_backward_any(d, s, n);
         }
     }
     dst
@@ -196,15 +423,13 @@ pub unsafe extern "C" fn memset(dst: *mut c_void, c: c_int, n: usize) -> *mut c_
             if n <= 32 {
                 store16(d, v);
                 store16(d.add(n - 16), v);
-            } else if n < REP_THRESHOLD {
-                let mut i = 0;
-                while i + 32 <= n {
-                    store16(d.add(i), v);
-                    store16(d.add(i + 16), v);
-                    i += 32;
-                }
+            } else if n <= 64 {
+                store16(d, v);
+                store16(d.add(16), v);
                 store16(d.add(n - 32), v);
                 store16(d.add(n - 16), v);
+            } else if n <= REP_THRESHOLD {
+                set_mid_any(d, b, n);
             } else {
                 asm!("rep stosb", inout("rcx") n => _, inout("rdi") d => _, in("al") b,
                      options(nostack, preserves_flags));
@@ -261,11 +486,7 @@ pub unsafe extern "C" fn bcmp(a: *const c_void, b: *const c_void, n: usize) -> c
 #[cfg_attr(not(test), unsafe(no_mangle))]
 pub unsafe extern "C" fn memchr(s: *const c_void, c: c_int, n: usize) -> *mut c_void {
     // SAFETY: forwarded from the caller.
-    let hay = unsafe { slice::from_raw_parts(s as *const u8, n) };
-    match search::memchr(hay, c as u8) {
-        Some(i) => hay[i..].as_ptr() as *mut c_void,
-        None => ptr::null_mut(),
-    }
+    unsafe { search::memchr_ptr(s as *const u8, c as u8, n) as *mut c_void }
 }
 
 /// `memrchr(3)`.
@@ -277,7 +498,8 @@ pub unsafe extern "C" fn memrchr(s: *const c_void, c: c_int, n: usize) -> *mut c
     // SAFETY: forwarded from the caller.
     let hay = unsafe { slice::from_raw_parts(s as *const u8, n) };
     match search::memrchr(hay, c as u8) {
-        Some(i) => hay[i..].as_ptr() as *mut c_void,
+        // SAFETY: `i < n`.
+        Some(i) => unsafe { (s as *mut u8).add(i) as *mut c_void },
         None => ptr::null_mut(),
     }
 }

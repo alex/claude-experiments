@@ -4,6 +4,7 @@
 //! cargo xtask build      # build libc.a and assemble target/sysroot
 //! cargo xtask test       # build, then compile and run every tests/c/*.c
 //! cargo xtask test NAME  # only tests whose file name contains NAME
+//! cargo xtask bench      # run bench/bench.c against rustlibc and glibc
 //! ```
 //!
 //! Each C test is compiled against the sysroot with `-static -nostdlib`
@@ -287,6 +288,92 @@ fn test(filter: Option<&str>, release: bool) -> ExitCode {
     }
 }
 
+/// Parses the `name\tvalue\tunit` lines the benchmark prints.
+fn parse_bench(out: &str) -> Vec<(String, f64, String)> {
+    out.lines()
+        .filter_map(|l| {
+            let mut it = l.split('\t');
+            let name = it.next()?.to_string();
+            let value = it.next()?.parse().ok()?;
+            let unit = it.next()?.to_string();
+            Some((name, value, unit))
+        })
+        .collect()
+}
+
+fn bench(filter: Option<&str>, release: bool) -> ExitCode {
+    let sysroot = match build(release) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("error: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let root = root();
+    let bindir = root.join("target/bench");
+    fs::create_dir_all(&bindir).unwrap();
+    let src = root.join("bench/bench.c");
+    let ours = bindir.join("bench-rustlibc");
+    let theirs = bindir.join("bench-glibc");
+    let extra = vec!["-fno-builtin".to_string(), "-pthread".to_string()];
+    if !run(&mut compile_cmd(&sysroot, &src, &ours, &extra)) {
+        eprintln!("error: compiling the benchmark against rustlibc failed");
+        return ExitCode::FAILURE;
+    }
+    if !run(Command::new(cc())
+        .args([
+            "-std=gnu11",
+            "-O2",
+            "-static",
+            "-fno-builtin",
+            "-pthread",
+            "-o",
+        ])
+        .arg(&theirs)
+        .arg(&src))
+    {
+        eprintln!("error: compiling the benchmark against glibc failed");
+        return ExitCode::FAILURE;
+    }
+    let mut results = Vec::new();
+    for bin in [&ours, &theirs] {
+        let mut cmd = Command::new(bin);
+        if let Some(f) = filter {
+            cmd.arg(f);
+        }
+        match cmd.output() {
+            Ok(o) if o.status.success() => {
+                results.push(parse_bench(&String::from_utf8_lossy(&o.stdout)))
+            }
+            Ok(o) => {
+                eprintln!(
+                    "error: {} failed: {}",
+                    bin.display(),
+                    String::from_utf8_lossy(&o.stderr)
+                );
+                return ExitCode::FAILURE;
+            }
+            Err(e) => {
+                eprintln!("error: {e}");
+                return ExitCode::FAILURE;
+            }
+        }
+    }
+    println!(
+        "{:<28} {:>12} {:>12} {:>8}",
+        "benchmark", "rustlibc", "glibc", "ratio"
+    );
+    for (o, g) in results[0].iter().zip(results[1].iter()) {
+        // Ratio > 1 means rustlibc is faster for both throughput and latency units.
+        let ratio = if o.2 == "GB/s" { o.1 / g.1 } else { g.1 / o.1 };
+        println!(
+            "{:<28} {:>7.2} {:<4} {:>7.2} {:<4} {:>7.2}x",
+            o.0, o.1, o.2, g.1, g.2, ratio
+        );
+    }
+    ExitCode::SUCCESS
+}
+
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let release = !args.iter().any(|a| a == "--debug");
@@ -308,8 +395,12 @@ fn main() -> ExitCode {
         },
         ["test"] => test(None, release),
         ["test", filter] => test(Some(filter), release),
+        ["bench"] => bench(None, release),
+        ["bench", filter] => bench(Some(filter), release),
         _ => {
-            eprintln!("usage: cargo xtask [--debug] build | test [FILTER]");
+            eprintln!(
+                "usage: cargo xtask [--debug] build | test [FILTER] | bench [mem|malloc|stdlib]"
+            );
             ExitCode::FAILURE
         }
     }

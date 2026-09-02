@@ -7,6 +7,7 @@
 //! * [`ctype`] – `<ctype.h>`.
 
 pub mod ctype;
+pub mod lanes;
 pub mod mem;
 pub mod search;
 pub mod simd;

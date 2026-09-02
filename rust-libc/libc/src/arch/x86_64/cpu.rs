@@ -10,6 +10,8 @@ pub enum Level {
     Sse2 = 0,
     /// AVX2 with OS support for saving the upper halves of the YMM registers.
     Avx2 = 1,
+    /// AVX-512F and AVX-512BW with OS support for the ZMM state.
+    Avx512 = 2,
 }
 
 /// Queries the CPU for the best supported [`Level`].
@@ -25,9 +27,15 @@ pub fn detect() -> Level {
     let ymm_state = xcr0 & 0b110 == 0b110;
     let leaf7 = __cpuid_count(7, 0);
     let avx2 = leaf7.ebx & (1 << 5) != 0;
-    if ymm_state && avx2 {
-        Level::Avx2
+    if !(ymm_state && avx2) {
+        return Level::Sse2;
+    }
+    let zmm_state = xcr0 & 0xe0 == 0xe0;
+    let avx512f = leaf7.ebx & (1 << 16) != 0;
+    let avx512bw = leaf7.ebx & (1 << 30) != 0;
+    if zmm_state && avx512f && avx512bw {
+        Level::Avx512
     } else {
-        Level::Sse2
+        Level::Avx2
     }
 }

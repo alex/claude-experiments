@@ -209,14 +209,7 @@ pub unsafe extern "C" fn strlcat(dst: *mut c_char, src: *const c_char, n: usize)
 #[cfg_attr(not(test), unsafe(no_mangle))]
 pub unsafe extern "C" fn strchr(s: *const c_char, c: c_int) -> *mut c_char {
     // SAFETY: forwarded from the caller.
-    unsafe {
-        let p = strchrnul(s, c);
-        if *p as u8 == c as u8 {
-            p
-        } else {
-            ptr::null_mut()
-        }
-    }
+    unsafe { search::strchr_ptr(s as *const u8, c as u8) as *mut c_char }
 }
 
 /// `strchrnul(3)`: like `strchr` but returns the terminator when not found.

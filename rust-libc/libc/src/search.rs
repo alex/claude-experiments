@@ -583,7 +583,7 @@ mod tests {
             assert!(!tfind(&keys[1] as *const i64 as *const c_void, &root, cmp).is_null());
             assert!(tdelete(&missing as *const i64 as *const c_void, &mut root, cmp).is_null());
             unsafe extern "C" fn nofree(_: *mut c_void) {}
-            tdestroy(root, nofree);
+            tdestroy(root, Some(nofree));
         }
     }
 

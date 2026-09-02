@@ -15,7 +15,6 @@ crate-type = ["staticlib", "rlib"]
 doctest = false
 
 [dependencies]
-fearless_simd = { version = "0.7", default-features = false, features = ["libm"] }
 # The Rust port of musl's math library, used for <math.h>.
 libm = "0.2"
 

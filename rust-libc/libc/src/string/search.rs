@@ -1,39 +1,43 @@
 //! SIMD kernels for searching and comparing bytes.
 //!
-//! Every kernel is generic over the SIMD level `S` and instantiated by
-//! [`dispatch!`](crate::string::simd::dispatch). Two kinds of loads are
+//! Every kernel is generic over the vector type `L` and instantiated by
+//! [`dispatch_fn!`](crate::string::simd::dispatch_fn). Two kinds of loads are
 //! used:
 //!
-//! * slice loads for length-delimited data (`memchr`, `memcmp`), which
-//!   are plainly in bounds;
-//! * aligned "over-reads" for NUL-terminated strings (`strlen`,
-//!   `strchr`), which read whole vectors from vector-aligned addresses. An
-//!   aligned vector never crosses a page boundary, so if any byte of it is
-//!   inside the string, the whole load is backed by readable memory.
-//!   This is the standard technique used by every libc and by Rust's own
-//!   `compiler_builtins`.
+//! * in-bounds vector loads for length-delimited data (`memchr`,
+//!   `memcmp`) whenever a whole vector fits;
+//! * "over-reads" of readable memory for the remaining cases: whole
+//!   vectors from vector-aligned addresses for NUL-terminated strings
+//!   (`strlen`, `strchr`), and for short length-delimited inputs either
+//!   an unaligned vector that provably stays inside the current page or
+//!   the aligned vector containing the data. An aligned vector never
+//!   crosses a page boundary, so if any byte of it is inside the string
+//!   or buffer, the whole load is backed by readable memory. This is the
+//!   standard technique used by every libc and by Rust's own
+//!   `compiler_builtins`; the bytes outside the input are masked off
+//!   and never influence the result.
 //!
 //! For two-string kernels (`strcmp`) whose pointers have different
 //! alignments the loads are unaligned instead, and only performed when
 //! they provably stay inside the current page.
+//!
+//! The main loops handle four vectors per iteration, combining the
+//! per-vector predicates with cheap vector operations and testing once.
 
-use crate::string::simd::dispatch;
+use crate::string::lanes::{Lanes, Mask};
+use crate::string::simd::dispatch_fn;
 use crate::sys::PAGE_SIZE;
 use core::ffi::c_int;
-use fearless_simd::prelude::*;
-
-/// Native u8 vector of level `S`.
-type V<S> = <S as Simd>::u8s;
 
 /// Loads one vector from `p`.
 ///
 /// # Safety
-/// `p` must be valid for reads of `V::<S>::N` bytes in the sense
-/// described in the module documentation.
+/// `p` must be valid for reads of `L::N` bytes in the sense described in
+/// the module documentation.
 #[inline(always)]
-unsafe fn load<S: Simd>(simd: S, p: *const u8) -> V<S> {
+unsafe fn load<L: Lanes>(p: *const u8) -> L {
     // SAFETY: caller guarantees readability.
-    V::<S>::from_slice(simd, unsafe { core::slice::from_raw_parts(p, V::<S>::N) })
+    unsafe { L::load(p) }
 }
 
 /// True if a read of `n` bytes at `p` stays inside one page.
@@ -42,41 +46,112 @@ fn page_safe(p: *const u8, n: usize) -> bool {
     (p as usize & (PAGE_SIZE - 1)) <= PAGE_SIZE - n
 }
 
-/// Bit mask with one bit per lane of `V<S>`.
+/// [`page_safe`] for two pointers, evaluated without branches.
 #[inline(always)]
-fn lane_mask<S: Simd>() -> u64 {
-    if V::<S>::N >= 64 {
-        u64::MAX
-    } else {
-        (1u64 << V::<S>::N) - 1
+fn both_page_safe(a: *const u8, b: *const u8, n: usize) -> bool {
+    let (oa, ob) = (a as usize & (PAGE_SIZE - 1), b as usize & (PAGE_SIZE - 1));
+    oa.max(ob) <= PAGE_SIZE - n
+}
+
+/// Mask of the low `k` bits (all bits for `k >= 64`).
+#[inline(always)]
+fn low_bits(k: usize) -> u64 {
+    if k >= 64 { u64::MAX } else { (1u64 << k) - 1 }
+}
+
+/// Finds the bytes equal to `needle` among the `len < L::N` bytes at
+/// `p` without a scalar loop, by over-reading as described in the module
+/// documentation. Returns a bitmask with bit `i` set when byte `i`
+/// matches; bits at or above `len` are clear.
+///
+/// (Kernels must not use closures: a closure does not inherit the
+/// caller's target features, so the SIMD operations inside it would
+/// become out-of-line calls.)
+///
+/// # Safety
+/// `p` must be valid for `len` bytes.
+#[inline(always)]
+unsafe fn small_eq_mask<L: Lanes>(p: *const u8, len: usize, needle: L) -> u64 {
+    let n = L::N;
+    debug_assert!(len < n);
+    if page_safe(p, n) {
+        // SAFETY: an unaligned vector that stays inside the page of `p`,
+        // whose first byte is inside the buffer.
+        return unsafe { load::<L>(p) }.eq(needle).bits() & low_bits(len);
     }
+    // `p` lies in the last `n - 1` bytes of its page, so the aligned
+    // vector containing it is the last one of the page.
+    let a = (p as usize & !(n - 1)) as *const u8;
+    let shift = p as usize - a as usize;
+    let covered = n - shift;
+    // SAFETY: aligned over-read containing byte 0 of the buffer.
+    let m = (unsafe { load::<L>(a) }.eq(needle).bits() >> shift) & low_bits(len.min(covered));
+    if len <= covered {
+        return m;
+    }
+    // The rest of the buffer starts exactly at the next page.
+    // SAFETY: page-aligned vector whose first byte is inside the buffer.
+    let rest = unsafe { load::<L>(p.add(covered)) }.eq(needle).bits() & low_bits(len - covered);
+    m | (rest << covered)
 }
 
 // ---------------------------------------------------------------------
 // memchr / memrchr
 
 #[inline(always)]
-fn memchr_k<S: Simd>(simd: S, hay: &[u8], needle: u8) -> Option<usize> {
-    let n = V::<S>::N;
-    if hay.len() < n {
-        return hay.iter().position(|&b| b == needle);
+fn memchr_k<L: Lanes>(hay: &[u8], needle: u8) -> Option<usize> {
+    let n = L::N;
+    let len = hay.len();
+    let p = hay.as_ptr();
+    let v = L::splat(needle);
+    if len < n {
+        if len == 0 {
+            return None;
+        }
+        // SAFETY: `hay` is valid for `len` bytes.
+        let m = unsafe { small_eq_mask::<L>(p, len, v) };
+        return (m != 0).then(|| m.trailing_zeros() as usize);
     }
-    let v = V::<S>::splat(simd, needle);
     let mut i = 0;
-    while i + n <= hay.len() {
-        let m = V::<S>::from_slice(simd, &hay[i..i + n])
-            .simd_eq(v)
-            .to_bitmask();
+    while i + 4 * n <= len {
+        // SAFETY: all four vectors are inside `hay`.
+        let (a, b, c, d) = unsafe {
+            (
+                load::<L>(p.add(i)),
+                load::<L>(p.add(i + n)),
+                load::<L>(p.add(i + 2 * n)),
+                load::<L>(p.add(i + 3 * n)),
+            )
+        };
+        let (ma, mb, mc, md) = (a.eq(v), b.eq(v), c.eq(v), d.eq(v));
+        if ma.or(mb).or(mc).or(md).any() {
+            let (x, y, z, w) = (ma.bits(), mb.bits(), mc.bits(), md.bits());
+            let k = if x != 0 {
+                x.trailing_zeros() as usize
+            } else if y != 0 {
+                n + y.trailing_zeros() as usize
+            } else if z != 0 {
+                2 * n + z.trailing_zeros() as usize
+            } else {
+                3 * n + w.trailing_zeros() as usize
+            };
+            return Some(i + k);
+        }
+        i += 4 * n;
+    }
+    while i + n <= len {
+        // SAFETY: inside `hay`.
+        let m = unsafe { load::<L>(p.add(i)) }.eq(v).bits();
         if m != 0 {
             return Some(i + m.trailing_zeros() as usize);
         }
         i += n;
     }
-    if i < hay.len() {
-        let start = hay.len() - n;
-        let m = V::<S>::from_slice(simd, &hay[start..])
-            .simd_eq(v)
-            .to_bitmask();
+    if i < len {
+        // Overlapping final vector; bytes before `i` were already checked.
+        let start = len - n;
+        // SAFETY: inside `hay`.
+        let m = unsafe { load::<L>(p.add(start)) }.eq(v).bits() & !low_bits(i - start);
         if m != 0 {
             return Some(start + m.trailing_zeros() as usize);
         }
@@ -84,110 +159,272 @@ fn memchr_k<S: Simd>(simd: S, hay: &[u8], needle: u8) -> Option<usize> {
     None
 }
 
-/// Index of the first `needle` in `hay`.
-#[inline]
-pub fn memchr(hay: &[u8], needle: u8) -> Option<usize> {
-    dispatch!(simd => memchr_k(simd, hay, needle))
+dispatch_fn! {
+    /// Index of the first `needle` in `hay`.
+    pub fn memchr(hay: &[u8], needle: u8) -> Option<usize> = memchr_k;
+}
+
+/// Index of the highest set bit.
+#[inline(always)]
+fn high_bit(m: u64) -> usize {
+    63 - m.leading_zeros() as usize
 }
 
 #[inline(always)]
-fn memrchr_k<S: Simd>(simd: S, hay: &[u8], needle: u8) -> Option<usize> {
-    let n = V::<S>::N;
-    if hay.len() < n {
-        return hay.iter().rposition(|&b| b == needle);
+fn memrchr_k<L: Lanes>(hay: &[u8], needle: u8) -> Option<usize> {
+    let n = L::N;
+    let len = hay.len();
+    let p = hay.as_ptr();
+    let v = L::splat(needle);
+    if len < n {
+        if len == 0 {
+            return None;
+        }
+        // SAFETY: `hay` is valid for `len` bytes.
+        let m = unsafe { small_eq_mask::<L>(p, len, v) };
+        return (m != 0).then(|| high_bit(m));
     }
-    let v = V::<S>::splat(simd, needle);
-    let mut end = hay.len();
+    let mut end = len;
+    while end >= 4 * n {
+        let base = end - 4 * n;
+        // SAFETY: all four vectors are inside `hay`.
+        let (a, b, c, d) = unsafe {
+            (
+                load::<L>(p.add(base)),
+                load::<L>(p.add(base + n)),
+                load::<L>(p.add(base + 2 * n)),
+                load::<L>(p.add(base + 3 * n)),
+            )
+        };
+        let (ma, mb, mc, md) = (a.eq(v), b.eq(v), c.eq(v), d.eq(v));
+        if ma.or(mb).or(mc).or(md).any() {
+            let (x, y, z, w) = (ma.bits(), mb.bits(), mc.bits(), md.bits());
+            let k = if w != 0 {
+                3 * n + high_bit(w)
+            } else if z != 0 {
+                2 * n + high_bit(z)
+            } else if y != 0 {
+                n + high_bit(y)
+            } else {
+                high_bit(x)
+            };
+            return Some(base + k);
+        }
+        end = base;
+    }
     while end >= n {
-        let m = V::<S>::from_slice(simd, &hay[end - n..end])
-            .simd_eq(v)
-            .to_bitmask();
+        // SAFETY: inside `hay`.
+        let m = unsafe { load::<L>(p.add(end - n)) }.eq(v).bits();
         if m != 0 {
-            return Some(end - n + (63 - m.leading_zeros() as usize));
+            return Some(end - n + high_bit(m));
         }
         end -= n;
     }
     if end > 0 {
-        let m = V::<S>::from_slice(simd, &hay[..n]).simd_eq(v).to_bitmask() & ((1u64 << end) - 1);
+        // Overlapping first vector; bytes at or after `end` were checked.
+        // SAFETY: `len >= n`.
+        let m = unsafe { load::<L>(p) }.eq(v).bits() & low_bits(end);
         if m != 0 {
-            return Some(63 - m.leading_zeros() as usize);
+            return Some(high_bit(m));
         }
     }
     None
 }
 
-/// Index of the last `needle` in `hay`.
-#[inline]
-pub fn memrchr(hay: &[u8], needle: u8) -> Option<usize> {
-    dispatch!(simd => memrchr_k(simd, hay, needle))
+dispatch_fn! {
+    /// Index of the last `needle` in `hay`.
+    pub fn memrchr(hay: &[u8], needle: u8) -> Option<usize> = memrchr_k;
+}
+
+/// [`memchr_k`] returning a pointer, for the C entry point (so that it
+/// is a tail call).
+///
+/// # Safety
+/// `s` must be valid for `n` bytes.
+#[inline(always)]
+unsafe fn memchr_ptr_k<L: Lanes>(s: *const u8, c: u8, n: usize) -> *mut u8 {
+    // SAFETY: caller contract.
+    let hay = unsafe { core::slice::from_raw_parts(s, n) };
+    match memchr_k::<L>(hay, c) {
+        // SAFETY: `i < n`.
+        Some(i) => unsafe { s.add(i) as *mut u8 },
+        None => core::ptr::null_mut(),
+    }
+}
+
+dispatch_fn! {
+    /// `memchr(3)` proper: a pointer to the first `c`, or null.
+    ///
+    /// # Safety
+    /// `s` must be valid for `n` bytes.
+    pub unsafe fn memchr_ptr(s: *const u8, c: u8, n: usize) -> *mut u8 = memchr_ptr_k;
 }
 
 // ---------------------------------------------------------------------
 // strlen / strnlen / strchrnul
 
+/// Vector with a zero byte wherever `v` has a NUL or (when `with_needle`)
+/// the needle byte: `min(v, v ^ needle)`. This lets four vectors be
+/// combined with three `min`s and tested once.
+#[inline(always)]
+fn zmin<L: Lanes>(v: L, nd: L, with_needle: bool) -> L {
+    if with_needle { v.min(v.xor(nd)) } else { v }
+}
+
 /// Scans forward from `s` for the first byte that is NUL (or, if
 /// `needle` is `Some`, NUL or the needle) and returns its offset.
 ///
 /// # Safety
-/// `s` must point to a NUL-terminated string.
+/// `s` must point to a NUL-terminated string, or be readable for `limit`
+/// bytes.
 #[inline(always)]
-unsafe fn scan_k<S: Simd>(simd: S, s: *const u8, needle: Option<u8>, limit: usize) -> usize {
-    let n = V::<S>::N;
+unsafe fn scan_k<L: Lanes>(s: *const u8, needle: Option<u8>, limit: usize) -> usize {
+    let n = L::N;
     let start = s as usize;
+    let zero = L::splat(0);
+    let nd = L::splat(needle.unwrap_or(0));
+    let wn = needle.is_some();
+
+    // First vector: aligned, with the bytes before `start` ignored.
     let mut p = start & !(n - 1);
-    let zero = V::<S>::splat(simd, 0);
-    let needle = V::<S>::splat(simd, needle.unwrap_or(0));
     // SAFETY: aligned over-read, see the module documentation.
-    let v = unsafe { load(simd, p as *const u8) };
-    // Ignore the bytes of the first vector that precede `start`.
-    let m = (v.simd_eq(zero) | v.simd_eq(needle)).to_bitmask() >> (start - p);
+    let v = unsafe { load::<L>(p as *const u8) };
+    let m = zmin::<L>(v, nd, wn).eq(zero).bits() >> (start - p);
     if m != 0 {
         return (m.trailing_zeros() as usize).min(limit);
     }
+    p += n;
     loop {
-        p += n;
         if p - start >= limit {
             return limit;
         }
-        // SAFETY: as above; the previous vector contained no NUL, so the
-        // string extends at least to `p`.
-        let v = unsafe { load(simd, p as *const u8) };
-        let m = (v.simd_eq(zero) | v.simd_eq(needle)).to_bitmask();
+        // Four vectors at a time once aligned to a 4-vector block, as
+        // long as the first byte of the last vector is inside the limit
+        // (so every byte of the block is readable or past a NUL).
+        if p & (4 * n - 1) == 0 && limit - (p - start) > 3 * n {
+            // SAFETY: as above; the previous vectors contained no NUL.
+            let (a, b, c, d) = unsafe {
+                (
+                    load::<L>(p as *const u8),
+                    load::<L>((p + n) as *const u8),
+                    load::<L>((p + 2 * n) as *const u8),
+                    load::<L>((p + 3 * n) as *const u8),
+                )
+            };
+            let (za, zb, zc, zd) = (
+                zmin::<L>(a, nd, wn),
+                zmin::<L>(b, nd, wn),
+                zmin::<L>(c, nd, wn),
+                zmin::<L>(d, nd, wn),
+            );
+            if za.min(zb).min(zc.min(zd)).eq(zero).any() {
+                let x = za.eq(zero).bits();
+                let y = zb.eq(zero).bits();
+                let z = zc.eq(zero).bits();
+                let w = zd.eq(zero).bits();
+                let k = if x != 0 {
+                    x.trailing_zeros() as usize
+                } else if y != 0 {
+                    n + y.trailing_zeros() as usize
+                } else if z != 0 {
+                    2 * n + z.trailing_zeros() as usize
+                } else {
+                    3 * n + w.trailing_zeros() as usize
+                };
+                return (p - start + k).min(limit);
+            }
+            p += 4 * n;
+            continue;
+        }
+        // SAFETY: as above.
+        let v = unsafe { load::<L>(p as *const u8) };
+        let m = zmin::<L>(v, nd, wn).eq(zero).bits();
         if m != 0 {
             return (p - start + m.trailing_zeros() as usize).min(limit);
+        }
+        p += n;
+    }
+}
+
+/// [`scan_k`] for `strlen`.
+///
+/// # Safety
+/// `s` must point to a NUL-terminated string.
+#[inline(always)]
+unsafe fn strlen_k<L: Lanes>(s: *const u8) -> usize {
+    // SAFETY: forwarded.
+    unsafe { scan_k::<L>(s, None, usize::MAX) }
+}
+
+/// [`scan_k`] for `strnlen`.
+///
+/// # Safety
+/// `s` must be readable up to the NUL terminator or `max` bytes.
+#[inline(always)]
+unsafe fn strnlen_k<L: Lanes>(s: *const u8, max: usize) -> usize {
+    // SAFETY: forwarded.
+    unsafe { scan_k::<L>(s, None, max) }
+}
+
+/// [`scan_k`] for `strchrnul`.
+///
+/// # Safety
+/// `s` must point to a NUL-terminated string.
+#[inline(always)]
+unsafe fn strchrnul_k<L: Lanes>(s: *const u8, c: u8) -> usize {
+    // SAFETY: forwarded.
+    unsafe { scan_k::<L>(s, Some(c), usize::MAX) }
+}
+
+dispatch_fn! {
+    /// `strlen`.
+    ///
+    /// # Safety
+    /// `s` must point to a NUL-terminated string.
+    pub unsafe fn strlen(s: *const u8) -> usize = strlen_k;
+}
+
+dispatch_fn! {
+    /// `strnlen`: like [`strlen`] but never looks past `max` bytes.
+    ///
+    /// # Safety
+    /// `s` must be readable up to the NUL terminator or `max` bytes,
+    /// whichever comes first.
+    pub unsafe fn strnlen(s: *const u8, max: usize) -> usize = strnlen_k;
+}
+
+dispatch_fn! {
+    /// `strchrnul`: offset of the first `c` or of the terminating NUL.
+    ///
+    /// # Safety
+    /// `s` must point to a NUL-terminated string.
+    pub unsafe fn strchrnul(s: *const u8, c: u8) -> usize = strchrnul_k;
+}
+
+/// `strchr` proper, for the C entry point.
+///
+/// # Safety
+/// `s` must point to a NUL-terminated string.
+#[inline(always)]
+unsafe fn strchr_ptr_k<L: Lanes>(s: *const u8, c: u8) -> *mut u8 {
+    // SAFETY: forwarded.
+    let i = unsafe { scan_k::<L>(s, Some(c), usize::MAX) };
+    // SAFETY: `i` is inside the string (at most the terminator).
+    unsafe {
+        if *s.add(i) == c {
+            s.add(i) as *mut u8
+        } else {
+            core::ptr::null_mut()
         }
     }
 }
 
-/// `strlen`.
-///
-/// # Safety
-/// `s` must point to a NUL-terminated string.
-#[inline]
-pub unsafe fn strlen(s: *const u8) -> usize {
-    // SAFETY: forwarded.
-    dispatch!(simd => unsafe { scan_k(simd, s, None, usize::MAX) })
-}
-
-/// `strnlen`: like [`strlen`] but never looks past `max` bytes.
-///
-/// # Safety
-/// `s` must be readable up to the NUL terminator or `max` bytes,
-/// whichever comes first.
-#[inline]
-pub unsafe fn strnlen(s: *const u8, max: usize) -> usize {
-    // SAFETY: forwarded.
-    dispatch!(simd => unsafe { scan_k(simd, s, None, max) })
-}
-
-/// `strchrnul`: offset of the first `c` or of the terminating NUL.
-///
-/// # Safety
-/// `s` must point to a NUL-terminated string.
-#[inline]
-pub unsafe fn strchrnul(s: *const u8, c: u8) -> usize {
-    // SAFETY: forwarded.
-    dispatch!(simd => unsafe { scan_k(simd, s, Some(c), usize::MAX) })
+dispatch_fn! {
+    /// `strchr(3)` proper: a pointer to the first `c`, or null.
+    ///
+    /// # Safety
+    /// `s` must point to a NUL-terminated string.
+    pub unsafe fn strchr_ptr(s: *const u8, c: u8) -> *mut u8 = strchr_ptr_k;
 }
 
 // ---------------------------------------------------------------------
@@ -199,21 +436,10 @@ fn diff_at(a: &[u8], b: &[u8], k: usize) -> c_int {
     a[k] as c_int - b[k] as c_int
 }
 
+/// Scalar comparison of fewer than a vector's worth of bytes.
 #[inline(always)]
-fn memcmp_k<S: Simd>(simd: S, a: &[u8], b: &[u8]) -> c_int {
-    let n = V::<S>::N;
-    let len = a.len().min(b.len());
+fn memcmp_scalar(a: &[u8], b: &[u8], len: usize) -> c_int {
     let mut i = 0;
-    while i + n <= len {
-        let m = !V::<S>::from_slice(simd, &a[i..i + n])
-            .simd_eq(V::<S>::from_slice(simd, &b[i..i + n]))
-            .to_bitmask()
-            & lane_mask::<S>();
-        if m != 0 {
-            return diff_at(a, b, i + m.trailing_zeros() as usize);
-        }
-        i += n;
-    }
     while i + 8 <= len {
         let x = u64::from_ne_bytes(a[i..i + 8].try_into().unwrap());
         let y = u64::from_ne_bytes(b[i..i + 8].try_into().unwrap());
@@ -231,10 +457,85 @@ fn memcmp_k<S: Simd>(simd: S, a: &[u8], b: &[u8]) -> c_int {
     0
 }
 
-/// `memcmp` over two equally long slices.
-#[inline]
-pub fn memcmp(a: &[u8], b: &[u8]) -> c_int {
-    dispatch!(simd => memcmp_k(simd, a, b))
+#[inline(always)]
+fn memcmp_k<L: Lanes>(a: &[u8], b: &[u8]) -> c_int {
+    let n = L::N;
+    let len = a.len().min(b.len());
+    let (pa, pb) = (a.as_ptr(), b.as_ptr());
+    if len < n {
+        if len == 0 {
+            return 0;
+        }
+        if both_page_safe(pa, pb, n) {
+            // SAFETY: unaligned over-reads inside the current pages.
+            let (va, vb) = unsafe { (load::<L>(pa), load::<L>(pb)) };
+            let m = va.eq(vb).not().bits() & low_bits(len);
+            return if m == 0 {
+                0
+            } else {
+                diff_at(a, b, m.trailing_zeros() as usize)
+            };
+        }
+        return memcmp_scalar(a, b, len);
+    }
+    let mut i = 0;
+    while i + 4 * n <= len {
+        // SAFETY: all vectors are inside both slices.
+        let (ea, eb, ec, ed) = unsafe {
+            (
+                load::<L>(pa.add(i)).eq(load::<L>(pb.add(i))),
+                load::<L>(pa.add(i + n)).eq(load::<L>(pb.add(i + n))),
+                load::<L>(pa.add(i + 2 * n)).eq(load::<L>(pb.add(i + 2 * n))),
+                load::<L>(pa.add(i + 3 * n)).eq(load::<L>(pb.add(i + 3 * n))),
+            )
+        };
+        if !ea.and(eb).and(ec).and(ed).all() {
+            let (x, y, z, w) = (
+                ea.not().bits(),
+                eb.not().bits(),
+                ec.not().bits(),
+                ed.not().bits(),
+            );
+            let k = if x != 0 {
+                x.trailing_zeros() as usize
+            } else if y != 0 {
+                n + y.trailing_zeros() as usize
+            } else if z != 0 {
+                2 * n + z.trailing_zeros() as usize
+            } else {
+                3 * n + w.trailing_zeros() as usize
+            };
+            return diff_at(a, b, i + k);
+        }
+        i += 4 * n;
+    }
+    while i + n <= len {
+        // SAFETY: inside both slices.
+        let m = unsafe { load::<L>(pa.add(i)).eq(load::<L>(pb.add(i))) }
+            .not()
+            .bits();
+        if m != 0 {
+            return diff_at(a, b, i + m.trailing_zeros() as usize);
+        }
+        i += n;
+    }
+    if i < len {
+        let start = len - n;
+        // SAFETY: inside both slices.
+        let m = unsafe { load::<L>(pa.add(start)).eq(load::<L>(pb.add(start))) }
+            .not()
+            .bits()
+            & !low_bits(i - start);
+        if m != 0 {
+            return diff_at(a, b, start + m.trailing_zeros() as usize);
+        }
+    }
+    0
+}
+
+dispatch_fn! {
+    /// `memcmp` over two equally long slices.
+    pub fn memcmp(a: &[u8], b: &[u8]) -> c_int = memcmp_k;
 }
 
 /// Compares two NUL-terminated strings, looking at most at `limit` bytes.
@@ -242,26 +543,80 @@ pub fn memcmp(a: &[u8], b: &[u8]) -> c_int {
 /// # Safety
 /// Both must be NUL-terminated (within `limit` bytes if `limit` is finite).
 #[inline(always)]
-unsafe fn strncmp_k<S: Simd>(simd: S, a: *const u8, b: *const u8, limit: usize) -> c_int {
-    let n = V::<S>::N;
-    let zero = V::<S>::splat(simd, 0);
+unsafe fn strncmp_k<L: Lanes>(a: *const u8, b: *const u8, limit: usize) -> c_int {
+    let n = L::N;
+    let zero = L::splat(0);
     let mut i = 0;
     while i < limit {
         // SAFETY: both strings are readable up to their NUL terminators and
         // no NUL has been seen before `i`.
         let (pa, pb) = unsafe { (a.add(i), b.add(i)) };
-        if i + n <= limit && page_safe(pa, n) && page_safe(pb, n) {
+        // Most strings end within the first vector, so look at that one
+        // alone before switching to four at a time. `keep_eq` is zero
+        // exactly where the comparison stops.
+        if i >= n && i + 4 * n <= limit && both_page_safe(pa, pb, 4 * n) {
             // SAFETY: the loads stay within the current page of each string,
-            // and the string extends to at least `pa`.
-            let (va, vb) = unsafe { (load(simd, pa), load(simd, pb)) };
-            let m =
-                (va.simd_eq(zero).to_bitmask() | !va.simd_eq(vb).to_bitmask()) & lane_mask::<S>();
+            // and both strings extend to at least `pa`/`pb`.
+            let (t0, t1, t2, t3) = unsafe {
+                (
+                    load::<L>(pa).keep_eq(load::<L>(pb)),
+                    load::<L>(pa.add(n)).keep_eq(load::<L>(pb.add(n))),
+                    load::<L>(pa.add(2 * n)).keep_eq(load::<L>(pb.add(2 * n))),
+                    load::<L>(pa.add(3 * n)).keep_eq(load::<L>(pb.add(3 * n))),
+                )
+            };
+            if t0.min(t1).min(t2.min(t3)).eq(zero).any() {
+                let (x, y, z, w) = (
+                    t0.eq(zero).bits(),
+                    t1.eq(zero).bits(),
+                    t2.eq(zero).bits(),
+                    t3.eq(zero).bits(),
+                );
+                let k = if x != 0 {
+                    x.trailing_zeros() as usize
+                } else if y != 0 {
+                    n + y.trailing_zeros() as usize
+                } else if z != 0 {
+                    2 * n + z.trailing_zeros() as usize
+                } else {
+                    3 * n + w.trailing_zeros() as usize
+                };
+                // SAFETY: `k` is within the loaded vectors.
+                return unsafe { *pa.add(k) as c_int - *pb.add(k) as c_int };
+            }
+            i += 4 * n;
+        } else if i + n <= limit && both_page_safe(pa, pb, n) {
+            // SAFETY: as above.
+            let m = unsafe { load::<L>(pa).keep_eq(load::<L>(pb)) }
+                .eq(zero)
+                .bits();
             if m != 0 {
                 let k = m.trailing_zeros() as usize;
                 // SAFETY: `k` is within the loaded vectors.
                 return unsafe { *pa.add(k) as c_int - *pb.add(k) as c_int };
             }
             i += n;
+        } else if i + 8 <= limit && both_page_safe(pa, pb, 8) {
+            // Near a page end: eight bytes at a time. The lowest set bit
+            // of `zero` marks the first NUL of `x` exactly (higher bits may
+            // be spurious), and the lowest set bit of `diff` the first
+            // differing byte, so the lower of the two is the answer.
+            // SAFETY: both reads stay inside the current page and start
+            // inside the strings.
+            let (x, y) = unsafe {
+                (
+                    pa.cast::<u64>().read_unaligned(),
+                    pb.cast::<u64>().read_unaligned(),
+                )
+            };
+            let zero = x.wrapping_sub(0x0101_0101_0101_0101) & !x & 0x8080_8080_8080_8080;
+            let diff = x ^ y;
+            if zero | diff != 0 {
+                let k = ((zero | diff).trailing_zeros() / 8) as usize;
+                // SAFETY: byte `k` is inside both strings.
+                return unsafe { *pa.add(k) as c_int - *pb.add(k) as c_int };
+            }
+            i += 8;
         } else {
             // SAFETY: byte `i` is inside both strings.
             let (x, y) = unsafe { (*pa, *pb) };
@@ -274,36 +629,98 @@ unsafe fn strncmp_k<S: Simd>(simd: S, a: *const u8, b: *const u8, limit: usize) 
     0
 }
 
-/// `strcmp`.
+/// [`strncmp_k`] without a limit.
 ///
 /// # Safety
 /// Both strings must be NUL-terminated.
-#[inline]
-pub unsafe fn strcmp(a: *const u8, b: *const u8) -> c_int {
+#[inline(always)]
+unsafe fn strcmp_k<L: Lanes>(a: *const u8, b: *const u8) -> c_int {
     // SAFETY: forwarded.
-    dispatch!(simd => unsafe { strncmp_k(simd, a, b, usize::MAX) })
+    unsafe { strncmp_k::<L>(a, b, usize::MAX) }
 }
 
-/// `strncmp`.
-///
-/// # Safety
-/// Both strings must be NUL-terminated or readable for `limit` bytes.
-#[inline]
-pub unsafe fn strncmp(a: *const u8, b: *const u8, limit: usize) -> c_int {
-    // SAFETY: forwarded.
-    dispatch!(simd => unsafe { strncmp_k(simd, a, b, limit) })
+dispatch_fn! {
+    /// `strcmp`.
+    ///
+    /// # Safety
+    /// Both strings must be NUL-terminated.
+    pub unsafe fn strcmp(a: *const u8, b: *const u8) -> c_int = strcmp_k;
+}
+
+dispatch_fn! {
+    /// `strncmp`.
+    ///
+    /// # Safety
+    /// Both strings must be NUL-terminated or readable for `limit` bytes.
+    pub unsafe fn strncmp(a: *const u8, b: *const u8, limit: usize) -> c_int = strncmp_k;
 }
 
 // ---------------------------------------------------------------------
-// memmem (Two-Way)
+// memmem
 
-/// Finds `needle` in `hay` using the Two-Way algorithm (Crochemore &
-/// Perrin), which runs in `O(hay + needle)` time and constant space, so
-/// adversarial inputs cannot make it quadratic.
+/// Result of the vectorised candidate scan.
+enum Scan {
+    Found(usize),
+    NotFound,
+    /// The verification budget ran out; no match starts before this offset.
+    Budget(usize),
+}
+
+/// Scans for windows whose first and last bytes match the needle's and
+/// verifies each candidate. Verification work is capped at a multiple
+/// of the haystack length so that a needle like `aaaaaaaa` in a haystack
+/// of `a`s cannot make this quadratic; when the cap is hit the caller
+/// falls back to Two-Way.
+#[inline(always)]
+fn find_k<L: Lanes>(hay: &[u8], needle: &[u8]) -> Scan {
+    let n = L::N;
+    let (h, l) = (hay.len(), needle.len());
+    let p = hay.as_ptr();
+    let first = L::splat(needle[0]);
+    let last = L::splat(needle[l - 1]);
+    let inner = &needle[1..l - 1];
+    let mut budget = 2 * h + 64;
+    let mut i = 0;
+    // Both the "first byte" vector at `i` and the "last byte" vector at
+    // `i + l - 1` must be inside the haystack.
+    while i + (l - 1) + n <= h {
+        // SAFETY: both vectors are inside `hay`.
+        let (a, b) = unsafe { (load::<L>(p.add(i)), load::<L>(p.add(i + l - 1))) };
+        let mut m = a.eq(first).and(b.eq(last)).bits();
+        while m != 0 {
+            let k = i + m.trailing_zeros() as usize;
+            if hay[k + 1..k + l - 1] == *inner {
+                return Scan::Found(k);
+            }
+            budget = budget.saturating_sub(l);
+            if budget == 0 {
+                return Scan::Budget(k + 1);
+            }
+            m &= m - 1;
+        }
+        i += n;
+    }
+    // Fewer than a vector's worth of candidate windows remain.
+    while i + l <= h {
+        if hay[i] == needle[0] && hay[i + l - 1] == needle[l - 1] && hay[i + 1..i + l - 1] == *inner
+        {
+            return Scan::Found(i);
+        }
+        i += 1;
+    }
+    Scan::NotFound
+}
+
+dispatch_fn! {
+    /// [`find_k`] for the detected level.
+    fn find(hay: &[u8], needle: &[u8]) -> Scan = find_k;
+}
+
+/// Finds `needle` in `hay`.
 ///
-/// This follows musl's `twoway_memmem`. The needle's maximal suffix and
-/// period are computed with both orderings; the haystack is then scanned
-/// with a shift table on the last needle byte for fast skipping.
+/// A vectorised scan handles the common case; the Two-Way algorithm
+/// ([`two_way`]) takes over when a pathological needle makes the scan's
+/// verification work exceed its budget, so the total stays linear.
 pub fn memmem(hay: &[u8], needle: &[u8]) -> Option<usize> {
     let l = needle.len();
     if l == 0 {
@@ -315,8 +732,28 @@ pub fn memmem(hay: &[u8], needle: &[u8]) -> Option<usize> {
     if hay.len() < l {
         return None;
     }
-    let n = needle;
+    match find(hay, needle) {
+        Scan::Found(k) => Some(k),
+        Scan::NotFound => None,
+        Scan::Budget(from) => two_way(&hay[from..], needle).map(|k| k + from),
+    }
+}
 
+/// Finds `needle` (at least two bytes, no longer than `hay`) in `hay`
+/// using the Two-Way algorithm (Crochemore & Perrin), which runs in
+/// `O(hay + needle)` time and constant space, so adversarial inputs
+/// cannot make it quadratic.
+///
+/// This follows musl's `twoway_memmem`. The needle's maximal suffix and
+/// period are computed with both orderings; the haystack is then scanned
+/// with a shift table on the last needle byte for fast skipping.
+fn two_way(hay: &[u8], needle: &[u8]) -> Option<usize> {
+    let l = needle.len();
+    debug_assert!(l >= 2);
+    if hay.len() < l {
+        return None;
+    }
+    let n = needle;
     // Byte set and last-occurrence shift table.
     let mut byteset = [0u64; 4];
     let mut shift = [0usize; 256];
@@ -431,10 +868,8 @@ mod tests {
 
     fn for_each_level(f: impl Fn()) {
         use core::sync::atomic::Ordering;
-        for level in [0u8, 1] {
-            if level == 1 && crate::arch::cpu::detect() != crate::arch::cpu::Level::Avx2 {
-                continue;
-            }
+        let supported = crate::arch::cpu::detect() as u8;
+        for level in 0u8..=supported {
             super::super::simd::LEVEL_FOR_TESTS.store(level, Ordering::Relaxed);
             f();
         }
@@ -575,6 +1010,41 @@ mod tests {
     }
 
     #[test]
+    fn memchr_memcmp_small_inputs_at_page_edges() {
+        for_each_level(|| {
+            let page = PAGE_SIZE;
+            let mut region = vec![0u8; 3 * page];
+            let base = (region.as_ptr() as usize + page - 1) & !(page - 1);
+            let off = base - region.as_ptr() as usize;
+            let mut rng = Rng(5);
+            for _ in 0..4000 {
+                let len = rng.below(70);
+                // Start anywhere from 70 bytes before the boundary to just after it.
+                let start = off + page - rng.below(len + 72);
+                let data: Vec<u8> = (0..len).map(|_| b'a' + rng.below(3) as u8).collect();
+                region[start..start + len].copy_from_slice(&data);
+                // Bytes outside the slice contain the needle, to catch masking bugs.
+                region[start.saturating_sub(64)..start].fill(b'c');
+                region[start + len..start + len + 64].fill(b'c');
+                let hay = &region[start..start + len];
+                assert_eq!(memchr(hay, b'c'), data.iter().position(|&b| b == b'c'));
+                assert_eq!(memrchr(hay, b'c'), data.iter().rposition(|&b| b == b'c'));
+                let mut other = data.clone();
+                if len > 0 && rng.below(2) == 0 {
+                    let k = rng.below(len);
+                    other[k] ^= 1;
+                }
+                let expected = match data.iter().zip(&other).find(|(x, y)| x != y) {
+                    Some((&x, &y)) => x as c_int - y as c_int,
+                    None => 0,
+                };
+                assert_eq!(memcmp(hay, &other), expected);
+                assert_eq!(memcmp(&other, hay), -expected);
+            }
+        });
+    }
+
+    #[test]
     fn memmem_matches_naive() {
         fn naive(h: &[u8], n: &[u8]) -> Option<usize> {
             if n.is_empty() {
@@ -582,15 +1052,31 @@ mod tests {
             }
             h.windows(n.len()).position(|w| w == n)
         }
-        let mut rng = Rng(42);
-        for _ in 0..20000 {
-            let alphabet = 1 + rng.below(3);
-            let hl = rng.below(60);
-            let nl = rng.below(8);
-            let h: Vec<u8> = (0..hl).map(|_| b'a' + rng.below(alphabet) as u8).collect();
-            let n: Vec<u8> = (0..nl).map(|_| b'a' + rng.below(alphabet) as u8).collect();
-            assert_eq!(memmem(&h, &n), naive(&h, &n), "h={h:?} n={n:?}");
-        }
+        for_each_level(|| {
+            let mut rng = Rng(42);
+            for _ in 0..20000 {
+                let alphabet = 1 + rng.below(3);
+                let long = rng.below(4) == 0;
+                let hl = rng.below(if long { 300 } else { 60 });
+                let nl = rng.below(8);
+                let h: Vec<u8> = (0..hl).map(|_| b'a' + rng.below(alphabet) as u8).collect();
+                let n: Vec<u8> = (0..nl).map(|_| b'a' + rng.below(alphabet) as u8).collect();
+                assert_eq!(memmem(&h, &n), naive(&h, &n), "h={h:?} n={n:?}");
+                if nl >= 2 && hl >= nl {
+                    assert_eq!(two_way(&h, &n), naive(&h, &n), "two_way h={h:?} n={n:?}");
+                }
+            }
+        });
+        // A needle whose first and last bytes match everywhere exhausts
+        // the scan's verification budget and falls back to Two-Way.
+        let hay: Vec<u8> = core::iter::repeat_n(b'a', 20000).collect();
+        let mut needle: Vec<u8> = core::iter::repeat_n(b'a', 40).collect();
+        needle[20] = b'b';
+        assert_eq!(memmem(&hay, &needle), None);
+        let mut hay2 = hay.clone();
+        hay2[19000] = b'b';
+        assert_eq!(memmem(&hay2, &needle), Some(19000 - 20));
+        assert_eq!(two_way(&hay2, &needle), Some(19000 - 20));
         // Periodic and pathological needles.
         let cases: &[(&[u8], &[u8])] = &[
             (b"aaaaaaaaaaaaaaaaaaaaaaaaab", b"aaaaab"),
