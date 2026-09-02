@@ -479,19 +479,17 @@ pub unsafe fn format<S: Sink>(sink: &mut S, fmt: *const u8, ap: &mut VaList) -> 
         count: 0,
         failed: false,
     };
-    let mut vals = [0u64; MAX_POS];
+    // Positional arguments (`%2$d`) need all arguments fetched up front;
+    // a single scan for '$' decides. The table is only filled in then.
+    let mut vals: [u64; MAX_POS];
     // SAFETY: forwarded.
-    let uses_positional = unsafe {
-        crate::string::search::memchr(
-            core::slice::from_raw_parts(fmt, crate::string::search::strlen(fmt)),
-            b'$',
-        )
-        .is_some()
-    };
+    let uses_positional = unsafe { !crate::string::search::strchr_ptr(fmt, b'$').is_null() };
     let mut args = if uses_positional {
+        vals = [0; MAX_POS];
+        let table = &mut vals;
         // SAFETY: forwarded.
-        match unsafe { fetch_positional(fmt, ap, &mut vals) } {
-            Some(n) => Args::Pos(&vals[..n]),
+        match unsafe { fetch_positional(fmt, ap, table) } {
+            Some(n) => Args::Pos(&table[..n]),
             None => {
                 Errno::EINVAL.set();
                 return -1;
