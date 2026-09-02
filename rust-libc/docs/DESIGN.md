@@ -36,7 +36,10 @@ call the `v*` variant, which walks the `va_list` by hand.
   and runs it. These are the integration tests: startup, TLS, threads,
   signals, stdio and everything else that only makes sense end-to-end.
 * `tests/c/abi.c` checks that the C headers and the Rust
-  `#[repr(C)]` types agree on sizes and offsets.
+  `#[repr(C)]` types agree on sizes and offsets (the Rust side has
+  matching compile-time assertions in `lib.rs`).
+* `cargo xtask bench` compiles `bench/bench.c` twice, against rustlibc and
+  the host glibc, and prints both results with their ratio.
 
 ## Startup
 
