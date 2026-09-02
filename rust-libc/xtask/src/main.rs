@@ -8,6 +8,7 @@
 //! cargo xtask bench alloc  # the allocator workloads in bench/alloc.c
 //! cargo xtask --aarch64 test  # cross-build with aarch64-linux-gnu-gcc,
 //!                             # run under qemu-aarch64
+//! cargo xtask --pie test      # link the tests as static PIEs
 //! ```
 //!
 //! Each C test (or C++ test, `*.cpp`, linked with the host toolchain's
@@ -39,6 +40,13 @@ enum Target {
 }
 
 static TARGET: Mutex<Target> = Mutex::new(Target::Host);
+/// Link the test programs as static PIEs instead of fixed-address
+/// executables.
+static PIE: Mutex<bool> = Mutex::new(false);
+
+fn pie() -> bool {
+    *PIE.lock().unwrap()
+}
 
 fn target() -> Target {
     *TARGET.lock().unwrap()
@@ -165,9 +173,13 @@ fn compile_cmd(sysroot: &Path, src: &Path, out: &Path, extra: &[String]) -> Comm
         "-Wextra",
         "-Werror",
         "-fstack-protector-strong",
-        "-static",
-        "-no-pie",
-        "-fno-pie",
+    ]);
+    if pie() {
+        cmd.args(["-static-pie", "-fPIE"]);
+    } else {
+        cmd.args(["-static", "-no-pie", "-fno-pie"]);
+    }
+    cmd.args([
         "-nostdlib",
         "-nostartfiles",
         "-nostdinc",
@@ -370,10 +382,13 @@ fn test(filter: Option<&str>, release: bool) -> ExitCode {
         }
     };
     let root = root();
-    let bindir = root.join("target").join(match target() {
+    let mut bindir = root.join("target").join(match target() {
         Target::Host => "ctests".to_string(),
         t => format!("ctests-{}", t.sysroot_name().trim_start_matches("sysroot-")),
     });
+    if pie() {
+        bindir.set_file_name(format!("{}-pie", bindir.file_name().unwrap().to_string_lossy()));
+    }
     fs::create_dir_all(&bindir).unwrap();
     let cxx_ok = have_cxx();
     if !cxx_ok {
@@ -527,10 +542,13 @@ fn main() -> ExitCode {
     if args.iter().any(|a| a == "--aarch64") {
         *TARGET.lock().unwrap() = Target::Aarch64;
     }
+    if args.iter().any(|a| a == "--pie") {
+        *PIE.lock().unwrap() = true;
+    }
     let args: Vec<&str> = args
         .iter()
         .map(String::as_str)
-        .filter(|a| *a != "--debug" && *a != "--aarch64")
+        .filter(|a| *a != "--debug" && *a != "--aarch64" && *a != "--pie")
         .collect();
     match args.as_slice() {
         ["build"] => match build(release) {
@@ -549,7 +567,7 @@ fn main() -> ExitCode {
         ["bench", filter] => bench(Some(filter), release),
         _ => {
             eprintln!(
-                "usage: cargo xtask [--debug] [--aarch64] build | test [FILTER] | bench [mem|malloc|stdlib|alloc]"
+                "usage: cargo xtask [--debug] [--aarch64] [--pie] build | test [FILTER] | bench [mem|malloc|stdlib|alloc]"
             );
             ExitCode::FAILURE
         }

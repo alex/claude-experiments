@@ -41,6 +41,18 @@ struct AuxvCell(UnsafeCell<*const usize>);
 unsafe impl Sync for AuxvCell {}
 static AUXV: AuxvCell = AuxvCell(UnsafeCell::new(core::ptr::null()));
 
+struct BiasCell(UnsafeCell<usize>);
+// SAFETY: written once during single-threaded startup.
+unsafe impl Sync for BiasCell {}
+static LOAD_BIAS: BiasCell = BiasCell(UnsafeCell::new(0));
+
+/// The executable's load bias: the difference between its runtime and
+/// link-time addresses (zero unless it is a static PIE).
+pub fn load_bias() -> usize {
+    // SAFETY: only written during startup.
+    unsafe { *LOAD_BIAS.0.get() }
+}
+
 /// The stack protector canary on architectures whose compilers read it
 /// from a global rather than the TCB.
 #[cfg(all(target_arch = "aarch64", not(test)))]
@@ -118,6 +130,12 @@ unsafe fn run_array(
 /// Must only be called once, by `_start`.
 #[cfg(not(test))]
 pub unsafe extern "C" fn start_c(sp: *const usize) -> ! {
+    // A static PIE must relocate itself before any pointer in its data
+    // (including the statics below) can be trusted.
+    // SAFETY: called once, first.
+    let bias = unsafe { crate::reloc::relocate() };
+    // SAFETY: startup is single-threaded.
+    unsafe { *LOAD_BIAS.0.get() = bias };
     // SAFETY: the kernel lays out argc, argv, NULL, envp, NULL, auxv.
     let (argc, argv, envp) = unsafe {
         let argc = *sp;

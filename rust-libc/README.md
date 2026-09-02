@@ -3,7 +3,9 @@
 A Linux libc written from scratch in Rust.
 
 * **Static only.** Programs link `libc.a` and talk directly to the stable
-  Linux kernel ABI. There is no dynamic loader.
+  Linux kernel ABI. There is no dynamic loader; static PIE (`-static-pie`,
+  address-space randomised) is supported and the executable relocates
+  itself at startup.
 * **Performance conscious.** SIMD string routines with runtime CPU
   dispatch (SSE2 / AVX2 / AVX-512BW on x86_64, NEON on AArch64), a
   size-class allocator with per-thread caches, buffered stdio, the vDSO
@@ -51,12 +53,14 @@ cargo xtask bench alloc  # the allocator workloads in bench/alloc.c
 cargo test -p rustlibc   # host unit tests of the pure Rust code
 cargo xtask --aarch64 test   # cross-build with aarch64-linux-gnu-gcc and
                              # run the suite under qemu-aarch64
+cargo xtask --pie test       # link every test as a static PIE
 ```
 
 The AArch64 build needs `rustup target add aarch64-unknown-linux-gnu`,
 `gcc-aarch64-linux-gnu` and `qemu-user`.
 
-To compile a program against it:
+To compile a program against it (replace `-static` with `-static-pie
+-fPIE` for a position-independent executable):
 
 ```
 cc -static -nostdlib -nostartfiles -nostdinc -Wl,--eh-frame-hdr \
@@ -106,8 +110,8 @@ TCP fallback, search list, PTR), time zones (`TZ`, TZif files, POSIX
 rules), the vDSO for the clock calls, and `pthread_cancel` (deferred and
 asynchronous).
 
-Known limitations: no PIE or static-pie; multibyte conversion is UTF-8
-only; `long double` is treated as `double` (no `*l` math functions;
+Known limitations: no dynamic linking (static and static-pie only);
+multibyte conversion is UTF-8 only; `long double` is treated as `double` (no `*l` math functions;
 `strtold` returns a `double`'s precision, in the platform's `long double`
 format); no `dlopen` (static linking only); cancellation is acted on at
 cancellation points rather than at any instruction inside a system call;

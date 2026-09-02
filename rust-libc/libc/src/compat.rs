@@ -724,7 +724,6 @@ pub struct DlFindObject {
 }
 
 const PT_LOAD: u32 = 1;
-const PT_PHDR: u32 = 6;
 const PT_GNU_EH_FRAME: u32 = 0x6474_e550;
 
 /// `_dl_find_object`: describes the (only) object containing `addr`, for
@@ -742,14 +741,9 @@ pub unsafe extern "C" fn _dl_find_object(addr: *mut c_void, result: *mut DlFindO
     }
     // SAFETY: AT_PHDR/AT_PHNUM describe the executable's own headers.
     let headers = unsafe { core::slice::from_raw_parts(phdr, phnum) };
-    // Load bias: zero for a non-PIE executable; otherwise the PT_PHDR
-    // entry reveals it (as in `dl_iterate_phdr`).
-    let mut base = 0usize;
-    for ph in headers {
-        if ph.p_type == PT_PHDR {
-            base = (phdr as usize).wrapping_sub(ph.p_vaddr as usize);
-        }
-    }
+    // Load bias: zero for a non-PIE executable; a static PIE recorded it
+    // when it relocated itself.
+    let base = crate::start::load_bias();
     let (mut lo, mut hi, mut found, mut eh) = (usize::MAX, 0usize, false, ptr::null_mut());
     for ph in headers {
         let start = base.wrapping_add(ph.p_vaddr as usize);

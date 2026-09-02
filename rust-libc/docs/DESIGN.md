@@ -47,6 +47,15 @@ call the `v*` variant, which walks the `va_list` by hand.
 `_start` (assembly) passes the initial stack pointer to
 `start::start_c`, which:
 
+0. relocates the executable if it is a static PIE (`reloc.rs`): the
+   load bias is the runtime address of the ELF header (`__ehdr_start`,
+   PC-relative) minus the link-time address of the segment holding it;
+   the `PT_DYNAMIC` entry then leads to the `DT_RELA`/`DT_RELR` tables
+   whose `R_*_RELATIVE` entries get the bias added. Until that is done
+   nothing may touch a pointer stored in data (statics, the GOT that
+   x86_64 Rust calls go through), so this step is inlined and uses only
+   its stack. Afterwards the RELRO segment is made read-only, for
+   fixed-address executables too;
 1. splits it into `argc`/`argv`/`envp`/auxv and sets `environ`;
 2. finds `PT_TLS` via `AT_PHDR`, maps a region for the main thread's static
    TLS block and TCB, copies the TLS image and installs the thread pointer

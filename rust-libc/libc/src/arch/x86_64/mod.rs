@@ -374,3 +374,19 @@ pub const JMPBUF_MASK_WORD: usize = 9;
 pub const VDSO_CLOCK_GETTIME: &[u8] = b"__vdso_clock_gettime";
 #[allow(missing_docs)]
 pub const VDSO_GETCPU: &[u8] = b"__vdso_getcpu";
+
+/// Runtime address of the ELF header of the executable (the linker's
+/// `__ehdr_start`), obtained PC-relative so it is valid before any
+/// relocation has been applied.
+#[inline(always)]
+pub fn ehdr_start() -> *const u8 {
+    let p: *const u8;
+    // SAFETY: a PC-relative address computation.
+    unsafe {
+        asm!("lea {}, [rip + __ehdr_start]", out(reg) p, options(nomem, nostack, preserves_flags));
+    }
+    p
+}
+
+/// `R_X86_64_RELATIVE`.
+pub const R_RELATIVE: u32 = 8;

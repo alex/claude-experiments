@@ -40,17 +40,10 @@ pub unsafe extern "C" fn dl_iterate_phdr(callback: PhdrCallback, data: *mut c_vo
     if phdr.is_null() {
         return 0;
     }
-    // The load address of a non-PIE executable is zero; for a static PIE
-    // it is the difference between the runtime and link addresses of the
-    // headers, which the PT_PHDR entry reveals.
-    // SAFETY: AT_PHDR/AT_PHNUM describe the executable's own header table.
-    let headers = unsafe { core::slice::from_raw_parts(phdr, phnum) };
-    let base = headers
-        .iter()
-        .find(|ph| ph.p_type == 6)
-        .map_or(0, |ph| (phdr as usize).wrapping_sub(ph.p_vaddr as usize));
     let mut info = DlPhdrInfo {
-        dlpi_addr: base,
+        // Zero for a non-PIE executable; a static PIE recorded its load
+        // bias when it relocated itself.
+        dlpi_addr: crate::start::load_bias(),
         dlpi_name: c"".as_ptr(),
         dlpi_phdr: phdr,
         dlpi_phnum: phnum as u16,

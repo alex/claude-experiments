@@ -93,7 +93,7 @@ pub unsafe fn init_from_phdrs(phdr: *const Elf64Phdr, phnum: usize) {
         let ph = unsafe { *phdr.add(i) };
         if ph.p_type == PT_TLS {
             let image = Image {
-                addr: ph.p_vaddr as usize as *const u8,
+                addr: (ph.p_vaddr as usize).wrapping_add(crate::start::load_bias()) as *const u8,
                 filesz: ph.p_filesz as usize,
                 memsz: ph.p_memsz as usize,
                 align: (ph.p_align as usize).max(1),

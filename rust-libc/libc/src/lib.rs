@@ -52,6 +52,7 @@ pub mod resolv;
 pub mod search;
 pub mod signal;
 pub mod socket;
+pub mod reloc;
 pub mod start;
 pub mod stdio;
 pub mod stdlib;
