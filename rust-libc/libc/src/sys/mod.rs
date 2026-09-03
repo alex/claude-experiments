@@ -192,6 +192,17 @@ pub fn getrandom_exact(mut buf: &mut [u8]) -> Result<()> {
 /// Returns `Ok(())` when woken, or when the value already differed
 /// (`EAGAIN`). Any timeout is relative.
 pub fn futex_wait(addr: &AtomicU32, expected: u32, timeout: Option<&Timespec>) -> Result<()> {
+    match futex_wait_raw(addr, expected, timeout) {
+        Ok(()) | Err(Errno::EAGAIN) => Ok(()),
+        Err(e) => Err(e),
+    }
+}
+
+/// [`futex_wait`] reporting the kernel's result as it is: `Ok(())` only
+/// when actually woken by a `FUTEX_WAKE` (or a requeue followed by one),
+/// `Err(EAGAIN)` when the value already differed, `Err(EINTR)` for a
+/// signal.
+pub fn futex_wait_raw(addr: &AtomicU32, expected: u32, timeout: Option<&Timespec>) -> Result<()> {
     const FUTEX_WAIT_PRIVATE: usize = 128;
     let ts = timeout.map_or(core::ptr::null(), |t| t as *const Timespec);
     // SAFETY: `addr` and `ts` are valid for the duration of the call.
@@ -204,10 +215,7 @@ pub fn futex_wait(addr: &AtomicU32, expected: u32, timeout: Option<&Timespec>) -
             ts as usize,
         )
     };
-    match check(r) {
-        Ok(_) | Err(Errno::EAGAIN) => Ok(()),
-        Err(e) => Err(e),
-    }
+    check(r).map(|_| ())
 }
 
 /// `futex(FUTEX_WAIT)` with a *shared* key. Needed to wait for the tid

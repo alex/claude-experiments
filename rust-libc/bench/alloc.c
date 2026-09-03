@@ -485,6 +485,157 @@ static double xmalloc_test(long batches) {
     return total / NTHREADS;
 }
 
+// fan-out free: one thread allocates everything and hands batches to N
+// freeing threads in turn, so every free is remote and all the remote
+// frees of a span come from several threads at once.
+struct fo_arg { void **mailbox; volatile int *ready; int nfree; long batches; double secs; };
+enum { FO_B = 256 };
+static void *fanout_freer(void *p) {
+    struct fo_arg *a = p;
+    void ***mailbox = (void ***)a->mailbox;
+    for (;;) {
+        while (!__atomic_load_n(a->ready, __ATOMIC_ACQUIRE)) sched_yield();
+        void **batch = *mailbox;
+        __atomic_store_n(a->ready, 0, __ATOMIC_RELEASE);
+        if (!batch) return NULL;
+        for (int i = 0; i < FO_B; i++) free(batch[i]);
+        free(batch);
+    }
+}
+
+static double fanout_free(int nfree, long batches) {
+    pthread_t th[16];
+    struct fo_arg args[16];
+    void *mailbox[16] = {0};
+    volatile int ready[16] = {0};
+    for (int i = 0; i < nfree; i++) {
+        args[i].mailbox = &mailbox[i];
+        args[i].ready = &ready[i];
+        pthread_create(&th[i], NULL, fanout_freer, &args[i]);
+    }
+    uint64_t s = 99;
+    double t0 = now();
+    for (long b = 0; b < batches; b++) {
+        void **batch = malloc(FO_B * sizeof *batch);
+        for (int i = 0; i < FO_B; i++) {
+            batch[i] = malloc(16 + rnd(&s) % 240);
+            ((char *)batch[i])[0] = 1;
+        }
+        int k = b % nfree;
+        while (__atomic_load_n(&ready[k], __ATOMIC_ACQUIRE)) sched_yield();
+        mailbox[k] = batch;
+        __atomic_store_n(&ready[k], 1, __ATOMIC_RELEASE);
+    }
+    for (int k = 0; k < nfree; k++) {
+        while (__atomic_load_n(&ready[k], __ATOMIC_ACQUIRE)) sched_yield();
+        mailbox[k] = NULL;
+        __atomic_store_n(&ready[k], 1, __ATOMIC_RELEASE);
+    }
+    for (int i = 0; i < nfree; i++) pthread_join(th[i], NULL);
+    return now() - t0;
+}
+
+// parallel free: the main thread allocates everything up front, then N
+// threads free it all at once while the main thread waits, either each
+// thread taking every N-th block (all threads hit the same spans and
+// words together) or a contiguous chunk.
+struct pf_arg { void **blocks; long n; int id; int nthreads; int interleaved; };
+static void *parallel_freer(void *p) {
+    struct pf_arg *a = p;
+    if (a->interleaved) {
+        for (long i = a->id; i < a->n; i += a->nthreads) free(a->blocks[i]);
+    } else {
+        long per = a->n / a->nthreads;
+        long lo = per * a->id, hi = a->id == a->nthreads - 1 ? a->n : lo + per;
+        for (long i = lo; i < hi; i++) free(a->blocks[i]);
+    }
+    return NULL;
+}
+
+static double parallel_free(int nthreads, long n, size_t size, int interleaved) {
+    void **blocks = malloc(n * sizeof *blocks);
+    uint64_t s = 5;
+    for (long i = 0; i < n; i++) {
+        blocks[i] = malloc(size ? size : 16 + rnd(&s) % 240);
+        ((char *)blocks[i])[0] = 1;
+    }
+    pthread_t th[16];
+    struct pf_arg args[16];
+    double t0 = now();
+    for (int i = 0; i < nthreads; i++) {
+        args[i] = (struct pf_arg){blocks, n, i, nthreads, interleaved};
+        pthread_create(&th[i], NULL, parallel_freer, &args[i]);
+    }
+    for (int i = 0; i < nthreads; i++) pthread_join(th[i], NULL);
+    double t = now() - t0;
+    free(blocks);
+    return t;
+}
+
+// frame pipeline (the shape of a video reader): one thread allocates
+// large frame buffers into a bounded pool and hands them over a
+// mutex/condvar queue; workers take one each, do a burst of short-lived
+// vectors, and free the frame. Every frame free is remote, and the reader
+// stalls whenever a freed frame does not come back promptly.
+#define FRAME_POOL 8
+#define FRAME_SIZE (690 * 1024)
+static pthread_mutex_t fp_mu = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t fp_cv = PTHREAD_COND_INITIALIZER;
+static void *fp_queue[FRAME_POOL];
+static int fp_head, fp_tail, fp_inflight, fp_done;
+static double fp_wait;
+
+static void *frame_worker(void *p) {
+    (void)p;
+    uint64_t s = (uint64_t)(uintptr_t)&s;
+    for (;;) {
+        pthread_mutex_lock(&fp_mu);
+        while (fp_head == fp_tail && !fp_done) pthread_cond_wait(&fp_cv, &fp_mu);
+        if (fp_head == fp_tail) { pthread_mutex_unlock(&fp_mu); return NULL; }
+        char *frame = fp_queue[fp_tail++ % FRAME_POOL];
+        pthread_mutex_unlock(&fp_mu);
+        // A strip's worth of work: a few dozen short-lived vectors.
+        void *v[48];
+        for (int i = 0; i < 48; i++) { v[i] = malloc(16 + rnd(&s) % 2000); ((char *)v[i])[0] = frame[i * 4096]; }
+        for (int i = 0; i < 48; i++) free(v[i]);
+        free(frame);
+        pthread_mutex_lock(&fp_mu);
+        fp_inflight--;
+        pthread_cond_broadcast(&fp_cv);
+        pthread_mutex_unlock(&fp_mu);
+    }
+}
+
+static double frame_pipeline(int workers, long frames) {
+    pthread_t th[64];
+    fp_head = fp_tail = fp_inflight = fp_done = 0;
+    fp_wait = 0;
+    for (int i = 0; i < workers; i++) pthread_create(&th[i], NULL, frame_worker, NULL);
+    double t0 = now();
+    for (long f = 0; f < frames; f++) {
+        pthread_mutex_lock(&fp_mu);
+        double w0 = now();
+        while (fp_inflight == FRAME_POOL) pthread_cond_wait(&fp_cv, &fp_mu);
+        fp_wait += now() - w0;
+        fp_inflight++;
+        pthread_mutex_unlock(&fp_mu);
+        char *frame = malloc(FRAME_SIZE);
+        for (size_t off = 0; off < FRAME_SIZE; off += 4096) frame[off] = (char)f;
+        pthread_mutex_lock(&fp_mu);
+        fp_queue[fp_head++ % FRAME_POOL] = frame;
+        pthread_cond_broadcast(&fp_cv);
+        pthread_mutex_unlock(&fp_mu);
+    }
+    pthread_mutex_lock(&fp_mu);
+    fp_done = 1;
+    pthread_cond_broadcast(&fp_cv);
+    pthread_mutex_unlock(&fp_mu);
+    for (int i = 0; i < workers; i++) pthread_join(th[i], NULL);
+    double t = now() - t0;
+    if (getenv("BENCH_VERBOSE")) fprintf(stderr, "  reader waited %.0f%% of the time\n", 100 * fp_wait / t);
+    return t;
+}
+
 // cache-scratch: objects allocated by the main thread are freed and
 // reallocated by workers, which then write them repeatedly. False
 // sharing between the workers' objects shows up as slowness.
@@ -638,6 +789,16 @@ int main(int argc, char **argv) {
     TIMED("producer/consumer", 400000, producer_consumer(400000, 0));
     TIMED("producer/consumer (sync only)", 400000, producer_consumer(400000, 1));
     TIMED("xmalloc-test 4 threads", 800 * 256 * 2, xmalloc_test(800));
+    TIMED("fan-out free, 3 freeing threads", 3000 * 256, fanout_free(3, 3000));
+    TIMED("fan-out free, 7 freeing threads", 3000 * 256, fanout_free(7, 3000));
+    TIMED("parallel free 64B, 4 thr interleaved", 1000000, parallel_free(4, 1000000, 64, 1));
+    TIMED("parallel free 64B, 4 thr contiguous", 1000000, parallel_free(4, 1000000, 64, 0));
+    TIMED("parallel free 64B, 16 thr interleaved", 1000000, parallel_free(16, 1000000, 64, 1));
+    TIMED("parallel free mixed, 4 thr interleaved", 1000000, parallel_free(4, 1000000, 0, 1));
+    TIMED("parallel free 4K, 4 thr interleaved", 200000, parallel_free(4, 200000, 4096, 1));
+    TIMED("parallel free 2M, 4 thr", 400, parallel_free(4, 400, 2 << 20, 1));
+    TIMED("frame pipeline, 8 workers", 20000, frame_pipeline(8, 20000));
+    TIMED("frame pipeline, 40 workers", 20000, frame_pipeline(40, 20000));
     TIMED("cache-scratch", 20000000, cache_scratch(20000000));
     TIMED("cache-thrash", 20000000, cache_thrash(20000000));
     TIMED("mstress 4 threads", 500000, mstress(500000));

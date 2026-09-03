@@ -111,7 +111,7 @@ mod abi_asserts {
     const _: () = assert!(size_of::<crate::search::Entry>() == 16);
     const _: () = assert!(size_of::<crate::search::HsearchData>() == 16);
     const _: () = assert!(size_of::<crate::thread::sync::Mutex>() == 20);
-    const _: () = assert!(size_of::<crate::thread::sync::Cond>() == 16);
+    const _: () = assert!(size_of::<crate::thread::sync::Cond>() == 32);
     const _: () = assert!(size_of::<crate::thread::sync::RwLock>() == 16);
     const _: () = assert!(size_of::<crate::thread::sync::Barrier>() == 16);
     const _: () = assert!(size_of::<crate::thread::sync::Sem>() == 16);

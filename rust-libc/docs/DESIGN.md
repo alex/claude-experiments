@@ -163,6 +163,18 @@ thread's working set compact. Blocks freed by another thread are marked
 in the span's remote-free bitmap, batched per freeing thread (one atomic
 `or` per bitmap word per batch of 64) with a summary word the owner
 swaps out to find what to collect; collecting is again metadata only.
+A batch is flushed when it is full, when it holds more than 32 KiB (a
+thread that frees one big buffer per work item and nothing else remote
+must not strand a dozen of them; a video reader waiting for its frame
+buffers to come back from forty workers found exactly that), and
+whenever the freeing thread's own caches are refilled or flushed. The
+owner collects a span's remote frees when it looks for blocks of that
+class, and every 250 ms sweeps all its spans from the refill and flush
+paths, so memory other threads freed for it comes back even for classes
+it no longer allocates. An owner that never allocates again keeps what
+others freed for it until it does (mimalloc has the same limitation;
+glibc and jemalloc, whose remote frees go straight to a locked shared
+structure, do not).
 The state bytes cost 6% of the smallest class and under 1% from 128
 bytes up, the same order as glibc's chunk headers and far less than the
 cost of trusting freed memory.
@@ -250,12 +262,22 @@ other case, and any request for more than 15 digits, uses the exact mode.
   design) rather than the classic three-state futex word: an unlock only
   makes the `futex_wake` system call when somebody is asleep, and the
   futex word stays stable while the lock is held so sleepers are not
-  woken with `EAGAIN` as other waiters arrive. On a four-thread
-  producer/consumer workload this measured 5-10x faster than the
-  three-state design, which keeps waking after every contended acquire.
-  A contended acquire spins briefly (reading only, and not at all once
-  somebody sleeps on the lock) before sleeping. Condition variable
-  signals and broadcasts skip the sequence bump when nobody waits.
+  woken with `EAGAIN` as other waiters arrive. A bit of the count word
+  marks a wake-up in flight, so the unlocks that happen while the woken
+  thread is still on its way to the CPU do not each wake somebody else
+  (that alone halved the futex calls of a forty-worker pipeline). A
+  contended acquire spins ten iterations (reading only) before
+  sleeping: enough to ride out the tiny critical sections, measured
+  against 0, 30 and 100 on ping-pong, pipeline and allocator workloads.
+* Condition variable signals and broadcasts skip the sequence bump when
+  nobody waits. A broadcast wakes one waiter and requeues the rest onto
+  the mutex (`FUTEX_CMP_REQUEUE`), raising the mutex's waiter count for
+  them; each takes it back when it reacquires the mutex. Without this,
+  forty idle workers on one queue all woke on every broadcast, fought
+  for the mutex and went back to sleep, nine tenths of the program's
+  system calls. Timed waits sleep on a separate word and are woken
+  rather than requeued, since a thread whose wait timed out cannot tell
+  whether it had been moved. `pthread_cond_t` is 32 bytes.
 * `pthread_join` keeps the finished thread's stack mapping for the next
   `pthread_create`.
 * `qsort` is an introsort with three-way partitioning, so equal keys and

@@ -13,8 +13,19 @@ use core::sync::atomic::{AtomicU32, Ordering};
 const UNLOCKED: u32 = 0;
 const LOCKED: u32 = 1;
 
+/// Bit of [`RawMutex::waiters`] set while a wake-up is in flight: an
+/// unlock has woken a sleeper that has not run yet. Further unlocks do
+/// not wake anybody until it does, so a hand-off costs one `futex_wake`
+/// rather than one per unlock while the sleeper is in transit (tens of
+/// microseconds on a busy machine, many unlocks). The bit is cleared by
+/// whoever returns from a futex wait on the lock, and by an unlock whose
+/// wake found nobody asleep.
+const WAKING: u32 = 1 << 31;
+/// The waiter count proper.
+const COUNT: u32 = WAKING - 1;
+
 /// Load-only spin iterations before a contended acquire sleeps.
-const SPIN: u32 = 40;
+const SPIN: u32 = 10;
 
 /// A small futex based mutex.
 ///
@@ -69,10 +80,11 @@ impl RawMutex {
     }
 
     /// Spins briefly, reading only, so waiters do not fight the holder for
-    /// the cache line; most critical sections are tiny. Spinning stops as
-    /// soon as somebody is asleep on the lock: barging past a sleeper only
-    /// burns CPU and delays it further. Returns true if the lock was
-    /// acquired.
+    /// the cache line; most critical sections are tiny, and on a machine
+    /// with cores to spare a spin that succeeds saves a sleep and a wake
+    /// (two system calls and a context switch) for every hand-off, so it
+    /// is done whether or not somebody else is already asleep. Returns
+    /// true if the lock was acquired.
     #[inline]
     fn spin(&self) -> bool {
         for _ in 0..SPIN {
@@ -80,8 +92,6 @@ impl RawMutex {
                 if self.try_lock() {
                     return true;
                 }
-            } else if self.waiters.load(Ordering::Relaxed) != 0 {
-                return false;
             } else {
                 core::hint::spin_loop();
             }
@@ -104,7 +114,11 @@ impl RawMutex {
             if self.state.load(Ordering::SeqCst) == UNLOCKED && self.try_lock() {
                 break true;
             }
-            if !wait() {
+            let r = wait();
+            // Whether woken, timed out or returned early, the wake-up (if
+            // any) has been consumed: let the next unlock issue another.
+            self.waiters.fetch_and(!WAKING, Ordering::SeqCst);
+            if !r {
                 break false;
             }
         };
@@ -137,11 +151,47 @@ impl RawMutex {
         })
     }
 
+    /// The word sleepers wait on, for a condition variable that moves its
+    /// waiters onto this lock (`FUTEX_CMP_REQUEUE`).
+    pub fn futex_word(&self) -> &AtomicU32 {
+        &self.state
+    }
+
+    /// Accounts for `n` threads that a condition variable is about to
+    /// wake or move onto this lock's futex: each of them takes the lock
+    /// back through [`RawMutex::lock_after_wake`]. Done before they can
+    /// possibly run, so the count never goes below the true number of
+    /// sleepers (too high only costs a spurious wake; too low would lose
+    /// one).
+    pub fn add_waiters(&self, n: u32) {
+        self.waiters.fetch_add(n, Ordering::SeqCst);
+    }
+
+    /// Takes back part of an [`RawMutex::add_waiters`] that turned out
+    /// not to be needed.
+    pub fn sub_waiters(&self, n: u32) {
+        self.waiters.fetch_sub(n, Ordering::SeqCst);
+    }
+
+    /// Acquires the lock for a thread counted by [`RawMutex::add_waiters`]
+    /// that has just been woken (by a signal, or by an unlock after being
+    /// requeued onto the lock).
+    pub fn lock_after_wake(&self) {
+        self.waiters.fetch_sub(1, Ordering::SeqCst);
+        self.waiters.fetch_and(!WAKING, Ordering::SeqCst);
+        self.lock();
+    }
+
     /// Resets the lock to unlocked without waking anyone. For use in a
     /// forked child, where no other thread exists.
     pub fn force_unlock(&self) {
         self.state.store(UNLOCKED, Ordering::Release);
         self.waiters.store(0, Ordering::Relaxed);
+    }
+
+    /// Whether anybody is (or is about to be) asleep on the lock.
+    pub fn has_waiters(&self) -> bool {
+        self.waiters.load(Ordering::Relaxed) & COUNT != 0
     }
 
     /// Whether the lock is currently held (racy; for diagnostics).
@@ -171,8 +221,25 @@ impl RawMutex {
         // Sequentially consistent so the store is ordered before the load
         // of the count (see `sleep`); on x86 that is one `xchg`.
         self.state.store(UNLOCKED, Ordering::SeqCst);
-        if self.waiters.load(Ordering::SeqCst) != 0 {
-            let _ = sys::futex_wake(&self.state, 1);
+        let w = self.waiters.load(Ordering::SeqCst);
+        if w & COUNT != 0 && w & WAKING == 0 {
+            self.wake_one(w);
+        }
+    }
+
+    /// Wakes one sleeper, unless another unlock got there first.
+    #[cold]
+    fn wake_one(&self, w: u32) {
+        if self
+            .waiters
+            .compare_exchange(w, w | WAKING, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok()
+            && sys::futex_wake(&self.state, 1).unwrap_or(0) == 0
+        {
+            // Nobody was asleep yet (a registered waiter still on its way
+            // to the futex will check the state first); do not leave the
+            // bit set for a wake that never happened.
+            self.waiters.fetch_and(!WAKING, Ordering::SeqCst);
         }
     }
 }

@@ -158,29 +158,35 @@ vary between runs by up to 2x); ns per operation, lower is better.
 
 | workload | rustlibc | glibc | mimalloc | jemalloc | tcmalloc |
 |---|---|---|---|---|---|
-| malloc+free 16 B / 4 KiB / 1 MiB | 13.4 / 15.8 / 16.0 | 13.2 / 30.7 / 33.3 | 12.1 / 16.6 / 263 | 11.3 / 14.3 / 449 | 6.8 / 7.8 / 69 |
-| live set, 16-256 B | 35 | 41 | 24 | 26 | 25 |
-| live set, 256 B-8 KiB | 37 | 164 | 58 | 72 | 33 |
-| live set, 64 KiB-1 MiB | 235 | 591 | 418 | 848 | 411 |
-| cfrac (LIFO bursts) | 15 | 25 | 7.8 | 11 | 9.0 |
-| alloc-test, 100k live | 106 | 369 | 115 | 173 | 155 |
-| sh6bench | 19 | 31 | 16 | 171 | 28 |
-| glibc-simple | 20 | 30 | 9.8 | 16 | 11 |
-| malloc-large, 1-16 MiB touched | 1.0 µs | 118 µs | 1.4 µs | 208 µs | 8.1 µs |
-| calloc 64 B / 64 KiB | 21 / 3.5 µs | 25 / 2.7 µs | 9.8 / 2.5 µs | 26 / 4.7 µs | 12 / 2.6 µs |
-| memalign 64 / aligned_alloc 4 KiB | 22 / 30 | 116 / 112 | 20 / 79 | 36 / 211 | 10 / 17 |
-| realloc growth 16 B to 1 MiB | 3.0 µs | 3.3 µs | 3.2 µs | 0.17 µs | 1.9 µs |
-| realloc vectors x1.5 | 444 | 477 | 531 | 596 | 448 |
-| tree build/teardown, 200k nodes | 9.4 | 14 | 6.5 | 11 | 15 |
-| larson, 4 threads | 32 | 46 | 27 | 29 | 28 |
-| producer/consumer, 4 threads | 621 | 997 | 542 | 740 | 606 |
-| xmalloc-test, 4 threads (all frees remote) | 33 | 176 | 57 | 14 | 14 |
-| mstress, 4 threads | 29 | 149 | 40 | 70 | 33 |
-| thread churn (create, 64 mallocs, exit, join) | 39 µs | 37 µs | 40 µs | 167 µs | 39 µs |
+| malloc+free 16 B / 4 KiB / 1 MiB | 13.5 / 15.6 / 15.6 | 12.9 / 29.7 / 32.5 | 12.0 / 16.2 / 258 | 11.3 / 14.3 / 439 | 6.5 / 7.7 / 69 |
+| live set, 16-256 B | 35 | 41 | 23 | 26 | 24 |
+| live set, 256 B-8 KiB | 42 | 153 | 57 | 69 | 33 |
+| live set, 64 KiB-1 MiB | 223 | 500 | 438 | 891 | 402 |
+| cfrac (LIFO bursts) | 14 | 23 | 8.7 | 12 | 10 |
+| alloc-test, 100k live | 113 | 304 | 122 | 145 | 104 |
+| sh6bench | 19 | 32 | 15 | 139 | 27 |
+| glibc-simple | 19 | 30 | 9.5 | 16 | 12 |
+| malloc-large, 1-16 MiB touched | 1.0 µs | 132 µs | 1.5 µs | 185 µs | 8.9 µs |
+| calloc 64 B / 64 KiB | 22 / 3.2 µs | 25 / 2.6 µs | 9.8 / 2.5 µs | 26 / 4.7 µs | 12 / 2.5 µs |
+| memalign 64 / aligned_alloc 4 KiB | 21 / 32 | 114 / 110 | 19 / 80 | 34 / 217 | 10 / 17 |
+| realloc growth 16 B to 1 MiB | 2.9 µs | 3.2 µs | 3.4 µs | 0.17 µs | 1.8 µs |
+| realloc vectors x1.5 | 444 | 466 | 541 | 596 | 430 |
+| tree build/teardown, 200k nodes | 8.9 | 15 | 6.4 | 11 | 14 |
+| larson, 4 threads | 32 | 44 | 24 | 30 | 30 |
+| producer/consumer, 4 threads | 519 | 1791 | 600 | 689 | 1709 |
+| producer/consumer, sync only (no malloc) | 403 | 422 | 345 | 356 | 381 |
+| xmalloc-test, 4 threads (all frees remote) | 42 | 334 | 56 | 26 | 28 |
+| fan-out free (1 allocating, 7 freeing threads) | 43 | 600 | 93 | 104 | 160 |
+| parallel free of 1M 64 B blocks, 16 threads | 9.3 | 151 | 24 | 714 | 333 |
+| parallel free of 200k 4 KiB blocks, 4 threads | 22 | 1069 | 43 | 1147 | 386 |
+| frame pipeline (690 KiB frames, 8 workers) | 21 µs | 32 µs | 22 µs | 34 µs | 26 µs |
+| frame pipeline, 40 workers | 61 µs | 111 µs | 82 µs | 124 µs | 96 µs |
+| mstress, 4 threads | 40 | 181 | 46 | 78 | 49 |
+| thread churn (create, 64 mallocs, exit, join) | 50 µs | 41 µs | 43 µs | 174 µs | 46 µs |
 
-rustlibc is faster than glibc on every row but two within noise, and
-faster than every other allocator on the large-block and multi-threaded
-rows. mimalloc keeps a lead of about 2x on the small-block burst
+rustlibc is faster than glibc on every row but the tight pair and
+thread churn (within noise or 20%), and faster than every other
+allocator on the large-block, cross-thread-free and pipeline rows. mimalloc keeps a lead of about 2x on the small-block burst
 workloads (cfrac, glibc-simple, tree): its `free` is two stores with no
 validation, ours checks the mapping registry, the segment header, the
 block index and the block's state on every call. jemalloc's realloc row
@@ -189,11 +195,11 @@ report its resident memory at the end and again after two idle seconds
 and a little activity: rustlibc holds 1-2 MiB after the single-threaded
 workloads, against 35-240 MiB for the others.
 
-The one row where rustlibc trails glibc by more than noise is the
-condition-variable ping-pong of `producer/consumer` with the allocator
-taken out (`bench alloc:sync`): about 3x, a scheduler interaction of the
-mutex hand-off that survived a rewrite of the mutex (see
-`docs/DESIGN.md`).
+The `fan-out free`, `parallel free` and `frame pipeline` rows are the
+shape of a reader thread whose buffers are freed by a pool of workers:
+every free is a cross-thread free. rustlibc leads them by 1.4-4x; the
+40-worker pipeline oversubscribes this 4-CPU machine and mostly measures
+the mutex and condition variable hand-offs (see `docs/DESIGN.md`).
 
 ## Dependencies
 

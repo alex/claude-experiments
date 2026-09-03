@@ -11,7 +11,7 @@ use crate::errno::Errno;
 use crate::sync::RawMutex;
 use crate::sys::{self, CLOCK_MONOTONIC, CLOCK_REALTIME, Timespec};
 use core::ffi::{c_int, c_uint, c_void};
-use core::sync::atomic::{AtomicI32, AtomicU32, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicI32, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
 const MUTEX_NORMAL: u32 = 0;
 const MUTEX_RECURSIVE: u32 = 1;
@@ -48,6 +48,15 @@ fn wait(
             _ => Ok(()),
         },
     }
+}
+
+/// Untimed futex wait saying whether the thread was actually woken by a
+/// wake (true) rather than returning because the value had already
+/// changed or a signal arrived (false).
+fn wait_woken(addr: &AtomicU32, expected: u32) -> bool {
+    // A signal that already happened would make the kernel return
+    // EAGAIN; the check here is the same answer without the syscall.
+    addr.load(Ordering::SeqCst) == expected && sys::futex_wait_raw(addr, expected, None).is_ok()
 }
 
 fn wake_all(addr: &AtomicU32) {
@@ -333,14 +342,35 @@ pub extern "C" fn pthread_mutexattr_setpshared(_attr: *mut MutexAttr, pshared: c
 // Condition variables.
 
 /// `pthread_cond_t`.
+///
+/// Waiters sleep on a sequence number that every signal and broadcast
+/// bumps. A broadcast does not wake them all: it wakes one and moves the
+/// rest onto the mutex's futex (`FUTEX_CMP_REQUEUE`), so they get the
+/// mutex one at a time as it is released instead of all waking at once
+/// to fight for it (with forty idle workers on one queue that thundering
+/// herd was nine tenths of the program's system calls). The mutex's
+/// waiter count is raised by the broadcaster for the threads it moves,
+/// and each of them lowers it again when it takes the mutex back.
+///
+/// Timed waits use their own sequence word and are woken rather than
+/// moved, because a thread whose wait timed out cannot tell whether it
+/// had been moved (and so whether it was counted).
 #[repr(C)]
 pub struct Cond {
+    /// Bumped by every signal and broadcast; untimed waiters sleep on it.
     seq: AtomicU32,
-    clock: u32,
-    /// Threads blocked (or about to block) in a wait, so signals with
-    /// nobody waiting skip the futex syscall.
+    /// Likewise, for timed waiters.
+    seq_timed: AtomicU32,
+    /// Untimed threads blocked (or about to block) in a wait, so signals
+    /// with nobody waiting skip the futex syscall.
     waiters: AtomicU32,
+    /// Timed threads blocked (or about to block).
+    waiters_timed: AtomicU32,
+    clock: u32,
     _pad: u32,
+    /// The mutex the waiters hold (POSIX requires all concurrent waiters
+    /// to use the same one), for requeueing.
+    mutex: AtomicUsize,
 }
 
 /// `pthread_condattr_t`.
@@ -364,9 +394,12 @@ pub unsafe extern "C" fn pthread_cond_init(c: *mut Cond, attr: *const CondAttr) 
         };
         c.write(Cond {
             seq: AtomicU32::new(0),
-            clock,
+            seq_timed: AtomicU32::new(0),
             waiters: AtomicU32::new(0),
+            waiters_timed: AtomicU32::new(0),
+            clock,
             _pad: 0,
+            mutex: AtomicUsize::new(0),
         });
     }
     0
@@ -399,21 +432,49 @@ unsafe fn cond_wait_clock(
 ) -> c_int {
     // SAFETY: caller contract.
     unsafe {
-        let seq = (*c).seq.load(Ordering::Acquire);
-        // Registered while the mutex is still held, so a signaller that
-        // takes the mutex afterwards is bound to see us.
-        (*c).waiters.fetch_add(1, Ordering::SeqCst);
-        let r = pthread_mutex_unlock(m);
-        if r != 0 {
-            (*c).waiters.fetch_sub(1, Ordering::SeqCst);
-            return r;
-        }
-        let result = wait(&(*c).seq, seq, deadline, clock);
-        (*c).waiters.fetch_sub(1, Ordering::SeqCst);
-        pthread_mutex_lock(m);
-        match result {
-            Ok(()) => 0,
-            Err(e) => e.0,
+        (*c).mutex.store(m as usize, Ordering::Relaxed);
+        let lock = &(*m).lock;
+        match deadline {
+            None => {
+                let seq = (*c).seq.load(Ordering::Acquire);
+                // Registered while the mutex is still held, so a signaller
+                // that takes the mutex afterwards is bound to see us.
+                (*c).waiters.fetch_add(1, Ordering::SeqCst);
+                let r = pthread_mutex_unlock(m);
+                if r != 0 {
+                    (*c).waiters.fetch_sub(1, Ordering::SeqCst);
+                    return r;
+                }
+                let woken = wait_woken(&(*c).seq, seq);
+                (*c).waiters.fetch_sub(1, Ordering::SeqCst);
+                // A thread that was woken (directly, or from the mutex's
+                // futex after being moved there) was counted as a mutex
+                // waiter by the signaller; one that returned on its own
+                // was not.
+                if woken {
+                    lock.lock_after_wake();
+                } else {
+                    lock.lock();
+                }
+                lock_epilogue(m);
+                0
+            }
+            Some(d) => {
+                let seq = (*c).seq_timed.load(Ordering::Acquire);
+                (*c).waiters_timed.fetch_add(1, Ordering::SeqCst);
+                let r = pthread_mutex_unlock(m);
+                if r != 0 {
+                    (*c).waiters_timed.fetch_sub(1, Ordering::SeqCst);
+                    return r;
+                }
+                let result = wait(&(*c).seq_timed, seq, Some(d), clock);
+                (*c).waiters_timed.fetch_sub(1, Ordering::SeqCst);
+                pthread_mutex_lock(m);
+                match result {
+                    Ok(()) => 0,
+                    Err(e) => e.0,
+                }
+            }
         }
     }
 }
@@ -483,7 +544,27 @@ pub unsafe extern "C" fn pthread_cond_signal(c: *mut Cond) -> c_int {
         // number and the (contended) sequence bump can be skipped.
         if (*c).waiters.load(Ordering::SeqCst) != 0 {
             (*c).seq.fetch_add(1, Ordering::SeqCst);
-            let _ = sys::futex_wake(&(*c).seq, 1);
+            let m = (*c).mutex.load(Ordering::Relaxed) as *mut Mutex;
+            if m.is_null() {
+                let _ = sys::futex_wake(&(*c).seq, 1);
+            } else {
+                // The woken thread relocks through `lock_after_wake`.
+                (*m).lock.add_waiters(1);
+                let woken = sys::futex_wake(&(*c).seq, 1).unwrap_or(0) as u32;
+                if woken < 1 {
+                    (*m).lock.sub_waiters(1 - woken);
+                    // Nobody untimed was asleep yet: a timed waiter then.
+                    if (*c).waiters_timed.load(Ordering::SeqCst) != 0 {
+                        (*c).seq_timed.fetch_add(1, Ordering::SeqCst);
+                        let _ = sys::futex_wake(&(*c).seq_timed, 1);
+                    }
+                }
+                return 0;
+            }
+        }
+        if (*c).waiters_timed.load(Ordering::SeqCst) != 0 {
+            (*c).seq_timed.fetch_add(1, Ordering::SeqCst);
+            let _ = sys::futex_wake(&(*c).seq_timed, 1);
         }
     }
     0
@@ -497,9 +578,46 @@ pub unsafe extern "C" fn pthread_cond_signal(c: *mut Cond) -> c_int {
 pub unsafe extern "C" fn pthread_cond_broadcast(c: *mut Cond) -> c_int {
     // SAFETY: caller contract.
     unsafe {
-        if (*c).waiters.load(Ordering::SeqCst) != 0 {
+        let w = (*c).waiters.load(Ordering::SeqCst);
+        if w != 0 {
             (*c).seq.fetch_add(1, Ordering::SeqCst);
-            wake_all(&(*c).seq);
+            let m = (*c).mutex.load(Ordering::Relaxed) as *mut Mutex;
+            if m.is_null() {
+                wake_all(&(*c).seq);
+            } else {
+                // Wake one, move the rest onto the mutex. Every registered
+                // waiter is counted as a mutex waiter first; the ones the
+                // kernel did not find asleep (they will see the new
+                // sequence number and return on their own) are taken back
+                // afterwards.
+                let lock = &(*m).lock;
+                lock.add_waiters(w);
+                let moved = loop {
+                    let expected = (*c).seq.load(Ordering::SeqCst);
+                    match sys::futex_cmp_requeue(
+                        &(*c).seq,
+                        expected,
+                        1,
+                        i32::MAX,
+                        lock.futex_word(),
+                    ) {
+                        Ok(n) => break (n as u32).min(w),
+                        // Another signaller bumped the sequence meanwhile.
+                        Err(Errno::EAGAIN) => continue,
+                        Err(_) => {
+                            wake_all(&(*c).seq);
+                            break w;
+                        }
+                    }
+                };
+                if moved < w {
+                    lock.sub_waiters(w - moved);
+                }
+            }
+        }
+        if (*c).waiters_timed.load(Ordering::SeqCst) != 0 {
+            (*c).seq_timed.fetch_add(1, Ordering::SeqCst);
+            wake_all(&(*c).seq_timed);
         }
     }
     0
@@ -1135,7 +1253,7 @@ mod tests {
     #[test]
     fn layouts() {
         assert_eq!(core::mem::size_of::<Mutex>(), 20);
-        assert_eq!(core::mem::size_of::<Cond>(), 16);
+        assert_eq!(core::mem::size_of::<Cond>(), 32);
         assert_eq!(core::mem::size_of::<RwLock>(), 16);
         assert_eq!(core::mem::size_of::<Barrier>(), 16);
         assert_eq!(core::mem::size_of::<Sem>(), 16);

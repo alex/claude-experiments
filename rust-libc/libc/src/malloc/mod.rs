@@ -77,7 +77,7 @@ fn tier_of(class: usize) -> usize {
 /// Returning a span (a TLB shootdown now, page faults later) is far
 /// more expensive than holding on to it, and most programs' allocation
 /// volume oscillates; this bounds the cost of a large drop in demand.
-const RETAIN_MAX: usize = 64 << 20;
+const RETAIN_MAX: usize = 16 << 20;
 
 /// Retained spans idle for longer than this are given back whenever the
 /// reserve is next touched.
@@ -136,14 +136,14 @@ impl Entry {
 type CacheEntries = [core::mem::MaybeUninit<Entry>; CACHE_MAX];
 
 /// Cache capacity per class: 128 blocks for the small classes, fewer as
-/// the blocks grow so that at most 128 KiB or so is cached per class
+/// the blocks grow so that at most 64 KiB or so is cached per class
 /// (one block for the big classes: enough for a free/malloc pair to
 /// hit, without pinning megabytes per thread).
 const CACHE_CAP: [u8; NUM_CLASSES] = {
     let mut caps = [0u8; NUM_CLASSES];
     let mut c = 0;
     while c < NUM_CLASSES {
-        let cap = (128 * 1024) / CLASS_SIZE[c] as usize;
+        let cap = (64 * 1024) / CLASS_SIZE[c] as usize;
         caps[c] = if cap < 1 {
             1
         } else if cap > CACHE_MAX {
@@ -169,8 +169,14 @@ unsafe fn span_of_word(word: *mut u64) -> *mut Span {
 /// Frees of other threads' blocks waiting to be marked in their spans'
 /// remote bitmaps in batches (one atomic `or` per bitmap word per batch
 /// instead of one per block, the biggest cost of producer/consumer
-/// hand-offs).
+/// hand-offs). A batch is flushed when it is full, when it holds more
+/// than [`REMOTE_FLUSH_BYTES`] (a big block must get back to its owner
+/// promptly: a thread that frees one large buffer per work item and
+/// nothing else remote would otherwise strand dozens of them), and
+/// whenever the thread's own caches are refilled or flushed.
 const REMOTE_BUF: usize = 64;
+/// Pending remote frees are flushed once they hold this many bytes.
+const REMOTE_FLUSH_BYTES: usize = 32 << 10;
 
 #[derive(Clone, Copy)]
 #[repr(C)]
@@ -185,6 +191,8 @@ pub struct Heap {
     /// Valid entries in each class's cache.
     counts: [u8; NUM_CLASSES],
     remote_count: u8,
+    /// Bytes of blocks in `remote`.
+    remote_bytes: u32,
     /// Spans that have (or may have, pending remote frees) free blocks.
     avail: [*mut Span; NUM_CLASSES],
     /// Spans with no locally free blocks.
@@ -198,6 +206,8 @@ pub struct Heap {
     retained: usize,
     /// Cache refills and flushes, for the periodic reserve decay check.
     refills: u32,
+    /// When the heap last collected the remote frees of all its spans.
+    collected_at: u64,
     /// Pending remote frees (see [`REMOTE_BUF`]).
     remote: [core::mem::MaybeUninit<RemoteEntry>; REMOTE_BUF],
     /// The block caches (see [`CacheEntries`]); last, and never
@@ -217,12 +227,14 @@ impl Heap {
         unsafe {
             ptr::addr_of_mut!((*this).counts).write([0; NUM_CLASSES]);
             ptr::addr_of_mut!((*this).remote_count).write(0);
+            ptr::addr_of_mut!((*this).remote_bytes).write(0);
             ptr::addr_of_mut!((*this).avail).write([ptr::null_mut(); NUM_CLASSES]);
             ptr::addr_of_mut!((*this).full).write([ptr::null_mut(); NUM_CLASSES]);
             ptr::addr_of_mut!((*this).empty).write([ptr::null_mut(); TIERS]);
             ptr::addr_of_mut!((*this).empty_tail).write([ptr::null_mut(); TIERS]);
             ptr::addr_of_mut!((*this).retained).write(0);
             ptr::addr_of_mut!((*this).refills).write(0);
+            ptr::addr_of_mut!((*this).collected_at).write(0);
         }
     }
 
@@ -698,11 +710,12 @@ unsafe fn take_retained(heap: *mut Heap, class: usize) -> *mut Span {
 // ---------------------------------------------------------------------
 // Allocation.
 
-/// Lets the heap's reserve decay every so often from the cache refill
-/// and flush paths: the reserve normally decays when it is touched, but
-/// a thread whose working set shrank and then settled would otherwise
-/// hold its reserve forever. A coarse clock read every 16th refill or
-/// flush costs about a nanosecond per allocation.
+/// Housekeeping from the cache refill and flush paths: flushes pending
+/// remote frees, and lets the heap's reserve decay every so often (the
+/// reserve normally decays when it is touched, but a thread whose
+/// working set shrank and then settled would otherwise hold its reserve
+/// forever; a coarse clock read every 16th refill or flush costs about
+/// a nanosecond per allocation).
 ///
 /// # Safety
 /// The heap must belong to the calling thread.
@@ -710,10 +723,68 @@ unsafe fn take_retained(heap: *mut Heap, class: usize) -> *mut Span {
 unsafe fn maybe_decay(heap: *mut Heap) {
     // SAFETY: caller contract.
     unsafe {
-        if (*heap).retained != 0 {
-            (*heap).refills = (*heap).refills.wrapping_add(1);
-            if (*heap).refills.is_multiple_of(16) {
-                decay_retained(heap, segment::coarse_ms());
+        // Pending remote frees go out now rather than when the batch
+        // fills: this thread is active, and their owners may be waiting.
+        if (*heap).remote_count != 0 {
+            flush_remote(heap);
+        }
+        (*heap).refills = (*heap).refills.wrapping_add(1);
+        if (*heap).refills.is_multiple_of(16) {
+            let now = segment::coarse_ms();
+            if (*heap).retained != 0 {
+                decay_retained(heap, now);
+            }
+            if now.saturating_sub((*heap).collected_at) >= COLLECT_MS {
+                (*heap).collected_at = now;
+                collect_all_remote(heap);
+            }
+        }
+    }
+}
+
+/// How often a heap sweeps all its spans for blocks other threads have
+/// freed (see [`collect_all_remote`]).
+const COLLECT_MS: u64 = 250;
+
+/// Collects the remote frees of every span of the heap, giving spans that
+/// became empty to the reserve (from where they decay). Remote frees are
+/// normally collected when the owner looks for blocks of that class; a
+/// thread that keeps allocating other classes would otherwise never
+/// reclaim memory that other threads freed for it, so this runs every
+/// [`COLLECT_MS`] from the refill and flush paths. Its cost is one atomic
+/// read per span, so a heap with thousands of spans pays tens of
+/// microseconds per period.
+///
+/// # Safety
+/// The heap must belong to the calling thread.
+unsafe fn collect_all_remote(heap: *mut Heap) {
+    // SAFETY: caller contract.
+    unsafe {
+        for class in 0..NUM_CLASSES {
+            let avail = ptr::addr_of_mut!((*heap).avail[class]);
+            let full = ptr::addr_of_mut!((*heap).full[class]);
+            let mut span = *full;
+            while !span.is_null() {
+                let next = (*span).next;
+                if span_collect_remote(span) {
+                    list_remove(full, span);
+                    (*span).is_full = false;
+                    if (*span).used == 0 {
+                        retain_span(heap, span);
+                    } else {
+                        list_push(avail, span);
+                    }
+                }
+                span = next;
+            }
+            let mut span = *avail;
+            while !span.is_null() {
+                let next = (*span).next;
+                if span_collect_remote(span) && (*span).used == 0 {
+                    list_remove(avail, span);
+                    retain_span(heap, span);
+                }
+                span = next;
             }
         }
     }
@@ -883,8 +954,13 @@ fn alloc_big(size: usize) -> Option<(*mut u8, bool)> {
     let heap = current_heap();
     // SAFETY: the heap belongs to the calling thread.
     unsafe {
+        let now = segment::coarse_ms();
         if (*heap).retained != 0 {
-            decay_retained(heap, segment::coarse_ms());
+            decay_retained(heap, now);
+        }
+        if now.saturating_sub((*heap).collected_at) >= COLLECT_MS {
+            (*heap).collected_at = now;
+            collect_all_remote(heap);
         }
     }
     if size <= segment::LARGE_MAX {
@@ -1034,7 +1110,6 @@ unsafe fn dealloc_huge(h: *mut segment::Header, p: *mut u8) {
 ///
 /// # Safety
 /// As for `dealloc`; the block's state is already cached.
-#[cold]
 #[inline(never)]
 unsafe fn dealloc_full(heap: *mut Heap, class: usize, p: *mut u8, byte: *mut u8) {
     // SAFETY: caller contract.
@@ -1050,11 +1125,11 @@ unsafe fn dealloc_full(heap: *mut Heap, class: usize, p: *mut u8, byte: *mut u8)
 
 /// `free` of a block owned by another thread: batched for the owner.
 /// The state is the owner's to change, but a block that is not allocated
-/// is already a double free.
+/// is already a double free. Out of line (but not cold: for a consumer
+/// thread this is the whole of `free`).
 ///
 /// # Safety
 /// `span` must be a live span and `idx` one of its blocks.
-#[cold]
 #[inline(never)]
 unsafe fn dealloc_remote(heap: *mut Heap, span: *mut Span, idx: u32) {
     // SAFETY: caller contract.
@@ -1063,13 +1138,11 @@ unsafe fn dealloc_remote(heap: *mut Heap, span: *mut Span, idx: u32) {
             corrupt("double free (remote)");
         }
         let n = (*heap).remote_count as usize;
-        if n == REMOTE_BUF {
+        (*heap).remote[n] = core::mem::MaybeUninit::new(RemoteEntry { span, idx });
+        (*heap).remote_count = (n + 1) as u8;
+        (*heap).remote_bytes += (*span).block_size;
+        if n + 1 == REMOTE_BUF || (*heap).remote_bytes as usize >= REMOTE_FLUSH_BYTES {
             flush_remote(heap);
-            (*heap).remote[0] = core::mem::MaybeUninit::new(RemoteEntry { span, idx });
-            (*heap).remote_count = 1;
-        } else {
-            (*heap).remote[n] = core::mem::MaybeUninit::new(RemoteEntry { span, idx });
-            (*heap).remote_count = (n + 1) as u8;
         }
     }
 }
@@ -1152,11 +1225,28 @@ unsafe fn flush_remote(heap: *mut Heap) {
             if word.fetch_or(g.bits, Ordering::AcqRel) & g.bits != 0 {
                 corrupt("double free (remote)");
             }
-            (*span)
+        }
+        // One summary update per span: the summary word is the one line
+        // every freeing thread and the owner share.
+        for i in 0..REMOTE_BUF {
+            let g = groups[i];
+            if g.span.is_null() {
+                continue;
+            }
+            let wpg = (*g.span).wpg as u32;
+            let mut summary = 1u64 << (g.word / wpg);
+            for h in groups[i + 1..].iter_mut() {
+                if h.span == g.span {
+                    summary |= 1 << (h.word / wpg);
+                    h.span = ptr::null_mut();
+                }
+            }
+            (*g.span)
                 .remote_summary
-                .fetch_or(1 << (g.word / (*span).wpg as u32), Ordering::Release);
+                .fetch_or(summary, Ordering::Release);
         }
         (*heap).remote_count = 0;
+        (*heap).remote_bytes = 0;
     }
 }
 
