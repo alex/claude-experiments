@@ -550,11 +550,7 @@ pub extern "C" fn getpriority(which: c_int, who: c_int) -> c_int {
 pub extern "C" fn nice(inc: c_int) -> c_int {
     let cur = getpriority(0, 0);
     let new = cur.saturating_add(inc).clamp(-20, 19);
-    if setpriority(0, 0, new) < 0 {
-        -1
-    } else {
-        new
-    }
+    if setpriority(0, 0, new) < 0 { -1 } else { new }
 }
 
 /// `struct rlimit`.

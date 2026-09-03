@@ -189,7 +189,7 @@ SIZE(ENTRY, 16);
 SIZE(struct hsearch_data, 16);
 
 // Library-private: must match the Rust definitions (asserted there).
-SIZE(pthread_mutex_t, 16);
+SIZE(pthread_mutex_t, 20);
 SIZE(pthread_cond_t, 16);
 SIZE(pthread_rwlock_t, 16);
 SIZE(pthread_barrier_t, 16);
@@ -200,7 +200,7 @@ SIZE(pthread_attr_t, 32);
 SIZE(pthread_mutexattr_t, 4);
 SIZE(pthread_condattr_t, 4);
 SIZE(sem_t, 16);
-SIZE(mtx_t, 16);
+SIZE(mtx_t, 20);
 SIZE(cnd_t, 16);
 SIZE(once_flag, 4);
 SIZE(tss_t, 4);

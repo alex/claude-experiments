@@ -767,11 +767,7 @@ pub fn flush_all(at_exit: bool) -> c_int {
         // SAFETY: streams on the list are valid while the list lock is
         // held.
         unsafe {
-            let guard = if at_exit {
-                try_lock(f)
-            } else {
-                Some(lock(f))
-            };
+            let guard = if at_exit { try_lock(f) } else { Some(lock(f)) };
             if let Some(mut guard) = guard
                 && guard.flush().is_err()
             {

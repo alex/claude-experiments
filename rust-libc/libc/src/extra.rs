@@ -395,7 +395,8 @@ pub extern "C" fn getprogname() -> *const c_char {
 #[cfg_attr(not(test), unsafe(no_mangle))]
 pub unsafe extern "C" fn getgroups(size: c_int, list: *mut c_uint) -> c_int {
     // SAFETY: caller contract.
-    let r = unsafe { crate::arch::syscall2(crate::arch::nr::GETGROUPS, size as usize, list as usize) };
+    let r =
+        unsafe { crate::arch::syscall2(crate::arch::nr::GETGROUPS, size as usize, list as usize) };
     sys::check(r).map(|v| v as c_int).c_ret_or(-1)
 }
 
@@ -437,18 +438,32 @@ id3! {
 #[cfg_attr(not(test), unsafe(no_mangle))]
 pub extern "C" fn setresuid(r: c_uint, e: c_uint, s: c_uint) -> c_int {
     // SAFETY: no memory is involved.
-    sys::check(unsafe { crate::arch::syscall3(crate::arch::nr::SETRESUID, r as usize, e as usize, s as usize) })
-        .map(drop)
-        .c_ret()
+    sys::check(unsafe {
+        crate::arch::syscall3(
+            crate::arch::nr::SETRESUID,
+            r as usize,
+            e as usize,
+            s as usize,
+        )
+    })
+    .map(drop)
+    .c_ret()
 }
 
 /// `setresgid(2)`.
 #[cfg_attr(not(test), unsafe(no_mangle))]
 pub extern "C" fn setresgid(r: c_uint, e: c_uint, s: c_uint) -> c_int {
     // SAFETY: no memory is involved.
-    sys::check(unsafe { crate::arch::syscall3(crate::arch::nr::SETRESGID, r as usize, e as usize, s as usize) })
-        .map(drop)
-        .c_ret()
+    sys::check(unsafe {
+        crate::arch::syscall3(
+            crate::arch::nr::SETRESGID,
+            r as usize,
+            e as usize,
+            s as usize,
+        )
+    })
+    .map(drop)
+    .c_ret()
 }
 
 /// `setpgrp(3)`.
@@ -651,7 +666,13 @@ pub extern "C" fn posix_fadvise(fd: c_int, off: i64, len: i64, advice: c_int) ->
 pub extern "C" fn fallocate(fd: c_int, mode: c_int, off: i64, len: i64) -> c_int {
     // SAFETY: no memory is involved.
     let r = unsafe {
-        crate::arch::syscall4(crate::arch::nr::FALLOCATE, fd as usize, mode as usize, off as usize, len as usize)
+        crate::arch::syscall4(
+            crate::arch::nr::FALLOCATE,
+            fd as usize,
+            mode as usize,
+            off as usize,
+            len as usize,
+        )
     };
     sys::check(r).map(drop).c_ret()
 }
@@ -660,7 +681,15 @@ pub extern "C" fn fallocate(fd: c_int, mode: c_int, off: i64, len: i64) -> c_int
 #[cfg_attr(not(test), unsafe(no_mangle))]
 pub extern "C" fn posix_fallocate(fd: c_int, off: i64, len: i64) -> c_int {
     // SAFETY: no memory is involved.
-    let r = unsafe { crate::arch::syscall4(crate::arch::nr::FALLOCATE, fd as usize, 0, off as usize, len as usize) };
+    let r = unsafe {
+        crate::arch::syscall4(
+            crate::arch::nr::FALLOCATE,
+            fd as usize,
+            0,
+            off as usize,
+            len as usize,
+        )
+    };
     sys::check(r).err().map_or(0, |e| e.0)
 }
 
@@ -794,7 +823,14 @@ pub extern "C" fn sched_getcpu() -> c_int {
         return -1;
     }
     // SAFETY: valid pointer.
-    let r = unsafe { crate::arch::syscall3(crate::arch::nr::GETCPU, &mut cpu as *mut c_uint as usize, 0, 0) };
+    let r = unsafe {
+        crate::arch::syscall3(
+            crate::arch::nr::GETCPU,
+            &mut cpu as *mut c_uint as usize,
+            0,
+            0,
+        )
+    };
     sys::check(r).map(|_| cpu as c_int).c_ret_or(-1)
 }
 
@@ -802,18 +838,22 @@ pub extern "C" fn sched_getcpu() -> c_int {
 #[cfg_attr(not(test), unsafe(no_mangle))]
 pub extern "C" fn sched_get_priority_max(policy: c_int) -> c_int {
     // SAFETY: no memory is involved.
-    sys::check(unsafe { crate::arch::syscall1(crate::arch::nr::SCHED_GET_PRIORITY_MAX, policy as usize) })
-        .map(|v| v as c_int)
-        .c_ret_or(-1)
+    sys::check(unsafe {
+        crate::arch::syscall1(crate::arch::nr::SCHED_GET_PRIORITY_MAX, policy as usize)
+    })
+    .map(|v| v as c_int)
+    .c_ret_or(-1)
 }
 
 /// `sched_get_priority_min(2)`.
 #[cfg_attr(not(test), unsafe(no_mangle))]
 pub extern "C" fn sched_get_priority_min(policy: c_int) -> c_int {
     // SAFETY: no memory is involved.
-    sys::check(unsafe { crate::arch::syscall1(crate::arch::nr::SCHED_GET_PRIORITY_MIN, policy as usize) })
-        .map(|v| v as c_int)
-        .c_ret_or(-1)
+    sys::check(unsafe {
+        crate::arch::syscall1(crate::arch::nr::SCHED_GET_PRIORITY_MIN, policy as usize)
+    })
+    .map(|v| v as c_int)
+    .c_ret_or(-1)
 }
 
 /// `sched_getscheduler(2)`.
@@ -836,9 +876,16 @@ pub unsafe extern "C" fn sched_setscheduler(
     param: *const c_int,
 ) -> c_int {
     // SAFETY: caller contract.
-    sys::check(unsafe { crate::arch::syscall3(crate::arch::nr::SCHED_SETSCHEDULER, pid as usize, policy as usize, param as usize) })
-        .map(drop)
-        .c_ret()
+    sys::check(unsafe {
+        crate::arch::syscall3(
+            crate::arch::nr::SCHED_SETSCHEDULER,
+            pid as usize,
+            policy as usize,
+            param as usize,
+        )
+    })
+    .map(drop)
+    .c_ret()
 }
 
 /// `sched_getparam(2)`.
@@ -848,9 +895,15 @@ pub unsafe extern "C" fn sched_setscheduler(
 #[cfg_attr(not(test), unsafe(no_mangle))]
 pub unsafe extern "C" fn sched_getparam(pid: c_int, param: *mut c_int) -> c_int {
     // SAFETY: caller contract.
-    sys::check(unsafe { crate::arch::syscall2(crate::arch::nr::SCHED_GETPARAM, pid as usize, param as usize) })
-        .map(drop)
-        .c_ret()
+    sys::check(unsafe {
+        crate::arch::syscall2(
+            crate::arch::nr::SCHED_GETPARAM,
+            pid as usize,
+            param as usize,
+        )
+    })
+    .map(drop)
+    .c_ret()
 }
 
 /// `sched_setparam(2)`.
@@ -860,9 +913,15 @@ pub unsafe extern "C" fn sched_getparam(pid: c_int, param: *mut c_int) -> c_int 
 #[cfg_attr(not(test), unsafe(no_mangle))]
 pub unsafe extern "C" fn sched_setparam(pid: c_int, param: *const c_int) -> c_int {
     // SAFETY: caller contract.
-    sys::check(unsafe { crate::arch::syscall2(crate::arch::nr::SCHED_SETPARAM, pid as usize, param as usize) })
-        .map(drop)
-        .c_ret()
+    sys::check(unsafe {
+        crate::arch::syscall2(
+            crate::arch::nr::SCHED_SETPARAM,
+            pid as usize,
+            param as usize,
+        )
+    })
+    .map(drop)
+    .c_ret()
 }
 
 /// `sched_rr_get_interval(2)`.
@@ -872,9 +931,15 @@ pub unsafe extern "C" fn sched_setparam(pid: c_int, param: *const c_int) -> c_in
 #[cfg_attr(not(test), unsafe(no_mangle))]
 pub unsafe extern "C" fn sched_rr_get_interval(pid: c_int, ts: *mut Timespec) -> c_int {
     // SAFETY: caller contract.
-    sys::check(unsafe { crate::arch::syscall2(crate::arch::nr::SCHED_RR_GET_INTERVAL, pid as usize, ts as usize) })
-        .map(drop)
-        .c_ret()
+    sys::check(unsafe {
+        crate::arch::syscall2(
+            crate::arch::nr::SCHED_RR_GET_INTERVAL,
+            pid as usize,
+            ts as usize,
+        )
+    })
+    .map(drop)
+    .c_ret()
 }
 
 /// `sched_getaffinity(2)`: unlike the raw system call, returns 0 on
@@ -925,9 +990,15 @@ pub unsafe extern "C" fn __sched_cpucount(size: usize, set: *const c_void) -> c_
 #[cfg_attr(not(test), unsafe(no_mangle))]
 pub extern "C" fn timerfd_create(clock: c_int, flags: c_int) -> c_int {
     // SAFETY: no memory is involved.
-    sys::check(unsafe { crate::arch::syscall2(crate::arch::nr::TIMERFD_CREATE, clock as usize, flags as usize) })
-        .map(|v| v as c_int)
-        .c_ret_or(-1)
+    sys::check(unsafe {
+        crate::arch::syscall2(
+            crate::arch::nr::TIMERFD_CREATE,
+            clock as usize,
+            flags as usize,
+        )
+    })
+    .map(|v| v as c_int)
+    .c_ret_or(-1)
 }
 
 /// `timerfd_settime(2)`.
@@ -943,7 +1014,13 @@ pub unsafe extern "C" fn timerfd_settime(
 ) -> c_int {
     // SAFETY: caller contract.
     sys::check(unsafe {
-        crate::arch::syscall4(crate::arch::nr::TIMERFD_SETTIME, fd as usize, flags as usize, new as usize, old as usize)
+        crate::arch::syscall4(
+            crate::arch::nr::TIMERFD_SETTIME,
+            fd as usize,
+            flags as usize,
+            new as usize,
+            old as usize,
+        )
     })
     .map(drop)
     .c_ret()
@@ -956,9 +1033,11 @@ pub unsafe extern "C" fn timerfd_settime(
 #[cfg_attr(not(test), unsafe(no_mangle))]
 pub unsafe extern "C" fn timerfd_gettime(fd: c_int, cur: *mut c_void) -> c_int {
     // SAFETY: caller contract.
-    sys::check(unsafe { crate::arch::syscall2(crate::arch::nr::TIMERFD_GETTIME, fd as usize, cur as usize) })
-        .map(drop)
-        .c_ret()
+    sys::check(unsafe {
+        crate::arch::syscall2(crate::arch::nr::TIMERFD_GETTIME, fd as usize, cur as usize)
+    })
+    .map(drop)
+    .c_ret()
 }
 
 /// `signalfd(2)`.
@@ -968,9 +1047,17 @@ pub unsafe extern "C" fn timerfd_gettime(fd: c_int, cur: *mut c_void) -> c_int {
 #[cfg_attr(not(test), unsafe(no_mangle))]
 pub unsafe extern "C" fn signalfd(fd: c_int, mask: *const u64, flags: c_int) -> c_int {
     // SAFETY: caller contract; the kernel reads 8 bytes of the set.
-    sys::check(unsafe { crate::arch::syscall4(crate::arch::nr::SIGNALFD4, fd as usize, mask as usize, 8, flags as usize) })
-        .map(|v| v as c_int)
-        .c_ret_or(-1)
+    sys::check(unsafe {
+        crate::arch::syscall4(
+            crate::arch::nr::SIGNALFD4,
+            fd as usize,
+            mask as usize,
+            8,
+            flags as usize,
+        )
+    })
+    .map(|v| v as c_int)
+    .c_ret_or(-1)
 }
 
 /// `inotify_init1(2)`.
@@ -995,18 +1082,27 @@ pub extern "C" fn inotify_init() -> c_int {
 #[cfg_attr(not(test), unsafe(no_mangle))]
 pub unsafe extern "C" fn inotify_add_watch(fd: c_int, path: *const c_char, mask: u32) -> c_int {
     // SAFETY: caller contract.
-    sys::check(unsafe { crate::arch::syscall3(crate::arch::nr::INOTIFY_ADD_WATCH, fd as usize, path as usize, mask as usize) })
-        .map(|v| v as c_int)
-        .c_ret_or(-1)
+    sys::check(unsafe {
+        crate::arch::syscall3(
+            crate::arch::nr::INOTIFY_ADD_WATCH,
+            fd as usize,
+            path as usize,
+            mask as usize,
+        )
+    })
+    .map(|v| v as c_int)
+    .c_ret_or(-1)
 }
 
 /// `inotify_rm_watch(2)`.
 #[cfg_attr(not(test), unsafe(no_mangle))]
 pub extern "C" fn inotify_rm_watch(fd: c_int, wd: c_int) -> c_int {
     // SAFETY: no memory is involved.
-    sys::check(unsafe { crate::arch::syscall2(crate::arch::nr::INOTIFY_RM_WATCH, fd as usize, wd as usize) })
-        .map(drop)
-        .c_ret()
+    sys::check(unsafe {
+        crate::arch::syscall2(crate::arch::nr::INOTIFY_RM_WATCH, fd as usize, wd as usize)
+    })
+    .map(drop)
+    .c_ret()
 }
 
 /// Builds `/dev/shm/<name>` for `shm_open`/`shm_unlink`.

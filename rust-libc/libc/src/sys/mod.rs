@@ -287,6 +287,33 @@ pub fn clock_gettime(clock: c_int) -> Result<Timespec> {
 }
 
 /// `futex(FUTEX_WAKE_PRIVATE)`: wakes up to `n` waiters.
+/// `futex(FUTEX_WAKE_PRIVATE)`: wakes up to `n` waiters.
+/// `futex(FUTEX_CMP_REQUEUE_PRIVATE)`: if `*addr == expected`, wakes
+/// `wake` waiters of `addr` and moves up to `requeue` more to wait on
+/// `target` instead. Fails with `EAGAIN` if the value changed.
+pub fn futex_cmp_requeue(
+    addr: &AtomicU32,
+    expected: u32,
+    wake: c_int,
+    requeue: c_int,
+    target: &AtomicU32,
+) -> Result<usize> {
+    const FUTEX_CMP_REQUEUE_PRIVATE: usize = 4 | 128;
+    // SAFETY: both words are valid.
+    unsafe {
+        check(syscall6(
+            nr::FUTEX,
+            addr.as_ptr() as usize,
+            FUTEX_CMP_REQUEUE_PRIVATE,
+            wake as usize,
+            requeue as usize,
+            target.as_ptr() as usize,
+            expected as usize,
+        ))
+    }
+}
+
+/// `futex(FUTEX_WAKE_PRIVATE)`: wakes up to `n` waiters of `addr`.
 pub fn futex_wake(addr: &AtomicU32, n: c_int) -> Result<usize> {
     const FUTEX_WAKE_PRIVATE: usize = 1 | 128;
     // SAFETY: `addr` is valid.

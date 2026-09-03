@@ -237,8 +237,8 @@ unsafe fn exec_via_shell(
         }
         // sh, the script, its arguments (all but argv[0]), NULL.
         let n = argc.max(1) + 2;
-        let new = crate::malloc::alloc(n * core::mem::size_of::<*const c_char>())
-            as *mut *const c_char;
+        let new =
+            crate::malloc::alloc(n * core::mem::size_of::<*const c_char>()) as *mut *const c_char;
         if new.is_null() {
             return Errno::ENOMEM;
         }

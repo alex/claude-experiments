@@ -241,7 +241,13 @@ pub unsafe extern "C" fn epoll_ctl(
 ) -> c_int {
     // SAFETY: caller contract.
     let r = unsafe {
-        crate::arch::syscall4(nr::EPOLL_CTL, epfd as usize, op as usize, fd as usize, event as usize)
+        crate::arch::syscall4(
+            nr::EPOLL_CTL,
+            epfd as usize,
+            op as usize,
+            fd as usize,
+            event as usize,
+        )
     };
     sys::check(r).map(drop).c_ret()
 }

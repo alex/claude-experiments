@@ -49,7 +49,10 @@ fn page_safe(p: *const u8, n: usize) -> bool {
 /// [`page_safe`] for two pointers, evaluated without branches.
 #[inline(always)]
 fn both_page_safe(a: *const u8, b: *const u8, n: usize) -> bool {
-    let (oa, ob) = (a as usize & (MIN_PAGE_SIZE - 1), b as usize & (MIN_PAGE_SIZE - 1));
+    let (oa, ob) = (
+        a as usize & (MIN_PAGE_SIZE - 1),
+        b as usize & (MIN_PAGE_SIZE - 1),
+    );
     oa.max(ob) <= MIN_PAGE_SIZE - n
 }
 

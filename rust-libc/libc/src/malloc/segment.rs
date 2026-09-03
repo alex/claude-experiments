@@ -4,17 +4,24 @@
 //! regions aligned to their size, so that the segment of any pointer is
 //! found by masking. A segment is either:
 //!
-//! * a **normal segment**, split into 64 units of 256 KiB. Spans of one or
-//!   four consecutive units each serve a single size class. The segment
-//!   header at the start of the segment holds the per-span metadata, so
-//!   no metadata is ever adjacent to user data;
+//! * a **normal segment**, split into 64 units of 256 KiB. Spans of one,
+//!   four or eight consecutive units each serve a single size class, and
+//!   a *large span* of any number of units holds a single block bigger
+//!   than [`MAX_SMALL`](super::classes::MAX_SMALL) (up to [`LARGE_MAX`]).
+//!   The segment header at the start of the segment holds the per-span
+//!   metadata, so no metadata is ever adjacent to user data;
 //! * a **huge mapping** for a single allocation larger than
-//!   [`MAX_SMALL`](super::classes::MAX_SMALL), with only the small
-//!   [`Header`] in its first page.
+//!   [`LARGE_MAX`], with only the small [`Header`] in its first page.
 //!
 //! Each span starts with an allocation bitmap (one bit per block) followed
-//! by the page-aligned block area. The bitmap makes double and invalid
-//! frees detectable.
+//! by the page-aligned block area (a large span keeps its single bit in
+//! its metadata). The bitmap makes double and invalid frees detectable.
+//!
+//! Units freed back to the pool keep their pages: they are returned to
+//! the kernel only once the segment has been idle for a while, or when
+//! the resident free units exceed a budget, so a program cycling through
+//! big buffers (the common case for large blocks) reuses resident memory
+//! instead of paying page faults on every allocation.
 
 use super::classes::{CLASS_INV, CLASS_INV_SHIFT, CLASS_SIZE, units_for_class};
 use crate::sync::{Mutex, RawMutex};
@@ -31,9 +38,14 @@ pub const SEGMENT_SIZE: usize = 16 * 1024 * 1024;
 /// Units per normal segment.
 pub const UNITS: usize = SEGMENT_SIZE / UNIT_SIZE;
 /// Bytes at the start of a normal segment reserved for the header.
-const HEADER_SIZE: usize = 8192;
+const HEADER_SIZE: usize = 16384;
 /// Bytes at the start of a huge mapping reserved for the header.
 const HUGE_HEADER_SIZE: usize = MIN_PAGE_SIZE;
+/// Largest block served by a large span (unit 0 holds the header, so
+/// one unit less than a segment).
+pub const LARGE_MAX: usize = (UNITS - 1) * UNIT_SIZE;
+/// `Span::class` of a large span (one block, any number of units).
+pub const LARGE_CLASS: u8 = u8::MAX;
 
 const MAGIC_NORMAL: usize = 0x5a5a_a11c_5e6d_0001;
 const MAGIC_HUGE: usize = 0x5a5a_a11c_5e6d_0002;
@@ -66,6 +78,9 @@ pub struct Segment {
     /// For each unit, the index of the first unit of its span. Only
     /// meaningful for allocated units.
     span_of: [AtomicU8; UNITS],
+    /// When units were last freed back (milliseconds); drives the return
+    /// of idle pages. Protected by the pool lock.
+    idle_since: u64,
     spans: [Span; UNITS],
 }
 
@@ -74,38 +89,63 @@ const _: () = assert!(core::mem::size_of::<Header>() <= HUGE_HEADER_SIZE);
 
 /// Metadata of a span. Lives in the segment header, indexed by the
 /// span's first unit.
-#[repr(C)]
+///
+/// Three cache lines: what every thread reads to classify a pointer
+/// (constant while the span is live), what the owner updates on every
+/// operation, and the remote-free stack that other threads write. Kept
+/// apart so a foreign thread freeing a block neither stalls on nor
+/// invalidates the owner's hot line.
+#[repr(C, align(64))]
 pub struct Span {
+    // --- read-mostly ---
     /// Block size in bytes; 0 for a span that is not allocated.
     pub block_size: u32,
     /// Size class.
     pub class: u8,
     /// Units in this span.
     pub units: u8,
-    /// True while the span is on its heap's `full` list.
-    pub is_full: bool,
+    _pad0: [u8; 2],
     /// Number of blocks in the block area.
     pub capacity: u32,
+    _pad1: [u8; 4],
+    /// Allocation bitmap, one bit per block.
+    pub bitmap: *mut u64,
+    /// Start of the page-aligned block area.
+    pub data: *mut u8,
+    /// The owning heap, or null when orphaned.
+    pub owner: AtomicUsize,
+    _pad2: [u8; 24],
+    // --- owner-hot ---
     /// Blocks `[bump, capacity)` have never been handed out.
     pub bump: u32,
     /// Blocks currently allocated, as seen by the owning heap (remote
     /// frees are not subtracted until collected).
     pub used: u32,
+    /// Blocks `[0, zeroed)` of a never-used bump area are known to be
+    /// zero (fresh pages), so `calloc` need not clear them.
+    pub zeroed: u32,
+    /// True while the span is on its heap's `full` list.
+    pub is_full: bool,
+    _pad3: [u8; 3],
     /// Head of the local free list, encoded (see `Heap`).
     pub free: usize,
-    /// Head of the lock-free list of blocks freed by other threads.
-    pub remote: AtomicUsize,
-    /// The owning heap, or null when orphaned.
-    pub owner: AtomicUsize,
     /// Previous span in the owning heap's per-class list (or orphan list).
     pub prev: *mut Span,
     /// Next span in the owning heap's per-class list (or orphan list).
     pub next: *mut Span,
-    /// Allocation bitmap, one bit per block.
-    pub bitmap: *mut u64,
-    /// Start of the page-aligned block area.
-    pub data: *mut u8,
+    /// When the span entered a heap's reserve (milliseconds).
+    pub retained_at: u64,
+    /// The allocation bitmap of a large span (a single bit), so its
+    /// block area needs no bitmap page.
+    inline_bits: u64,
+    _pad4: [u8; 8],
+    // --- written by other threads ---
+    /// Head of the lock-free list of blocks freed by other threads.
+    pub remote: AtomicUsize,
+    _pad5: [u8; 56],
 }
+
+const _: () = assert!(core::mem::size_of::<Span>() == 192);
 
 impl Span {
     #[allow(clippy::declare_interior_mutable_const)]
@@ -113,17 +153,26 @@ impl Span {
         block_size: 0,
         class: 0,
         units: 0,
-        is_full: false,
+        _pad0: [0; 2],
         capacity: 0,
-        bump: 0,
-        used: 0,
-        free: 0,
-        remote: AtomicUsize::new(0),
-        owner: AtomicUsize::new(0),
-        prev: ptr::null_mut(),
-        next: ptr::null_mut(),
+        _pad1: [0; 4],
         bitmap: ptr::null_mut(),
         data: ptr::null_mut(),
+        owner: AtomicUsize::new(0),
+        _pad2: [0; 24],
+        bump: 0,
+        used: 0,
+        zeroed: 0,
+        is_full: false,
+        _pad3: [0; 3],
+        free: 0,
+        prev: ptr::null_mut(),
+        next: ptr::null_mut(),
+        retained_at: 0,
+        inline_bits: 0,
+        _pad4: [0; 8],
+        remote: AtomicUsize::new(0),
+        _pad5: [0; 56],
     };
 
     /// End of the block area.
@@ -144,10 +193,13 @@ impl Span {
         if bs == 0 {
             return None;
         }
+        if self.class == LARGE_CLASS {
+            return (off == 0).then_some(0);
+        }
         // Division by multiplication (see `CLASS_INV`); the multiply-back
         // check makes the result exact for any `off`, valid or not.
-        let idx = ((off as u64).wrapping_mul(CLASS_INV[self.class as usize]) >> CLASS_INV_SHIFT)
-            as usize;
+        let idx =
+            ((off as u64).wrapping_mul(CLASS_INV[self.class as usize]) >> CLASS_INV_SHIFT) as usize;
         if idx >= self.bump as usize || idx * bs != off {
             None
         } else {
@@ -193,13 +245,47 @@ impl Span {
 /// Global pool of normal segments.
 struct Pool {
     head: *mut Segment,
+    /// Free units across all segments whose pages are still resident.
+    resident_free: usize,
+    /// Units currently allocated to spans.
+    live_units: usize,
+    /// When the pool last looked for idle memory to return.
+    last_purge: u64,
 }
+
+impl Pool {
+    /// Resident free units the pool may keep: a floor, or as much as is
+    /// allocated when that is more (a program with a big live set
+    /// oscillates by bigger amounts, and the decay pass returns what it
+    /// stops using).
+    fn resident_budget(&self) -> usize {
+        self.live_units.max(RESIDENT_FREE_MAX / UNIT_SIZE)
+    }
+}
+
+/// Floor of the resident free budget, in bytes.
+const RESIDENT_FREE_MAX: usize = 64 << 20;
+
+/// A segment's free units go back to the kernel once nothing has been
+/// freed into it for this long (checked whenever the pool is used).
+const POOL_DECAY_MS: u64 = 250;
+
+/// Over budget, only segments that have been idle for at least this
+/// long are swept: one that just had a block freed into it is the most
+/// likely to be reused (a program cycling through big buffers frees and
+/// reallocates within microseconds), and sweeping it would turn every
+/// reuse into page faults. Beyond twice the budget the sweep no longer
+/// waits.
+const POOL_MIN_IDLE_MS: u64 = 10;
 
 // SAFETY: access is serialised by the mutex.
 unsafe impl Send for Pool {}
 
 static POOL: Mutex<Pool> = Mutex::new(Pool {
     head: ptr::null_mut(),
+    resident_free: 0,
+    live_units: 0,
+    last_purge: 0,
 });
 
 /// Recently freed huge mappings, kept for reuse so that programs which
@@ -212,6 +298,17 @@ struct HugeCache {
     count: usize,
     /// Total length of the entries whose pages are still resident.
     resident: usize,
+    /// Bytes currently allocated as huge blocks (their mappings).
+    live: usize,
+}
+
+impl HugeCache {
+    /// Resident cache budget: a floor, or as much as the program has
+    /// live in huge blocks when that is more (its working set shows it
+    /// will reuse that much).
+    fn resident_budget(&self) -> usize {
+        (self.live * 2).max(HUGE_CACHE_RESIDENT_MIN)
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -220,9 +317,54 @@ struct CachedMapping {
     len: usize,
     /// False once the pages were returned with `MADV_DONTNEED`.
     resident: bool,
+    /// When the mapping was freed (milliseconds, `now_ms`).
+    freed_at: u64,
 }
 
-const HUGE_CACHE_SLOTS: usize = 8;
+/// Resident cached mappings older than this are returned to the kernel
+/// the next time the cache is touched: a program that stopped reusing
+/// large blocks should not keep them resident, one that churns through
+/// them keeps everything warm.
+const HUGE_DECAY_MS: u64 = 250;
+
+/// A coarse monotonic clock in milliseconds (a vDSO read).
+fn now_ms() -> u64 {
+    let t = sys::clock_gettime(sys::CLOCK_MONOTONIC_COARSE).unwrap_or_default();
+    t.tv_sec as u64 * 1000 + t.tv_nsec as u64 / 1_000_000
+}
+
+/// Returns the pages of resident cached mappings that have been idle
+/// for longer than the decay period, and of the least recently freed
+/// ones while the resident total exceeds the budget.
+fn purge_huge_cache(cache: &mut HugeCache, now: u64) {
+    let budget = cache.resident_budget();
+    let mut oldest = None;
+    for i in 0..cache.count {
+        let e = cache.entries[i];
+        if !e.resident {
+            continue;
+        }
+        if now.saturating_sub(e.freed_at) > HUGE_DECAY_MS {
+            madvise_dontneed(e.base as *mut u8, e.len);
+            cache.entries[i].resident = false;
+            cache.resident -= e.len;
+        } else if oldest.is_none_or(|o: usize| e.freed_at < cache.entries[o].freed_at) {
+            oldest = Some(i);
+        }
+    }
+    while cache.resident > budget {
+        let Some(i) = oldest else { break };
+        let e = cache.entries[i];
+        madvise_dontneed(e.base as *mut u8, e.len);
+        cache.entries[i].resident = false;
+        cache.resident -= e.len;
+        oldest = (0..cache.count)
+            .filter(|&j| cache.entries[j].resident)
+            .min_by_key(|&j| cache.entries[j].freed_at);
+    }
+}
+
+const HUGE_CACHE_SLOTS: usize = 32;
 /// Mappings larger than this always go back to the kernel.
 const HUGE_CACHE_MAX_LEN: usize = 64 << 20;
 
@@ -231,25 +373,59 @@ static HUGE_CACHE: Mutex<HugeCache> = Mutex::new(HugeCache {
         base: 0,
         len: 0,
         resident: false,
+        freed_at: 0,
     }; HUGE_CACHE_SLOTS],
     count: 0,
     resident: 0,
+    live: 0,
 });
 
 /// Cached mappings keep their pages (so reuse costs nothing) up to this
 /// many bytes in total; beyond it their pages are returned to the kernel
 /// and only the address range is kept, saving the mmap/munmap pair.
-const HUGE_CACHE_RESIDENT_MAX: usize = 32 << 20;
+const HUGE_CACHE_RESIDENT_MIN: usize = 256 << 20;
 
 /// Takes the smallest cached mapping of at least `len` bytes that does
 /// not waste more than half of itself. The flag says whether its pages
 /// were returned (so it reads as zeros).
 fn take_cached(len: usize) -> Option<(*mut u8, usize, bool)> {
     let mut cache = HUGE_CACHE.lock();
+    let now = now_ms();
+    purge_huge_cache(&mut cache, now);
+    // Best fit among the cached mappings, preferring a resident one (no
+    // page faults) over a closer fit. A larger mapping is still used (a
+    // fresh one would cost a system call and page faults), but when it
+    // is more than twice the request the part beyond the request is
+    // returned to the kernel so it does not stay resident for nothing.
+    // Below that the excess is kept: trimming costs a system call now
+    // and page faults when the mapping is reused for a bigger block,
+    // which for a workload cycling through large blocks of varying size
+    // is most of the cost of every allocation.
+    // Ranking: a mapping within twice the request ("good fit") beats one
+    // that would need trimming; among good fits a resident one, then the
+    // smallest; among oversized ones a non-resident one (its excess costs
+    // nothing as it is), then the smallest.
     let mut best: Option<usize> = None;
     for i in 0..cache.count {
-        let l = cache.entries[i].len;
-        if l >= len && l / 2 <= len && best.is_none_or(|b| l < cache.entries[b].len) {
+        let e = cache.entries[i];
+        if e.len < len {
+            continue;
+        }
+        let better = match best {
+            None => true,
+            Some(b) => {
+                let c = cache.entries[b];
+                let (ge, gc) = (e.len <= len * 2, c.len <= len * 2);
+                if ge != gc {
+                    ge
+                } else if e.resident != c.resident {
+                    e.resident == ge
+                } else {
+                    e.len < c.len
+                }
+            }
+        };
+        if better {
             best = Some(i);
         }
     }
@@ -259,7 +435,12 @@ fn take_cached(len: usize) -> Option<(*mut u8, usize, bool)> {
     cache.entries[i] = cache.entries[cache.count];
     if entry.resident {
         cache.resident -= entry.len;
+        let keep = len.next_multiple_of(sys::page_size());
+        if entry.len > keep * 2 {
+            madvise_dontneed((entry.base + keep) as *mut u8, entry.len - keep);
+        }
     }
+    cache.live += entry.len;
     Some((entry.base as *mut u8, entry.len, !entry.resident))
 }
 
@@ -307,6 +488,7 @@ fn new_segment() -> Option<*mut Segment> {
         ptr::addr_of_mut!((*seg).next).write(ptr::null_mut());
         ptr::addr_of_mut!((*seg).free_units).write(u64::MAX);
         ptr::addr_of_mut!((*seg).resident).write(0);
+        ptr::addr_of_mut!((*seg).idle_since).write(0);
         for i in 0..UNITS {
             ptr::addr_of_mut!((*seg).span_of[i]).write(AtomicU8::new(0));
             ptr::addr_of_mut!((*seg).spans[i]).write(Span::EMPTY);
@@ -326,12 +508,23 @@ fn find_run(free: u64, n: usize) -> Option<usize> {
     (0..=UNITS - n).find(|&i| free & (mask << i) == mask << i)
 }
 
-/// Allocates and initialises a span for `class`, owned by `owner`.
-pub fn alloc_span(class: usize, owner: usize) -> Option<*mut Span> {
-    let units = units_for_class(class);
-    let mut pool = POOL.lock();
+/// Mask of units `first..first + units`.
+fn run_mask(first: usize, units: usize) -> u64 {
+    if units >= UNITS {
+        u64::MAX
+    } else {
+        ((1u64 << units) - 1) << first
+    }
+}
+
+/// Finds `units` consecutive free units, mapping a new segment if none
+/// has them. Unit 0 (which starts with the segment header) is skipped
+/// when `skip_header` is set. Idle memory is returned first.
+fn take_units(pool: &mut Pool, units: usize, skip_header: bool) -> Option<(*mut Segment, usize)> {
+    // SAFETY: the pool lock is held.
+    unsafe { purge(pool, now_ms()) };
     let mut seg = pool.head;
-    let (seg, first) = loop {
+    loop {
         if seg.is_null() {
             let s = new_segment()?;
             // SAFETY: `s` is a fresh segment; linking it into the pool.
@@ -342,23 +535,169 @@ pub fn alloc_span(class: usize, owner: usize) -> Option<*mut Span> {
             seg = s;
         }
         // SAFETY: segments in the pool are valid while the lock is held.
-        let free = unsafe { (*seg).free_units };
+        let mut free = unsafe { (*seg).free_units };
+        if skip_header {
+            free &= !1;
+        }
         if let Some(first) = find_run(free, units) {
-            break (seg, first);
+            return Some((seg, first));
         }
         // SAFETY: as above.
         seg = unsafe { (*seg).next };
-    };
-    let mask = ((1u64 << units) - 1) << first;
+    }
+}
+
+/// Takes free units `start..start + units` of `seg` for the span whose
+/// first unit is `first`. Returns whether any of them may hold old data
+/// (pages returned to the kernel, or never touched, read as zeros).
+///
+/// # Safety
+/// The pool lock must be held and the units must be free.
+unsafe fn claim_units(
+    pool: &mut Pool,
+    seg: *mut Segment,
+    start: usize,
+    units: usize,
+    first: usize,
+) -> bool {
+    let mask = run_mask(start, units);
+    // SAFETY: caller contract.
+    unsafe {
+        let dirty = (*seg).resident & mask != 0;
+        pool.resident_free -= ((*seg).resident & mask).count_ones() as usize;
+        pool.live_units += units;
+        (*seg).free_units &= !mask;
+        (*seg).resident &= !mask;
+        for u in start..start + units {
+            (*seg).span_of[u].store(first as u8, Ordering::Relaxed);
+        }
+        dirty
+    }
+}
+
+/// Allocates and initialises a span for `class`, owned by `owner`.
+pub fn alloc_span(class: usize, owner: usize) -> Option<*mut Span> {
+    let units = units_for_class(class);
+    let mut pool = POOL.lock();
+    let (seg, first) = take_units(&mut pool, units, false)?;
     // SAFETY: the units were free and are now ours; all writes are to the
     // header (under the pool lock) or to the span's own memory.
     unsafe {
-        (*seg).free_units &= !mask;
-        (*seg).resident &= !mask;
-        for u in first..first + units {
-            (*seg).span_of[u].store(first as u8, Ordering::Relaxed);
-        }
+        let dirty = claim_units(&mut pool, seg, first, units, first);
         let span = ptr::addr_of_mut!((*seg).spans[first]);
+        span.write(Span::EMPTY);
+        (*span).units = units as u8;
+        (*span).owner.store(owner, Ordering::Relaxed);
+        init_span(span, seg, first, class, !dirty);
+        Some(span)
+    }
+}
+
+/// Allocates a large span holding one block of at least `size` bytes
+/// (up to [`LARGE_MAX`]). Returns the block and whether it is known to
+/// be zero-filled.
+pub fn alloc_large(size: usize) -> Option<(*mut u8, bool)> {
+    let units = size.div_ceil(UNIT_SIZE).max(1);
+    if units > UNITS - 1 {
+        return None;
+    }
+    let mut pool = POOL.lock();
+    let (seg, first) = take_units(&mut pool, units, true)?;
+    // SAFETY: as in `alloc_span`.
+    unsafe {
+        let dirty = claim_units(&mut pool, seg, first, units, first);
+        let span = ptr::addr_of_mut!((*seg).spans[first]);
+        span.write(Span::EMPTY);
+        (*span).units = units as u8;
+        (*span).class = LARGE_CLASS;
+        (*span).block_size = (units * UNIT_SIZE) as u32;
+        (*span).capacity = 1;
+        (*span).bump = 1;
+        (*span).used = 1;
+        (*span).inline_bits = 1;
+        (*span).bitmap = ptr::addr_of_mut!((*span).inline_bits);
+        (*span).data = (seg as usize + first * UNIT_SIZE) as *mut u8;
+        Some(((*span).data, !dirty))
+    }
+}
+
+/// Frees the block `p` of the large span `span`. The checks are redone
+/// under the pool lock, so two threads freeing the same block cannot
+/// both get through.
+///
+/// # Safety
+/// `span` must be a span of a live segment.
+pub unsafe fn free_large(span: *mut Span, p: *mut u8) {
+    let mut pool = POOL.lock();
+    // SAFETY: caller contract; the pool lock protects the metadata.
+    unsafe {
+        if (*span).class != LARGE_CLASS || (*span).data != p || (*span).inline_bits != 1 {
+            super::corrupt("double free of a large block");
+        }
+        (*span).inline_bits = 0;
+        (*span).used = 0;
+        release_locked(&mut pool, span, now_ms());
+    }
+}
+
+/// Resizes the large span `span` in place to hold `size` bytes: shrinks
+/// by giving back its tail units, grows into free units right after it.
+/// Returns false if that is not possible (the caller then moves the
+/// block).
+///
+/// # Safety
+/// `span` must be a live large span.
+pub unsafe fn resize_large(span: *mut Span, size: usize) -> bool {
+    let want = size.div_ceil(UNIT_SIZE).max(1);
+    if want > UNITS - 1 {
+        return false;
+    }
+    let seg = segment_of(span as *const u8) as *mut Segment;
+    // SAFETY: `span` lives in `seg`'s header.
+    let first = unsafe {
+        (span as usize - ptr::addr_of!((*seg).spans) as usize) / core::mem::size_of::<Span>()
+    };
+    let mut pool = POOL.lock();
+    // SAFETY: caller contract; the pool lock protects the bookkeeping.
+    unsafe {
+        let have = (*span).units as usize;
+        if want < have {
+            let n = have - want;
+            let mask = run_mask(first + want, n);
+            (*seg).free_units |= mask;
+            (*seg).resident |= mask;
+            pool.resident_free += n;
+            pool.live_units -= n;
+            let now = now_ms();
+            (*seg).idle_since = now;
+            purge(&mut pool, now);
+        } else if want > have {
+            let n = want - have;
+            if first + want > UNITS {
+                return false;
+            }
+            let mask = run_mask(first + have, n);
+            if (*seg).free_units & mask != mask {
+                return false;
+            }
+            claim_units(&mut pool, seg, first + have, n, first);
+        }
+        (*span).units = want as u8;
+        (*span).block_size = (want * UNIT_SIZE) as u32;
+    }
+    true
+}
+
+/// Lays out `span` (first unit `first` of `seg`, `units` set) for
+/// `class`: bitmap first, then the page-aligned block area. `zeroed`
+/// says whether the block area is known to be all zeros.
+///
+/// # Safety
+/// The span must be empty (no live blocks) and owned by the caller.
+unsafe fn init_span(span: *mut Span, seg: *mut Segment, first: usize, class: usize, zeroed: bool) {
+    // SAFETY: caller contract.
+    unsafe {
+        let units = (*span).units as usize;
         let block_size = CLASS_SIZE[class] as usize;
         let mut start = seg as usize + first * UNIT_SIZE;
         let end = start + units * UNIT_SIZE;
@@ -373,82 +712,182 @@ pub fn alloc_span(class: usize, owner: usize) -> Option<*mut Span> {
         let data = (start + bitmap_bytes).next_multiple_of(MIN_PAGE_SIZE);
         let capacity = ((end - data) / block_size) as u32;
         ptr::write_bytes(start as *mut u8, 0, bitmap_bytes);
-        span.write(Span {
-            block_size: block_size as u32,
-            class: class as u8,
-            units: units as u8,
-            is_full: false,
-            capacity,
-            bump: 0,
-            used: 0,
-            free: 0,
-            remote: AtomicUsize::new(0),
-            owner: AtomicUsize::new(owner),
-            prev: ptr::null_mut(),
-            next: ptr::null_mut(),
-            bitmap: start as *mut u64,
-            data: data as *mut u8,
-        });
-        Some(span)
+        (*span).block_size = block_size as u32;
+        (*span).class = class as u8;
+        (*span).is_full = false;
+        (*span).capacity = capacity;
+        (*span).bump = 0;
+        (*span).used = 0;
+        (*span).free = 0;
+        (*span).zeroed = if zeroed { capacity } else { 0 };
+        (*span).remote.store(0, Ordering::Relaxed);
+        (*span).prev = ptr::null_mut();
+        (*span).next = ptr::null_mut();
+        (*span).bitmap = start as *mut u64;
+        (*span).data = data as *mut u8;
     }
 }
 
-/// Returns a completely free span's units to its segment, and the
-/// segment to the kernel if it became empty (and is not the only one).
+/// Re-purposes an empty span for `class`, which must use the same number
+/// of units. Its blocks are handed out from the start again, sequentially.
 ///
 /// # Safety
-/// `span` must be an allocated span no heap references any more.
-pub unsafe fn release_span(span: *mut Span) {
+/// `span` must be empty (every block freed, remote frees collected) and
+/// owned by the caller.
+pub unsafe fn reinit_span(span: *mut Span, class: usize) {
     let seg = segment_of(span as *const u8) as *mut Segment;
     // SAFETY: `span` lives in `seg`'s header.
     let first = unsafe {
         (span as usize - ptr::addr_of!((*seg).spans) as usize) / core::mem::size_of::<Span>()
     };
+    // SAFETY: caller contract.
+    debug_assert_eq!(units_for_class(class), unsafe { (*span).units } as usize);
+    // SAFETY: caller contract; the old block area may hold old data.
+    unsafe { init_span(span, seg, first, class, false) };
+}
+
+/// Returns a completely free span's units to its segment. The pages stay
+/// resident until [`purge`] decides otherwise.
+///
+/// # Safety
+/// `span` must be an allocated span no heap references any more.
+pub unsafe fn release_span(span: *mut Span) {
     let mut pool = POOL.lock();
-    // SAFETY: the pool lock protects the segment's unit bookkeeping.
+    let now = now_ms();
+    // SAFETY: caller contract.
+    unsafe { release_locked(&mut pool, span, now) }
+}
+
+/// [`release_span`] for a span that has already sat unused in a heap's
+/// reserve since `idle_since` (milliseconds): its segment counts as idle
+/// from then, so the pages go back right away rather than after another
+/// decay period.
+///
+/// # Safety
+/// As for [`release_span`].
+pub unsafe fn release_idle_span(span: *mut Span, idle_since: u64) {
+    let mut pool = POOL.lock();
+    // SAFETY: caller contract.
+    unsafe { release_locked(&mut pool, span, idle_since) }
+}
+
+/// [`release_span`] with the pool lock held; `idle_since` is when the
+/// span's memory was last in use.
+///
+/// # Safety
+/// As for [`release_span`].
+unsafe fn release_locked(pool: &mut Pool, span: *mut Span, idle_since: u64) {
+    let seg = segment_of(span as *const u8) as *mut Segment;
+    // SAFETY: `span` lives in `seg`'s header; the pool lock protects the
+    // segment's unit bookkeeping.
     unsafe {
+        let first =
+            (span as usize - ptr::addr_of!((*seg).spans) as usize) / core::mem::size_of::<Span>();
         let units = (*span).units as usize;
         // Poison the metadata so a stale free into this span is caught.
         (*span).block_size = 0;
         (*span).capacity = 0;
         (*span).bump = 0;
+        (*span).class = 0;
         (*span).owner.store(0, Ordering::Relaxed);
-        let mask = ((1u64 << units) - 1) << first;
+        let mask = run_mask(first, units);
         (*seg).free_units |= mask;
-        if units > 1 {
-            // Large spans hold blocks that fault their pages in anyway:
-            // return the memory right away.
+        pool.live_units -= units;
+        let now = now_ms();
+        if now.saturating_sub(idle_since) >= POOL_DECAY_MS {
+            // Already idle for a whole decay period (a span from a
+            // heap's reserve): return the pages right away instead of
+            // waiting for the next decay pass, which runs only once per
+            // period and would leave the rest of a decaying reserve
+            // resident.
             madvise_units(seg, first, units);
         } else {
             (*seg).resident |= mask;
+            pool.resident_free += units;
+            (*seg).idle_since = (*seg).idle_since.max(idle_since);
         }
-        // Once the segment is mostly free, return everything still
-        // resident in as few calls as possible.
-        if (*seg).free_units.count_ones() >= SWEEP_FREE_UNITS && (*seg).resident != 0 {
-            let mut bits = (*seg).resident;
-            while bits != 0 {
-                let start = bits.trailing_zeros() as usize;
-                let run = (bits >> start).trailing_ones() as usize;
-                madvise_units(seg, start, run);
-                bits &= !(((1u64 << run) - 1) << start);
+        purge(pool, now);
+    }
+}
+
+/// Returns idle memory to the kernel: the resident free units of every
+/// segment that has had nothing freed into it for [`POOL_DECAY_MS`]
+/// (an entirely free segment is unmapped, unless it is the last one),
+/// and, while the resident free units exceed the pool's budget, those
+/// of the least recently used segments. The decay pass runs at most
+/// once per decay period.
+///
+/// # Safety
+/// The pool lock must be held.
+unsafe fn purge(pool: &mut Pool, now: u64) {
+    let budget = pool.resident_budget();
+    if now.saturating_sub(pool.last_purge) >= POOL_DECAY_MS {
+        pool.last_purge = now;
+        let mut link = &mut pool.head as *mut *mut Segment;
+        // SAFETY: caller contract; segments in the pool are valid.
+        unsafe {
+            while !(*link).is_null() {
+                let s = *link;
+                if now.saturating_sub((*s).idle_since) >= POOL_DECAY_MS {
+                    let last = pool.head == s && (*s).next.is_null();
+                    if (*s).free_units == u64::MAX && !last {
+                        pool.resident_free -= (*s).resident.count_ones() as usize;
+                        *link = (*s).next;
+                        unregister(s as usize);
+                        let _ = sys::munmap(s as *mut u8, SEGMENT_SIZE);
+                        continue;
+                    }
+                    if (*s).resident != 0 {
+                        pool.resident_free -= (*s).resident.count_ones() as usize;
+                        sweep_segment(s);
+                    }
+                }
+                link = ptr::addr_of_mut!((*s).next);
             }
-            (*seg).resident = 0;
         }
-        if (*seg).free_units == u64::MAX && (pool.head != seg || !(*seg).next.is_null()) {
-            // Unlink and unmap.
-            let mut link = &mut pool.head as *mut *mut Segment;
-            while *link != seg {
-                link = ptr::addr_of_mut!((**link).next);
+    }
+    while pool.resident_free > budget {
+        let mut victim: *mut Segment = ptr::null_mut();
+        let mut s = pool.head;
+        // SAFETY: as above.
+        unsafe {
+            while !s.is_null() {
+                if (*s).resident != 0
+                    && (victim.is_null() || (*s).idle_since < (*victim).idle_since)
+                {
+                    victim = s;
+                }
+                s = (*s).next;
             }
-            *link = (*seg).next;
-            unregister(seg as usize);
-            let _ = sys::munmap(seg as *mut u8, SEGMENT_SIZE);
+            if victim.is_null()
+                || (now.saturating_sub((*victim).idle_since) < POOL_MIN_IDLE_MS
+                    && pool.resident_free <= budget * 2)
+            {
+                break;
+            }
+            pool.resident_free -= (*victim).resident.count_ones() as usize;
+            sweep_segment(victim);
         }
     }
 }
 
-/// Free units in a segment at which the resident free pages are returned.
-const SWEEP_FREE_UNITS: u32 = 48;
+/// Returns the pages of every resident free unit of `seg`.
+///
+/// # Safety
+/// The pool lock must be held.
+unsafe fn sweep_segment(seg: *mut Segment) {
+    // SAFETY: caller contract.
+    unsafe {
+        let mut bits = (*seg).resident;
+        while bits != 0 {
+            let start = bits.trailing_zeros() as usize;
+            let run = (bits >> start).trailing_ones() as usize;
+            madvise_units(seg, start, run);
+            bits &= !run_mask(start, run);
+        }
+        (*seg).resident = 0;
+    }
+}
 
 /// Lets the kernel reclaim the pages of units `first..first + n` (they
 /// read as zeros if reused). The segment header at the start of unit 0
@@ -469,6 +908,11 @@ unsafe fn madvise_units(seg: *mut Segment, first: usize, n: usize) {
     }
 }
 
+/// The coarse clock, for the heaps' span reserves.
+pub fn coarse_ms() -> u64 {
+    now_ms()
+}
+
 fn madvise_dontneed(addr: *mut u8, len: usize) {
     const MADV_DONTNEED: usize = 4;
     // SAFETY: the range is our own mapping and currently unused.
@@ -481,6 +925,21 @@ fn madvise_dontneed(addr: *mut u8, len: usize) {
 #[inline]
 pub fn segment_of(p: *const u8) -> *const Header {
     (p as usize & !(SEGMENT_SIZE - 1)) as *const Header
+}
+
+/// The span whose units contain `p`, for pointers known to lie in a
+/// live normal segment (no registry check).
+///
+/// # Safety
+/// `p` must point into a unit of a live span.
+pub unsafe fn span_containing(p: *const u8) -> *mut Span {
+    let seg = segment_of(p) as *mut Segment;
+    // SAFETY: caller contract.
+    unsafe {
+        let unit = (p as usize - seg as usize) / UNIT_SIZE;
+        let first = (*seg).span_of[unit].load(Ordering::Relaxed) as usize;
+        ptr::addr_of_mut!((*seg).spans[first])
+    }
 }
 
 /// What a pointer belongs to.
@@ -574,7 +1033,11 @@ pub fn alloc_huge(size: usize, align: usize) -> Option<(*mut u8, bool)> {
         .checked_next_multiple_of(MIN_PAGE_SIZE)?;
     let (base, len, fresh) = match take_cached(len) {
         Some((base, len, zeroed)) => (base, len, zeroed),
-        None => (map_aligned(len)?, len, true),
+        None => {
+            let base = map_aligned(len)?;
+            HUGE_CACHE.lock().live += len;
+            (base, len, true)
+        }
     };
     // SAFETY: our mapping; the header fits in the first page.
     let data = unsafe {
@@ -693,22 +1156,34 @@ pub unsafe fn free_huge(h: *mut Header) {
         len
     };
     unregister(h as usize);
+    let mut cache = HUGE_CACHE.lock();
+    cache.live = cache.live.saturating_sub(len);
+    let now = now_ms();
     if len <= HUGE_CACHE_MAX_LEN {
-        let mut cache = HUGE_CACHE.lock();
-        if cache.count < HUGE_CACHE_SLOTS {
-            let resident = cache.resident + len <= HUGE_CACHE_RESIDENT_MAX;
-            if resident {
-                cache.resident += len;
-            } else {
-                madvise_dontneed(h as *mut u8, len);
+        if cache.count == HUGE_CACHE_SLOTS {
+            // Full: drop the entry that has been idle longest.
+            if let Some(i) = (0..cache.count).min_by_key(|&j| cache.entries[j].freed_at) {
+                let e = cache.entries[i];
+                if e.resident {
+                    cache.resident -= e.len;
+                }
+                // SAFETY: our mapping, no longer referenced.
+                let _ = unsafe { sys::munmap(e.base as *mut u8, e.len) };
+                cache.count -= 1;
+                cache.entries[i] = cache.entries[cache.count];
             }
+        }
+        if cache.count < HUGE_CACHE_SLOTS {
             let n = cache.count;
             cache.entries[n] = CachedMapping {
                 base: h as usize,
                 len,
-                resident,
+                resident: true,
+                freed_at: now,
             };
             cache.count = n + 1;
+            cache.resident += len;
+            purge_huge_cache(&mut cache, now);
             return;
         }
     }
@@ -768,8 +1243,7 @@ mod tests {
             release_span(big);
             release_span(span);
         }
-        let (p, fresh) = alloc_huge(1_000_000, 16).unwrap();
-        assert!(fresh);
+        let (p, _fresh) = alloc_huge(1_000_000, 16).unwrap();
         // SAFETY: valid huge block.
         unsafe {
             match lookup(p) {

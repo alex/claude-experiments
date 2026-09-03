@@ -133,6 +133,9 @@ mod tests {
         assert_eq!(f128_to_f64(e(0) | (1u128 << 59)), 1.0);
         assert_eq!(f128_to_f64(e(0) | (1u128 << 59) | 1), 1.0 + f64::EPSILON);
         // Carry across a power of two: 2 - 2^-54 rounds to 2.
-        assert_eq!(f128_to_f64(e(0) | (((1u128 << 112) - 1) & !((1u128 << 58) - 1))), 2.0);
+        assert_eq!(
+            f128_to_f64(e(0) | (((1u128 << 112) - 1) & !((1u128 << 58) - 1))),
+            2.0
+        );
     }
 }

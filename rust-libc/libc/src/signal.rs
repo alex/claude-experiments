@@ -332,7 +332,11 @@ pub extern "C" fn pause() -> c_int {
     }
     // SAFETY: `mask` outlives the call.
     let r = unsafe {
-        crate::arch::syscall2(crate::arch::nr::RT_SIGSUSPEND, &mask as *const u64 as usize, 8)
+        crate::arch::syscall2(
+            crate::arch::nr::RT_SIGSUSPEND,
+            &mask as *const u64 as usize,
+            8,
+        )
     };
     sys::check(r).map(drop).c_ret()
 }

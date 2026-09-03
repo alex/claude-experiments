@@ -393,7 +393,10 @@ fn test(filter: Option<&str>, release: bool) -> ExitCode {
         t => format!("ctests-{}", t.sysroot_name().trim_start_matches("sysroot-")),
     });
     if pie() {
-        bindir.set_file_name(format!("{}-pie", bindir.file_name().unwrap().to_string_lossy()));
+        bindir.set_file_name(format!(
+            "{}-pie",
+            bindir.file_name().unwrap().to_string_lossy()
+        ));
     }
     fs::create_dir_all(&bindir).unwrap();
     let cxx_ok = have_cxx();
@@ -403,7 +406,10 @@ fn test(filter: Option<&str>, release: bool) -> ExitCode {
     let mut sources: Vec<PathBuf> = fs::read_dir(root.join("tests/c"))
         .unwrap()
         .filter_map(|e| e.ok().map(|e| e.path()))
-        .filter(|p| p.extension().is_some_and(|x| x == "c" || (x == "cpp" && cxx_ok)))
+        .filter(|p| {
+            p.extension()
+                .is_some_and(|x| x == "c" || (x == "cpp" && cxx_ok))
+        })
         .filter(|p| filter.is_none_or(|f| p.file_name().unwrap().to_string_lossy().contains(f)))
         .collect();
     sources.sort();
@@ -463,6 +469,14 @@ fn parse_bench(out: &str) -> Vec<(String, f64, String)> {
         .collect()
 }
 
+/// Other allocators to compare with, as (name, link flag): used when the
+/// library is installed.
+const OTHER_ALLOCATORS: &[(&str, &str)] = &[
+    ("mimalloc", "-lmimalloc"),
+    ("jemalloc", "-ljemalloc"),
+    ("tcmalloc", "-ltcmalloc_minimal"),
+];
+
 fn bench(filter: Option<&str>, release: bool) -> ExitCode {
     let sysroot = match build(release) {
         Ok(s) => s,
@@ -474,20 +488,23 @@ fn bench(filter: Option<&str>, release: bool) -> ExitCode {
     let root = root();
     let bindir = root.join("target/bench");
     fs::create_dir_all(&bindir).unwrap();
-    // "alloc" selects the allocator workload program; anything else is a
-    // section filter for the main benchmark.
-    let (src, filter) = if filter == Some("alloc") {
-        (root.join("bench/alloc.c"), None)
-    } else {
-        (root.join("bench/bench.c"), filter)
+    // "alloc" selects the allocator workload program (optionally followed
+    // by a workload filter); anything else is a section filter for the
+    // main benchmark.
+    let (src, filter, alloc) = match filter {
+        Some("alloc") => (root.join("bench/alloc.c"), None, true),
+        Some(f) if f.starts_with("alloc:") => (root.join("bench/alloc.c"), Some(&f[6..]), true),
+        f => (root.join("bench/bench.c"), f, false),
     };
     let ours = bindir.join("bench-rustlibc");
-    let theirs = bindir.join("bench-glibc");
     let extra = vec!["-fno-builtin".to_string(), "-pthread".to_string()];
     if !run(&mut compile_cmd(&sysroot, &src, &ours, &extra)) {
         eprintln!("error: compiling the benchmark against rustlibc failed");
         return ExitCode::FAILURE;
     }
+    // (name, binary) of every allocator to run.
+    let mut variants: Vec<(String, PathBuf)> = vec![("rustlibc".into(), ours)];
+    let theirs = bindir.join("bench-glibc");
     if !run(Command::new(cc())
         .args([
             "-std=gnu11",
@@ -503,8 +520,26 @@ fn bench(filter: Option<&str>, release: bool) -> ExitCode {
         eprintln!("error: compiling the benchmark against glibc failed");
         return ExitCode::FAILURE;
     }
-    let mut results = Vec::new();
-    for bin in [&ours, &theirs] {
+    variants.push(("glibc".into(), theirs));
+    if alloc {
+        for (name, flag) in OTHER_ALLOCATORS {
+            let bin = bindir.join(format!("bench-{name}"));
+            let ok = Command::new(cc())
+                .args(["-std=gnu11", "-O2", "-fno-builtin", "-pthread", "-o"])
+                .arg(&bin)
+                .arg(&src)
+                .arg(flag)
+                .stderr(Stdio::null())
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false);
+            if ok {
+                variants.push((name.to_string(), bin));
+            }
+        }
+    }
+    let mut results: Vec<Vec<(String, f64, String)>> = Vec::new();
+    for (name, bin) in &variants {
         let mut cmd = Command::new(bin);
         if let Some(f) = filter {
             cmd.arg(f);
@@ -515,8 +550,9 @@ fn bench(filter: Option<&str>, release: bool) -> ExitCode {
             }
             Ok(o) => {
                 eprintln!(
-                    "error: {} failed: {}",
+                    "error: {} ({}) failed: {}",
                     bin.display(),
+                    name,
                     String::from_utf8_lossy(&o.stderr)
                 );
                 return ExitCode::FAILURE;
@@ -527,18 +563,43 @@ fn bench(filter: Option<&str>, release: bool) -> ExitCode {
             }
         }
     }
-    println!(
-        "{:<28} {:>12} {:>12} {:>8}",
-        "benchmark", "rustlibc", "glibc", "ratio"
-    );
-    for (o, g) in results[0].iter().zip(results[1].iter()) {
-        // Ratio > 1 means rustlibc is better: faster, or (for memory) smaller.
-        let ratio = if o.2 == "GB/s" { o.1 / g.1 } else { g.1 / o.1 };
-        println!(
-            "{:<28} {:>7.2} {:<4} {:>7.2} {:<4} {:>7.2}x",
-            o.0, o.1, o.2, g.1, g.2, ratio
-        );
+    // Header: one column per allocator, then rustlibc's ratio to glibc
+    // and to the best of the others (> 1 means rustlibc is better:
+    // faster, or smaller for memory).
+    print!("{:<26}", "benchmark");
+    for (name, _) in &variants {
+        print!(" {name:>10}");
     }
+    println!(" {:>8} {:>8}", "vs glibc", "vs best");
+    for (row, ours) in results[0].iter().enumerate() {
+        let unit = &ours.2;
+        let better = |a: f64, b: f64| if unit == "GB/s" { a / b } else { b / a };
+        print!("{:<26}", ours.0);
+        let mut best_other = f64::NAN;
+        for (i, r) in results.iter().enumerate() {
+            let v = r.get(row).map(|x| x.1).unwrap_or(f64::NAN);
+            let text = if unit == "KB" {
+                format!("{:.0}", v)
+            } else {
+                format!("{:.2}", v)
+            };
+            print!(" {text:>10}");
+            if i > 1 && (best_other.is_nan() || better(v, best_other) > 1.0) {
+                best_other = v;
+            }
+        }
+        let glibc = results[1].get(row).map(|x| x.1).unwrap_or(f64::NAN);
+        print!(" {:>7.2}x", better(ours.1, glibc));
+        if best_other.is_nan() {
+            println!("{:>9}", "-");
+        } else {
+            println!(" {:>7.2}x", better(ours.1, best_other));
+        }
+    }
+    println!(
+        "units: {}",
+        results[0].first().map(|x| x.2.as_str()).unwrap_or("ns/op")
+    );
     ExitCode::SUCCESS
 }
 
@@ -557,7 +618,9 @@ fn main() -> ExitCode {
     let args: Vec<&str> = args
         .iter()
         .map(String::as_str)
-        .filter(|a| *a != "--debug" && *a != "--aarch64" && *a != "--pie" && !a.starts_with("--pagesize="))
+        .filter(|a| {
+            *a != "--debug" && *a != "--aarch64" && *a != "--pie" && !a.starts_with("--pagesize=")
+        })
         .collect();
     match args.as_slice() {
         ["build"] => match build(release) {

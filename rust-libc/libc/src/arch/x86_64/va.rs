@@ -301,8 +301,6 @@ macro_rules! long_double_stub {
 #[cfg(not(test))]
 pub(crate) use long_double_stub;
 
-
-
 #[cfg(test)]
 mod tests {
     use super::*;

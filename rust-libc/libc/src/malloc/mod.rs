@@ -90,21 +90,180 @@ fn corrupt(what: &str) -> ! {
     }
 }
 
+/// Span size tiers (by unit count, see `classes::units_for_class`): an
+/// empty span can serve any class of its tier.
+const TIERS: usize = 3;
+
+fn tier_of(class: usize) -> usize {
+    match classes::units_for_class(class) {
+        1 => 0,
+        4 => 1,
+        _ => 2,
+    }
+}
+
+/// Bytes of empty spans a heap keeps for reuse before giving them back.
+/// Returning a span (a TLB shootdown now, page faults later) is far
+/// more expensive than holding on to it, and most programs' allocation
+/// volume oscillates; this bounds the cost of a large drop in demand.
+const RETAIN_MAX: usize = 64 << 20;
+
+/// Retained spans idle for longer than this are given back whenever the
+/// reserve is next touched.
+const RETAIN_DECAY_MS: u64 = 250;
+
+/// Most entries a per-class block cache holds.
+const CACHE_MAX: usize = 32;
+
+/// A cached block: the block itself and its allocation bit, so handing
+/// it out is a store to the bit and nothing else. Blocks are 16-byte
+/// aligned, so the bit's index within its bitmap byte rides in the low
+/// bits of the pointer.
+#[derive(Clone, Copy)]
+#[repr(C)]
+struct Entry {
+    /// `ptr | bit`.
+    tagged: usize,
+    /// The bitmap byte holding the block's allocation bit.
+    byte: *mut u8,
+}
+
+impl Entry {
+    #[inline(always)]
+    fn new(ptr: *mut u8, bitmap: *mut u64, idx: u32) -> Entry {
+        Entry {
+            tagged: ptr as usize | (idx as usize & 7),
+            // SAFETY: the bitmap has a byte for every block.
+            byte: unsafe { (bitmap as *mut u8).add(idx as usize / 8) },
+        }
+    }
+
+    #[inline(always)]
+    fn ptr(self) -> *mut u8 {
+        (self.tagged & !0xf) as *mut u8
+    }
+
+    /// Marks the block allocated and returns it.
+    ///
+    /// # Safety
+    /// The entry must be live (its span still owned by this thread).
+    #[inline(always)]
+    unsafe fn take(self) -> *mut u8 {
+        // SAFETY: caller contract.
+        unsafe { *self.byte |= 1 << (self.tagged & 7) };
+        self.ptr()
+    }
+
+    /// The block's index in its span.
+    fn index(self, bitmap: *mut u64) -> u32 {
+        ((self.byte as usize - bitmap as usize) * 8 + (self.tagged & 7)) as u32
+    }
+}
+
+/// Per-class cache of free blocks in front of the span machinery (the
+/// idea of glibc's tcache and tcmalloc's per-thread caches), holding
+/// blocks the span already counts as taken but whose allocation bit is
+/// clear. `malloc` pops one and sets the bit; `free` clears the bit
+/// after the usual validation and pushes. Refills and flushes move
+/// several blocks at once, so the span's free list, bitmap and the
+/// segment lookup are touched once per batch rather than per call. The
+/// cache stores no metadata inside freed blocks, and a block freed twice
+/// is still caught by its allocation bit.
+#[repr(C)]
+struct Cache {
+    count: u8,
+    cap: u8,
+    /// Only `entries[..count]` are initialised (leaving the rest
+    /// uninitialised keeps thread start-up from clearing the whole
+    /// table).
+    entries: [core::mem::MaybeUninit<Entry>; CACHE_MAX],
+}
+
+impl Cache {
+    const EMPTY: Cache = Cache {
+        count: 0,
+        cap: 0,
+        entries: [core::mem::MaybeUninit::uninit(); CACHE_MAX],
+    };
+
+    #[inline(always)]
+    fn get(&self, i: usize) -> Entry {
+        // SAFETY: callers only read entries below `count`.
+        unsafe { self.entries[i].assume_init() }
+    }
+
+    #[inline(always)]
+    fn set(&mut self, i: usize, e: Entry) {
+        self.entries[i] = core::mem::MaybeUninit::new(e);
+    }
+}
+
+/// Cache capacity for a class: 32 blocks for the small classes, fewer
+/// as the blocks grow so that at most 64 KiB or so is cached per class
+/// (one block for the big classes: enough for a free/malloc pair to
+/// hit, without pinning megabytes per thread).
+fn cache_cap(class: usize) -> u8 {
+    ((64 * 1024) / CLASS_SIZE[class] as usize).clamp(1, CACHE_MAX) as u8
+}
+
+/// The span whose bitmap `word` belongs to (the word lies in the span's
+/// first unit, and unit 0's header maps every unit to its span).
+///
+/// # Safety
+/// `word` must be a bitmap word of a live span.
+unsafe fn span_of_word(word: *mut u64) -> *mut Span {
+    // SAFETY: caller contract.
+    unsafe { segment::span_containing(word as *const u8) }
+}
+
+/// Frees of other threads' blocks waiting to be pushed on their spans'
+/// remote stacks in batches (one CAS per span per batch instead of one
+/// per block, the biggest cost of producer/consumer hand-offs).
+const REMOTE_BUF: usize = 64;
+
+#[derive(Clone, Copy)]
+#[repr(C)]
+struct RemoteEntry {
+    ptr: *mut u8,
+    span: *mut Span,
+}
+
 /// A thread's allocator state.
 #[repr(C)]
 pub struct Heap {
+    /// The block caches (see [`Cache`]).
+    cache: [Cache; NUM_CLASSES],
+    /// Pending remote frees (see [`REMOTE_BUF`]).
+    remote: [core::mem::MaybeUninit<RemoteEntry>; REMOTE_BUF],
+    remote_count: u8,
     /// Spans that have (or may have, pending remote frees) free blocks.
     avail: [*mut Span; NUM_CLASSES],
     /// Spans with no locally free blocks.
     full: [*mut Span; NUM_CLASSES],
+    /// Completely free spans kept for reuse, per tier: a doubly linked
+    /// list, most recently freed first.
+    empty: [*mut Span; TIERS],
+    /// The other end of each `empty` list (the oldest span).
+    empty_tail: [*mut Span; TIERS],
+    /// Bytes held in `empty`.
+    retained: usize,
+    /// Cache refills and flushes, for the periodic reserve decay check.
+    refills: u32,
 }
 
 impl Heap {
     /// An empty heap.
     pub const fn new() -> Self {
         Heap {
+            cache: [Cache::EMPTY; NUM_CLASSES],
+            remote: [core::mem::MaybeUninit::uninit(); REMOTE_BUF],
+            remote_count: 0,
             avail: [ptr::null_mut(); NUM_CLASSES],
             full: [ptr::null_mut(); NUM_CLASSES],
+            empty: [ptr::null_mut(); TIERS],
+            empty_tail: [ptr::null_mut(); TIERS],
+            retained: 0,
+            refills: 0,
         }
     }
 
@@ -170,6 +329,26 @@ unsafe fn list_remove(head: *mut *mut Span, span: *mut Span) {
 // ---------------------------------------------------------------------
 // Span operations (owner only).
 
+/// Takes a block from `span` like [`span_pop`], also saying whether the
+/// block is known to be zero-filled (never used since its pages were
+/// last cleared).
+///
+/// # Safety
+/// The calling thread must own `span`.
+#[inline]
+unsafe fn span_pop_zeroed(span: *mut Span) -> (*mut u8, bool) {
+    // SAFETY: caller contract.
+    unsafe {
+        let s = &mut *span;
+        if s.free == 0 && s.bump < s.capacity {
+            let zero = s.bump < s.zeroed;
+            (span_pop(span), zero)
+        } else {
+            (span_pop(span), false)
+        }
+    }
+}
+
 /// Takes a block from `span`, or returns null if it has none.
 ///
 /// # Safety
@@ -204,6 +383,40 @@ unsafe fn span_pop(span: *mut Span) -> *mut u8 {
     }
 }
 
+/// Takes a block from `span` for the cache: like [`span_pop`] but leaves
+/// the allocation bit clear (a cached block is counted in `used` and has
+/// its bit clear).
+///
+/// # Safety
+/// The calling thread must own `span`.
+#[inline]
+unsafe fn span_pop_cached(span: *mut Span) -> Option<Entry> {
+    // SAFETY: caller contract.
+    unsafe {
+        let s = &mut *span;
+        let (p, idx) = if s.free != 0 {
+            let p = decode(s.free, ptr::addr_of!(s.free) as usize);
+            let Some(idx) = s.block_index(p) else {
+                corrupt("free list pointer")
+            };
+            if s.is_allocated(idx) {
+                corrupt("free list block is allocated");
+            }
+            let next = decode(*(p as *const usize), p as usize);
+            s.free = encode(next, ptr::addr_of!(s.free) as usize);
+            (p, idx)
+        } else if s.bump < s.capacity {
+            let idx = s.bump;
+            s.bump += 1;
+            (s.data.add(idx as usize * s.block_size as usize), idx)
+        } else {
+            return None;
+        };
+        s.used += 1;
+        Some(Entry::new(p, s.bitmap, idx))
+    }
+}
+
 /// Puts block `idx` (at `p`) back on `span`'s local free list.
 ///
 /// # Safety
@@ -214,6 +427,24 @@ unsafe fn span_push(span: *mut Span, p: *mut u8, idx: u32) {
     unsafe {
         let s = &mut *span;
         s.mark_free(idx);
+        let head = decode(s.free, ptr::addr_of!(s.free) as usize);
+        *(p as *mut usize) = encode(head, p as usize);
+        s.free = encode(p, ptr::addr_of!(s.free) as usize);
+        s.used -= 1;
+    }
+}
+
+/// Like [`span_push`] for a block whose allocation bit is already clear
+/// (it came from the cache).
+///
+/// # Safety
+/// As for [`span_push`].
+#[inline]
+unsafe fn span_push_cached(span: *mut Span, p: *mut u8, idx: u32) {
+    // SAFETY: caller contract.
+    unsafe {
+        let s = &mut *span;
+        debug_assert!(!s.is_allocated(idx));
         let head = decode(s.free, ptr::addr_of!(s.free) as usize);
         *(p as *mut usize) = encode(head, p as usize);
         s.free = encode(p, ptr::addr_of!(s.free) as usize);
@@ -261,6 +492,26 @@ unsafe fn span_has_free(span: *const Span) -> bool {
 
 struct Orphans([*mut Span; NUM_CLASSES]);
 
+/// Releases the empty orphans that no thread has adopted for a decay
+/// period; their pages go straight back to the kernel.
+fn decay_orphans(orphans: &mut Orphans, now: u64) {
+    for class in 0..NUM_CLASSES {
+        let mut span = orphans.0[class];
+        while !span.is_null() {
+            // SAFETY: spans on the orphan lists are live; the caller
+            // holds the lock.
+            unsafe {
+                let next = (*span).next;
+                if (*span).used == 0 && now.saturating_sub((*span).retained_at) > RETAIN_DECAY_MS {
+                    list_remove(&mut orphans.0[class], span);
+                    segment::release_idle_span(span, (*span).retained_at);
+                }
+                span = next;
+            }
+        }
+    }
+}
+
 /// Whether the orphan list of `class` already holds an empty span.
 fn orphans_has_empty(orphans: &Orphans, class: usize) -> bool {
     let mut span = orphans.0[class];
@@ -286,7 +537,47 @@ static ORPHANS: Mutex<Orphans> = Mutex::new(Orphans([ptr::null_mut(); NUM_CLASSE
 /// # Safety
 /// `heap` must not be used again.
 pub unsafe fn abandon(heap: *mut Heap) {
+    // SAFETY: caller contract.
+    unsafe {
+        flush_remote(heap);
+        for class in 0..NUM_CLASSES {
+            let n = (*heap).cache[class].count as usize;
+            if n != 0 {
+                flush_cache(heap, class, n);
+            }
+        }
+    }
     let mut orphans = ORPHANS.lock();
+    let now = segment::coarse_ms();
+    decay_orphans(&mut orphans, now);
+    // The empty reserve goes to the orphan lists first (one empty span
+    // per class), where the next thread adopts it with a single list pop
+    // instead of a walk of the pool's segment bitmaps: a burst of
+    // short-lived threads otherwise serialises on the pool lock.
+    for tier in 0..TIERS {
+        // SAFETY: the heap's lists are only touched by its thread.
+        unsafe {
+            let mut span = (*heap).empty[tier];
+            while !span.is_null() {
+                let next = (*span).next;
+                let class = (*span).class as usize;
+                if orphans_has_empty(&orphans, class) {
+                    segment::release_span(span);
+                } else {
+                    segment::reinit_span(span, class);
+                    (*span).owner.store(0, Ordering::Release);
+                    (*span).is_full = false;
+                    (*span).retained_at = now;
+                    list_push(&mut orphans.0[class], span);
+                }
+                span = next;
+            }
+            (*heap).empty[tier] = ptr::null_mut();
+            (*heap).empty_tail[tier] = ptr::null_mut();
+        }
+    }
+    // SAFETY: as above.
+    unsafe { (*heap).retained = 0 };
     for class in 0..NUM_CLASSES {
         // SAFETY: the heap's lists are only touched by its thread.
         let lists = unsafe {
@@ -311,6 +602,7 @@ pub unsafe fn abandon(heap: *mut Heap) {
                     } else {
                         (*span).owner.store(0, Ordering::Release);
                         (*span).is_full = false;
+                        (*span).retained_at = now;
                         list_push(&mut orphans.0[class], span);
                     }
                 }
@@ -320,12 +612,189 @@ pub unsafe fn abandon(heap: *mut Heap) {
 }
 
 // ---------------------------------------------------------------------
+// Empty span reserve.
+
+/// Puts an empty span into the heap's reserve, or gives it back when
+/// the reserve is full.
+///
+/// # Safety
+/// `span` must be empty and owned by `heap`, and on no list.
+unsafe fn retain_span(heap: *mut Heap, span: *mut Span) {
+    // SAFETY: caller contract.
+    unsafe {
+        let now = segment::coarse_ms();
+        decay_retained(heap, now);
+        let bytes = (*span).units as usize * segment::UNIT_SIZE;
+        (*span).retained_at = now;
+        // Make room by giving back the least recently freed spans (the
+        // incoming one is the most likely to be needed again soon).
+        // (`unlink_retained` lowers `retained`, through the pointer.)
+        #[allow(clippy::while_immutable_condition)]
+        while (*heap).retained + bytes > RETAIN_MAX {
+            let mut victim: *mut Span = ptr::null_mut();
+            for tier in 0..TIERS {
+                let tail = (*heap).empty_tail[tier];
+                if !tail.is_null() && (victim.is_null() || (*tail).units > (*victim).units) {
+                    victim = tail;
+                }
+            }
+            if victim.is_null() {
+                segment::release_span(span);
+                return;
+            }
+            unlink_retained(heap, victim);
+            segment::release_span(victim);
+        }
+        let tier = tier_of((*span).class as usize);
+        let head = (*heap).empty[tier];
+        (*span).prev = ptr::null_mut();
+        (*span).next = head;
+        if head.is_null() {
+            (*heap).empty_tail[tier] = span;
+        } else {
+            (*head).prev = span;
+        }
+        (*heap).empty[tier] = span;
+        (*heap).retained += bytes;
+    }
+}
+
+/// Gives back the retained spans that have been idle for too long (they
+/// sit at the tails of the lists, oldest last).
+///
+/// # Safety
+/// The heap must belong to the calling thread.
+unsafe fn decay_retained(heap: *mut Heap, now: u64) {
+    // SAFETY: caller contract.
+    unsafe {
+        for tier in 0..TIERS {
+            loop {
+                let tail = (*heap).empty_tail[tier];
+                if tail.is_null() || now.saturating_sub((*tail).retained_at) <= RETAIN_DECAY_MS {
+                    break;
+                }
+                unlink_retained(heap, tail);
+                segment::release_idle_span(tail, (*tail).retained_at);
+            }
+        }
+    }
+}
+
+/// Removes `span` from the heap's reserve.
+///
+/// # Safety
+/// `span` must be in the reserve of `heap`.
+unsafe fn unlink_retained(heap: *mut Heap, span: *mut Span) {
+    // SAFETY: caller contract.
+    unsafe {
+        let tier = tier_of((*span).class as usize);
+        let (prev, next) = ((*span).prev, (*span).next);
+        if prev.is_null() {
+            (*heap).empty[tier] = next;
+        } else {
+            (*prev).next = next;
+        }
+        if next.is_null() {
+            (*heap).empty_tail[tier] = prev;
+        } else {
+            (*next).prev = prev;
+        }
+        (*span).prev = ptr::null_mut();
+        (*span).next = ptr::null_mut();
+        (*heap).retained -= (*span).units as usize * segment::UNIT_SIZE;
+    }
+}
+
+/// Takes an empty span for `class` out of the heap's reserve, laid out
+/// for that class.
+///
+/// # Safety
+/// The heap must belong to the calling thread.
+unsafe fn take_retained(heap: *mut Heap, class: usize) -> *mut Span {
+    // SAFETY: caller contract.
+    unsafe {
+        let tier = tier_of(class);
+        let span = (*heap).empty[tier];
+        if span.is_null() {
+            return span;
+        }
+        unlink_retained(heap, span);
+        decay_retained(heap, segment::coarse_ms());
+        segment::reinit_span(span, class);
+        span
+    }
+}
+
+// ---------------------------------------------------------------------
 // Allocation.
 
-/// The slow path of `malloc`: finds or creates a span with a free block.
+/// Lets the heap's reserve decay every so often from the cache refill
+/// and flush paths: the reserve normally decays when it is touched, but
+/// a thread whose working set shrank and then settled would otherwise
+/// hold its reserve forever. A coarse clock read every 16th refill or
+/// flush costs about a nanosecond per allocation.
+///
+/// # Safety
+/// The heap must belong to the calling thread.
+#[inline]
+unsafe fn maybe_decay(heap: *mut Heap) {
+    // SAFETY: caller contract.
+    unsafe {
+        if (*heap).retained != 0 {
+            (*heap).refills = (*heap).refills.wrapping_add(1);
+            if (*heap).refills.is_multiple_of(16) {
+                decay_retained(heap, segment::coarse_ms());
+            }
+        }
+    }
+}
+
+/// The slow path of `malloc`: refills the class's cache from spans (a
+/// batch, so the span is touched once for several allocations) and
+/// returns one block.
 #[cold]
 #[inline(never)]
 unsafe fn alloc_slow(heap: *mut Heap, class: usize) -> *mut u8 {
+    // SAFETY: the heap belongs to the calling thread.
+    unsafe {
+        let cache = ptr::addr_of_mut!((*heap).cache[class]);
+        if (*cache).cap == 0 {
+            (*cache).cap = cache_cap(class);
+        }
+        let want = ((*cache).cap / 2).max(1) as usize;
+        // The reserve normally decays when it is touched; a thread that
+        // stops needing spans altogether (its working set shrank and
+        // settled) would otherwise hold its reserve forever, so check it
+        // every so often from here.
+        maybe_decay(heap);
+        let mut got = 0;
+        while got < want {
+            let span = next_span(heap, class);
+            if span.is_null() {
+                break;
+            }
+            while got < want {
+                match span_pop_cached(span) {
+                    Some(e) => {
+                        (*cache).set(got, e);
+                        got += 1;
+                    }
+                    None => break,
+                }
+            }
+        }
+        if got == 0 {
+            return ptr::null_mut();
+        }
+        got -= 1;
+        (*cache).count = got as u8;
+        (*cache).get(got).take()
+    }
+}
+
+/// Finds or creates a span of `class` with a free block, at the head of
+/// the heap's avail list; null if memory is exhausted.
+unsafe fn next_span(heap: *mut Heap, class: usize) -> *mut Span {
     // SAFETY: the heap belongs to the calling thread.
     unsafe {
         let avail = ptr::addr_of_mut!((*heap).avail[class]);
@@ -336,7 +805,7 @@ unsafe fn alloc_slow(heap: *mut Heap, class: usize) -> *mut u8 {
             let span = *avail;
             span_collect_remote(span);
             if span_has_free(span) {
-                return span_pop(span);
+                return span;
             }
             list_remove(avail, span);
             (*span).is_full = true;
@@ -350,14 +819,15 @@ unsafe fn alloc_slow(heap: *mut Heap, class: usize) -> *mut u8 {
                 list_remove(full, span);
                 (*span).is_full = false;
                 list_push(avail, span);
-                return span_pop(span);
+                return span;
             }
             span = next;
         }
-        // Adopt an orphan.
+        // Adopt an orphan (and let the ones nobody adopts decay).
         loop {
             let span = {
                 let mut orphans = ORPHANS.lock();
+                decay_orphans(&mut orphans, segment::coarse_ms());
                 let span = orphans.0[class];
                 if !span.is_null() {
                     list_remove(&mut orphans.0[class], span);
@@ -371,38 +841,44 @@ unsafe fn alloc_slow(heap: *mut Heap, class: usize) -> *mut u8 {
             span_collect_remote(span);
             if span_has_free(span) {
                 list_push(avail, span);
-                return span_pop(span);
+                return span;
             }
             (*span).is_full = true;
             list_push(full, span);
         }
-        // A fresh span.
-        match segment::alloc_span(class, (*heap).id()) {
-            Some(span) => {
-                list_push(avail, span);
-                span_pop(span)
+        // A retained empty span, else a fresh one.
+        let span = take_retained(heap, class);
+        let span = if span.is_null() {
+            match segment::alloc_span(class, (*heap).id()) {
+                Some(span) => span,
+                None => return ptr::null_mut(),
             }
-            None => ptr::null_mut(),
-        }
+        } else {
+            span
+        };
+        list_push(avail, span);
+        span
     }
 }
 
 /// Allocates `size` bytes with the default alignment. Returns null and
-/// sets `errno` on failure.
+/// sets `errno` on failure. Inlined into its callers (`malloc` above
+/// all) so the fast path is not a jump through a stub.
+#[inline(always)]
 pub fn alloc(size: usize) -> *mut u8 {
     if size > MAX_SMALL {
-        return finish(segment::alloc_huge(size, 16).map(|(p, _)| p));
+        return alloc_big_entry(size);
     }
     let class = class_for(size);
     let heap = current_heap();
     // SAFETY: the heap belongs to the calling thread.
     unsafe {
-        let span = (*heap).avail[class];
-        if !span.is_null() {
-            let p = span_pop(span);
-            if !p.is_null() {
-                return p;
-            }
+        let cache = ptr::addr_of_mut!((*heap).cache[class]);
+        let n = (*cache).count;
+        if n != 0 {
+            let n = n - 1;
+            (*cache).count = n;
+            return (*cache).get(n as usize).take();
         }
         let p = alloc_slow(heap, class);
         if p.is_null() {
@@ -422,13 +898,47 @@ pub fn alloc_aligned(size: usize, align: usize) -> *mut u8 {
     {
         return alloc(CLASS_SIZE[class] as usize);
     }
+    // A large span starts on a unit boundary, which satisfies any
+    // alignment up to the unit size.
+    if align <= segment::UNIT_SIZE && size <= segment::LARGE_MAX {
+        return finish(segment::alloc_large(size).map(|(p, _)| p));
+    }
     finish(segment::alloc_huge(size, align).map(|(p, _)| p))
+}
+
+/// [`alloc`] for sizes above [`MAX_SMALL`], kept out of line so the
+/// small-block fast path needs no stack frame.
+#[cold]
+#[inline(never)]
+fn alloc_big_entry(size: usize) -> *mut u8 {
+    finish(alloc_big(size).map(|(p, _)| p))
+}
+
+/// Allocates a block bigger than [`MAX_SMALL`]: a large span, or a huge
+/// mapping beyond what a segment can hold. The flag says whether the
+/// memory is known to be zero-filled.
+fn alloc_big(size: usize) -> Option<(*mut u8, bool)> {
+    // A big allocation is a natural point to let this thread's reserve
+    // of small spans decay (the reserve otherwise only decays when the
+    // small-block paths touch it).
+    let heap = current_heap();
+    // SAFETY: the heap belongs to the calling thread.
+    unsafe {
+        if (*heap).retained != 0 {
+            decay_retained(heap, segment::coarse_ms());
+        }
+    }
+    if size <= segment::LARGE_MAX {
+        segment::alloc_large(size)
+    } else {
+        segment::alloc_huge(size, 16)
+    }
 }
 
 /// Allocates `size` zeroed bytes.
 pub fn alloc_zeroed(size: usize) -> *mut u8 {
     if size > MAX_SMALL {
-        return match segment::alloc_huge(size, 16) {
+        return match alloc_big(size) {
             Some((p, fresh)) => {
                 // A fresh mapping is already zero; a recycled one is not.
                 if !fresh {
@@ -440,12 +950,28 @@ pub fn alloc_zeroed(size: usize) -> *mut u8 {
             None => finish(None),
         };
     }
-    let p = alloc(size);
-    if !p.is_null() {
-        // SAFETY: `p` has at least `size` bytes.
-        unsafe { ptr::write_bytes(p, 0, size) };
+    let class = class_for(size);
+    let heap = current_heap();
+    // SAFETY: the heap belongs to the calling thread.
+    unsafe {
+        let span = (*heap).avail[class];
+        if !span.is_null() {
+            let (p, zero) = span_pop_zeroed(span);
+            if !p.is_null() {
+                if !zero {
+                    ptr::write_bytes(p, 0, size);
+                }
+                return p;
+            }
+        }
+        let p = alloc_slow(heap, class);
+        if p.is_null() {
+            Errno::ENOMEM.set();
+            return p;
+        }
+        ptr::write_bytes(p, 0, size);
+        p
     }
-    p
 }
 
 fn finish(p: Option<*mut u8>) -> *mut u8 {
@@ -479,74 +1005,146 @@ pub unsafe fn dealloc(p: *mut u8) {
                 let Some(idx) = (*span).block_index(p) else {
                     corrupt("free of invalid pointer")
                 };
+                if (*span).class == segment::LARGE_CLASS {
+                    segment::free_large(span, p);
+                    return;
+                }
                 let heap = current_heap();
                 if (*span).owner.load(Ordering::Acquire) == (*heap).id() {
                     if !(*span).is_allocated(idx) {
                         corrupt("double free");
                     }
-                    span_push(span, p, idx);
+                    (*span).mark_free(idx);
+                    // Into the cache; flush half of it to the spans when
+                    // it is full.
                     let class = (*span).class as usize;
-                    if (*span).is_full {
-                        list_remove(ptr::addr_of_mut!((*heap).full[class]), span);
-                        (*span).is_full = false;
-                        list_push(ptr::addr_of_mut!((*heap).avail[class]), span);
-                    } else if (*span).used == 0 {
-                        // Completely free. The only span of its class is
-                        // always kept (a block freed and reallocated in a
-                        // loop must not fault every time). Otherwise a
-                        // large span, whose blocks cost page faults
-                        // anyway, is given back, and of the single-unit
-                        // spans (256 KiB) exactly one empty one is kept,
-                        // at the head of the list where the next
-                        // allocations reuse it.
-                        let avail = ptr::addr_of_mut!((*heap).avail[class]);
-                        let head = *avail;
-                        if (*span).units > 1 {
-                            if head != span || !(*span).next.is_null() {
-                                list_remove(avail, span);
-                                segment::release_span(span);
-                            }
-                        } else if head != span {
-                            list_remove(avail, span);
-                            if (*head).used == 0 {
-                                segment::release_span(span);
-                            } else {
-                                list_push(avail, span);
-                            }
-                        } else {
-                            // A span that just came back from the full
-                            // list is the head; the previous empty span
-                            // is right behind it.
-                            let next = (*span).next;
-                            if !next.is_null() && (*next).used == 0 {
-                                list_remove(avail, next);
-                                segment::release_span(next);
-                            }
-                        }
+                    let cache = ptr::addr_of_mut!((*heap).cache[class]);
+                    if (*cache).cap == 0 {
+                        (*cache).cap = cache_cap(class);
                     }
+                    if (*cache).count >= (*cache).cap {
+                        flush_cache(heap, class, ((*cache).cap / 2).max(1) as usize);
+                    }
+                    let n = (*cache).count as usize;
+                    (*cache).set(n, Entry::new(p, (*span).bitmap, idx));
+                    (*cache).count = (n + 1) as u8;
                 } else {
-                    // Not ours: push on the owner's remote stack.
-                    // Links are encoded like the local list's, so a
-                    // use-after-free write cannot redirect the owner's
-                    // collection at an arbitrary block.
-                    let remote = &(*span).remote;
-                    let mut head = remote.load(Ordering::Relaxed);
-                    loop {
-                        *(p as *mut usize) = encode(head as *mut u8, p as usize);
-                        match remote.compare_exchange_weak(
-                            head,
-                            p as usize,
-                            Ordering::Release,
-                            Ordering::Relaxed,
-                        ) {
-                            Ok(_) => break,
-                            Err(h) => head = h,
-                        }
+                    // Not ours: batch it for the owner.
+                    let n = (*heap).remote_count as usize;
+                    if n == REMOTE_BUF {
+                        flush_remote(heap);
+                        (*heap).remote[0] =
+                            core::mem::MaybeUninit::new(RemoteEntry { ptr: p, span });
+                        (*heap).remote_count = 1;
+                    } else {
+                        (*heap).remote[n] =
+                            core::mem::MaybeUninit::new(RemoteEntry { ptr: p, span });
+                        (*heap).remote_count = (n + 1) as u8;
                     }
                 }
             }
             Owner::Invalid => corrupt("free of pointer not from malloc"),
         }
+    }
+}
+
+/// Returns `p` (block `idx` of `span`, owned by `heap`, its allocation
+/// bit already clear) to the span's free list and keeps the heap's span
+/// lists in order.
+///
+/// # Safety
+/// As stated; the block must not be in the cache.
+unsafe fn free_to_span(heap: *mut Heap, span: *mut Span, p: *mut u8, idx: u32) {
+    // SAFETY: caller contract.
+    unsafe {
+        span_push_cached(span, p, idx);
+        let class = (*span).class as usize;
+        if (*span).is_full {
+            list_remove(ptr::addr_of_mut!((*heap).full[class]), span);
+            (*span).is_full = false;
+            list_push(ptr::addr_of_mut!((*heap).avail[class]), span);
+        } else if (*span).used == 0 {
+            // Completely free: into the heap's reserve, where any class
+            // of its tier can pick it up (the block cache keeps a block
+            // freed and reallocated in a loop from ever getting here).
+            list_remove(ptr::addr_of_mut!((*heap).avail[class]), span);
+            retain_span(heap, span);
+        }
+    }
+}
+
+/// Pushes the buffered remote frees on their spans' remote stacks, one
+/// chain (and one CAS) per span. Links are encoded like the local
+/// list's, so a use-after-free write cannot redirect the owner's
+/// collection at an arbitrary block.
+///
+/// # Safety
+/// The heap must belong to the calling thread.
+unsafe fn flush_remote(heap: *mut Heap) {
+    // SAFETY: caller contract; buffered entries are live blocks of
+    // other threads' spans.
+    unsafe {
+        let n = (*heap).remote_count as usize;
+        let buf = (*heap).remote.as_mut_ptr() as *mut RemoteEntry;
+        for i in 0..n {
+            let first = *buf.add(i);
+            if first.span.is_null() {
+                continue;
+            }
+            // Chain every buffered block of this span: each links to the
+            // next one found, the last to whatever the stack holds.
+            let span = first.span;
+            let head = first.ptr;
+            let mut tail = first.ptr;
+            for j in i + 1..n {
+                let e = *buf.add(j);
+                if e.span == span {
+                    *(tail as *mut usize) = encode(e.ptr, tail as usize);
+                    tail = e.ptr;
+                    (*buf.add(j)).span = ptr::null_mut();
+                }
+            }
+            let remote = &(*span).remote;
+            let mut old = remote.load(Ordering::Relaxed);
+            loop {
+                *(tail as *mut usize) = encode(old as *mut u8, tail as usize);
+                match remote.compare_exchange_weak(
+                    old,
+                    head as usize,
+                    Ordering::Release,
+                    Ordering::Relaxed,
+                ) {
+                    Ok(_) => break,
+                    Err(h) => old = h,
+                }
+            }
+        }
+        (*heap).remote_count = 0;
+    }
+}
+
+/// Moves the oldest `n` entries of a class's cache to their spans.
+///
+/// # Safety
+/// The heap must belong to the calling thread.
+unsafe fn flush_cache(heap: *mut Heap, class: usize, n: usize) {
+    // SAFETY: caller contract; cached blocks belong to spans this heap
+    // owns.
+    unsafe {
+        let cache = ptr::addr_of_mut!((*heap).cache[class]);
+        let count = (*cache).count as usize;
+        let n = n.min(count);
+        maybe_decay(heap);
+        for i in 0..n {
+            let e = (*cache).get(i);
+            // The entry's bitmap byte says which span and block it is,
+            // without another lookup of the pointer.
+            let span = span_of_word(e.byte as *mut u64);
+            let idx = e.index((*span).bitmap);
+            free_to_span(heap, span, e.ptr(), idx);
+        }
+        (*cache).entries.copy_within(n..count, 0);
+        (*cache).count = (count - n) as u8;
     }
 }
 
@@ -575,14 +1173,22 @@ pub unsafe fn realloc_impl(p: *mut u8, size: usize) -> *mut u8 {
     }
     // SAFETY: caller contract.
     unsafe {
+        let owner = segment::lookup(p);
+        // A large span shrinks or grows in place when it can.
+        if let Owner::Span(span) = owner
+            && (*span).class == segment::LARGE_CLASS
+            && segment::resize_large(span, size)
+        {
+            return p;
+        }
         let old = usable_size(p);
         // Keep the block if it fits and would not waste most of it.
         if size <= old && (size >= old / 4 || old <= 128) {
             return p;
         }
         // Huge blocks are resized by the kernel instead of copied.
-        if size > MAX_SMALL
-            && let Owner::Huge(h) = segment::lookup(p)
+        if size > segment::LARGE_MAX
+            && let Owner::Huge(h) = owner
             && let Some(q) = segment::realloc_huge(h, size)
         {
             return q;
@@ -978,16 +1584,22 @@ mod tests {
     #[test]
     #[should_panic(expected = "heap corruption")]
     fn corrupted_free_list_is_detected() {
+        let _keep = alloc(64); // keeps the span from being recycled
         let p = alloc(64);
         let q = alloc(64);
         // SAFETY: deliberately corrupting a free block.
         unsafe {
             dealloc(p);
             dealloc(q);
-            // q is now the list head; smash its link.
+            // Move both from the cache to the span's free list, where the
+            // links live inside the blocks; q is the list head.
+            let heap = current_heap();
+            let class = class_for(64);
+            let n = (*heap).cache[class].count as usize;
+            flush_cache(heap, class, n);
             *(q as *mut usize) = 0x4141_4141_4141_4141;
-            let _ = alloc(64); // pops q
-            let _ = alloc(64); // pops the smashed link
+            let _ = alloc(64); // refills: pops q, then the smashed link
+            let _ = alloc(64);
         }
     }
 }

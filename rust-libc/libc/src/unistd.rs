@@ -206,7 +206,14 @@ pub extern "C" fn getpgrp() -> c_int {
 #[cfg_attr(not(test), unsafe(no_mangle))]
 pub extern "C" fn seteuid(uid: c_uint) -> c_int {
     // SAFETY: no memory is involved.
-    let r = unsafe { crate::arch::syscall3(crate::arch::nr::SETRESUID, usize::MAX, uid as usize, usize::MAX) };
+    let r = unsafe {
+        crate::arch::syscall3(
+            crate::arch::nr::SETRESUID,
+            usize::MAX,
+            uid as usize,
+            usize::MAX,
+        )
+    };
     sys::check(r).map(drop).c_ret()
 }
 
@@ -214,6 +221,13 @@ pub extern "C" fn seteuid(uid: c_uint) -> c_int {
 #[cfg_attr(not(test), unsafe(no_mangle))]
 pub extern "C" fn setegid(gid: c_uint) -> c_int {
     // SAFETY: no memory is involved.
-    let r = unsafe { crate::arch::syscall3(crate::arch::nr::SETRESGID, usize::MAX, gid as usize, usize::MAX) };
+    let r = unsafe {
+        crate::arch::syscall3(
+            crate::arch::nr::SETRESGID,
+            usize::MAX,
+            gid as usize,
+            usize::MAX,
+        )
+    };
     sys::check(r).map(drop).c_ret()
 }

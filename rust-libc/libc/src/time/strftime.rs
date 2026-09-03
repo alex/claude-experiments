@@ -106,7 +106,14 @@ pub fn format(buf: &mut [u8], fmt: &[u8], tm: &Tm) -> Option<usize> {
             )
             .ok()?,
             b'e' => write!(out, "{:2}", tm.tm_mday).ok()?,
-            b'F' => write!(out, "{}-{:02}-{:02}", year, tm.tm_mon as i64 + 1, tm.tm_mday).ok()?,
+            b'F' => write!(
+                out,
+                "{}-{:02}-{:02}",
+                year,
+                tm.tm_mon as i64 + 1,
+                tm.tm_mday
+            )
+            .ok()?,
             b'G' => write!(out, "{}", iso_week(tm).0).ok()?,
             b'g' => write!(out, "{:02}", iso_week(tm).0.rem_euclid(100)).ok()?,
             b'H' => write!(out, "{:02}", tm.tm_hour).ok()?,
@@ -138,10 +145,20 @@ pub fn format(buf: &mut [u8], fmt: &[u8], tm: &Tm) -> Option<usize> {
             b't' => out.write_str("\t").ok()?,
             b'T' => write!(out, "{:02}:{:02}:{:02}", tm.tm_hour, tm.tm_min, tm.tm_sec).ok()?,
             b'u' => write!(out, "{}", (tm.tm_wday as i64 + 6).rem_euclid(7) + 1).ok()?,
-            b'U' => write!(out, "{:02}", (tm.tm_yday as i64 + 7 - tm.tm_wday as i64) / 7).ok()?,
+            b'U' => write!(
+                out,
+                "{:02}",
+                (tm.tm_yday as i64 + 7 - tm.tm_wday as i64) / 7
+            )
+            .ok()?,
             b'V' => write!(out, "{:02}", iso_week(tm).1).ok()?,
             b'w' => write!(out, "{}", tm.tm_wday).ok()?,
-            b'W' => write!(out, "{:02}", (tm.tm_yday as i64 + 7 - (tm.tm_wday as i64 + 6).rem_euclid(7)) / 7).ok()?,
+            b'W' => write!(
+                out,
+                "{:02}",
+                (tm.tm_yday as i64 + 7 - (tm.tm_wday as i64 + 6).rem_euclid(7)) / 7
+            )
+            .ok()?,
             b'x' => write!(
                 out,
                 "{:02}/{:02}/{:02}",

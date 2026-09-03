@@ -30,8 +30,8 @@ use super::{
 use crate::errno::Errno;
 use crate::sync::Mutex;
 use crate::sys::{
-    self, MAP_ANONYMOUS, MAP_NORESERVE, MAP_PRIVATE, MAP_STACK, MIN_PAGE_SIZE, PROT_NONE, PROT_READ,
-    PROT_WRITE,
+    self, MAP_ANONYMOUS, MAP_NORESERVE, MAP_PRIVATE, MAP_STACK, MIN_PAGE_SIZE, PROT_NONE,
+    PROT_READ, PROT_WRITE,
 };
 use core::ffi::{c_int, c_void};
 use core::ptr;
@@ -152,7 +152,9 @@ pub unsafe extern "C" fn pthread_create(
     let tls_len = tls::round_up(tls::region_size(), 16);
     let (Some(guard), Some(stack)) = (
         attr.guard_size.checked_next_multiple_of(sys::page_size()),
-        attr.stack_size.max(16 * 1024).checked_next_multiple_of(sys::page_size()),
+        attr.stack_size
+            .max(16 * 1024)
+            .checked_next_multiple_of(sys::page_size()),
     ) else {
         return Errno::EINVAL.0;
     };

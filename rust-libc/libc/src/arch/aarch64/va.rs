@@ -108,7 +108,6 @@ pub unsafe fn write_long_double(dst: *mut u8, v: f64) {
     unsafe { (dst as *mut u128).write_unaligned(f64_to_f128(v)) }
 }
 
-
 /// Generates a variadic C entry point `$name` with `$fixed` fixed integer
 /// arguments that calls `$target` with a `va_list` pointer in `$reg`.
 #[cfg(not(test))]

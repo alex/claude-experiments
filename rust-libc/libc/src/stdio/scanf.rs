@@ -468,7 +468,9 @@ pub unsafe fn scan<S: Source>(src: &mut S, fmt: *const u8, ap: &mut VaList) -> c
                     if !dst.is_null() {
                         match length {
                             Length::None => *(dst as *mut f32) = res.value as f32,
-                            Length::BigL => crate::arch::va::write_long_double(dst as *mut u8, res.value),
+                            Length::BigL => {
+                                crate::arch::va::write_long_double(dst as *mut u8, res.value)
+                            }
                             _ => *(dst as *mut f64) = res.value,
                         }
                         assigned += 1;

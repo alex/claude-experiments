@@ -15,7 +15,7 @@ typedef unsigned long pthread_t;
 typedef int pthread_key_t;
 typedef int pthread_once_t;
 typedef int pthread_spinlock_t;
-typedef struct { unsigned __s[4]; } pthread_mutex_t;
+typedef struct { unsigned __s[5]; } pthread_mutex_t;
 typedef struct { unsigned __s[4]; } pthread_cond_t;
 typedef struct { unsigned __s[4]; } pthread_rwlock_t;
 typedef struct { unsigned long __s[2]; } pthread_barrier_t;
@@ -31,7 +31,7 @@ typedef struct {
     int __pad;
 } pthread_attr_t;
 
-#define PTHREAD_MUTEX_INITIALIZER {{0, 0, 0, 0}}
+#define PTHREAD_MUTEX_INITIALIZER {{0, 0, 0, 0, 0}}
 #define PTHREAD_RECURSIVE_MUTEX_INITIALIZER_NP {{0, 1, 0, 0}}
 #define PTHREAD_ERRORCHECK_MUTEX_INITIALIZER_NP {{0, 2, 0, 0}}
 #define PTHREAD_COND_INITIALIZER {{0, 0, 0, 0}}

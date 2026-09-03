@@ -478,8 +478,11 @@ pub unsafe extern "C" fn pthread_cond_clockwait(
 pub unsafe extern "C" fn pthread_cond_signal(c: *mut Cond) -> c_int {
     // SAFETY: caller contract.
     unsafe {
-        (*c).seq.fetch_add(1, Ordering::SeqCst);
+        // A waiter registers before it drops the mutex, so with none
+        // registered nobody can be about to sleep on the current sequence
+        // number and the (contended) sequence bump can be skipped.
         if (*c).waiters.load(Ordering::SeqCst) != 0 {
+            (*c).seq.fetch_add(1, Ordering::SeqCst);
             let _ = sys::futex_wake(&(*c).seq, 1);
         }
     }
@@ -494,8 +497,8 @@ pub unsafe extern "C" fn pthread_cond_signal(c: *mut Cond) -> c_int {
 pub unsafe extern "C" fn pthread_cond_broadcast(c: *mut Cond) -> c_int {
     // SAFETY: caller contract.
     unsafe {
-        (*c).seq.fetch_add(1, Ordering::SeqCst);
         if (*c).waiters.load(Ordering::SeqCst) != 0 {
+            (*c).seq.fetch_add(1, Ordering::SeqCst);
             wake_all(&(*c).seq);
         }
     }
@@ -1131,7 +1134,7 @@ mod tests {
 
     #[test]
     fn layouts() {
-        assert_eq!(core::mem::size_of::<Mutex>(), 16);
+        assert_eq!(core::mem::size_of::<Mutex>(), 20);
         assert_eq!(core::mem::size_of::<Cond>(), 16);
         assert_eq!(core::mem::size_of::<RwLock>(), 16);
         assert_eq!(core::mem::size_of::<Barrier>(), 16);
