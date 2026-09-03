@@ -136,37 +136,38 @@ impl Tcb {
     pub unsafe fn init(tcb: *mut Tcb, canary: usize) {
         // SAFETY: caller guarantees `tcb` is valid and unaliased.
         unsafe {
-            tcb.write(Tcb {
-                self_ptr: tcb,
-                dtv: 0,
-                self_ptr2: tcb,
-                multiple_threads: 0,
-                sysinfo: 0,
-                stack_guard: canary,
-                pointer_guard: 0,
-                errno: 0,
-                strerror_buf: [0; 32],
-                strtok_save: core::ptr::null_mut(),
-                tm: crate::time::Tm::default(),
-                asctime_buf: [0; 26],
-                path_buf: [0; 256],
-                heap: crate::malloc::Heap::new(),
-                tid: AtomicU32::new(0),
-                map_base: core::ptr::null_mut(),
-                map_len: 0,
-                map_guard: 0,
-                state: AtomicU32::new(STATE_JOINABLE),
-                start: None,
-                arg: core::ptr::null_mut(),
-                result: core::ptr::null_mut(),
-                cleanup: core::ptr::null_mut(),
-                keys: [core::ptr::null_mut(); KEYS_MAX],
-                key_seq: [0; KEYS_MAX],
-                thread_dtors: core::ptr::null_mut(),
-                cancel_disabled: AtomicU8::new(0),
-                cancel_async: AtomicU8::new(0),
-                cancel_pending: AtomicU8::new(0),
-            });
+            // Field by field: the heap holds large cache tables that are
+            // deliberately left uninitialised (see `Heap::init`), and a
+            // whole-struct write would copy them.
+            core::ptr::addr_of_mut!((*tcb).self_ptr).write(tcb);
+            core::ptr::addr_of_mut!((*tcb).dtv).write(0);
+            core::ptr::addr_of_mut!((*tcb).self_ptr2).write(tcb);
+            core::ptr::addr_of_mut!((*tcb).multiple_threads).write(0);
+            core::ptr::addr_of_mut!((*tcb).sysinfo).write(0);
+            core::ptr::addr_of_mut!((*tcb).stack_guard).write(canary);
+            core::ptr::addr_of_mut!((*tcb).pointer_guard).write(0);
+            core::ptr::addr_of_mut!((*tcb).errno).write(0);
+            core::ptr::addr_of_mut!((*tcb).strerror_buf).write([0; 32]);
+            core::ptr::addr_of_mut!((*tcb).strtok_save).write(core::ptr::null_mut());
+            core::ptr::addr_of_mut!((*tcb).tm).write(crate::time::Tm::default());
+            core::ptr::addr_of_mut!((*tcb).asctime_buf).write([0; 26]);
+            core::ptr::addr_of_mut!((*tcb).path_buf).write([0; 256]);
+            crate::malloc::Heap::init(core::ptr::addr_of_mut!((*tcb).heap));
+            core::ptr::addr_of_mut!((*tcb).tid).write(AtomicU32::new(0));
+            core::ptr::addr_of_mut!((*tcb).map_base).write(core::ptr::null_mut());
+            core::ptr::addr_of_mut!((*tcb).map_len).write(0);
+            core::ptr::addr_of_mut!((*tcb).map_guard).write(0);
+            core::ptr::addr_of_mut!((*tcb).state).write(AtomicU32::new(STATE_JOINABLE));
+            core::ptr::addr_of_mut!((*tcb).start).write(None);
+            core::ptr::addr_of_mut!((*tcb).arg).write(core::ptr::null_mut());
+            core::ptr::addr_of_mut!((*tcb).result).write(core::ptr::null_mut());
+            core::ptr::addr_of_mut!((*tcb).cleanup).write(core::ptr::null_mut());
+            core::ptr::addr_of_mut!((*tcb).keys).write([core::ptr::null_mut(); KEYS_MAX]);
+            core::ptr::addr_of_mut!((*tcb).key_seq).write([0; KEYS_MAX]);
+            core::ptr::addr_of_mut!((*tcb).thread_dtors).write(core::ptr::null_mut());
+            core::ptr::addr_of_mut!((*tcb).cancel_disabled).write(AtomicU8::new(0));
+            core::ptr::addr_of_mut!((*tcb).cancel_async).write(AtomicU8::new(0));
+            core::ptr::addr_of_mut!((*tcb).cancel_pending).write(AtomicU8::new(0));
         }
     }
 }

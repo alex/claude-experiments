@@ -11,19 +11,24 @@
 //!   class, a list of spans that may have free blocks and a list of full
 //!   spans. `malloc` and `free` on blocks owned by the calling thread
 //!   touch no shared state and take no locks.
-//! * Blocks freed by another thread are pushed on the span's lock-free
-//!   `remote` stack and collected by the owner when it runs out of blocks.
+//! * A span keeps no free list: every block has a two-bit state (free,
+//!   cached, allocated) in the span's bitmap, so the allocator never
+//!   reads or writes freed blocks. A thread refills its per-class cache
+//!   by scanning the bitmap for free blocks and flushes it by clearing
+//!   states, touching metadata only.
+//! * Blocks freed by another thread are marked in the span's remote-free
+//!   bitmap (one atomic `or` per batch and word) and collected by the
+//!   owner when it looks for blocks.
 //! * When a thread exits its spans are orphaned; any thread can adopt
 //!   them later.
 //!
 //! # Hardening
 //!
-//! * Free blocks are linked through their first word, with the pointer
-//!   XOR-encoded using a per-process random key and the slot address.
-//!   Every pointer taken off a list is checked to be a block of the span.
-//! * Each span has an allocation bitmap, so freeing a block twice, freeing
-//!   an interior pointer or a pointer that was never allocated is detected
-//!   and aborts the process.
+//! * No allocator metadata is stored in user memory, so overflowing or
+//!   writing into a freed block cannot corrupt the allocator's state.
+//! * Each block's state is tracked in its span's bitmap, so freeing a
+//!   block twice (cached or not), freeing an interior pointer or a
+//!   pointer that was never allocated is detected and aborts the process.
 //! * Metadata of released spans is poisoned, so a stale `free` into them
 //!   is caught as well.
 //! * Size computations use checked arithmetic (`calloc`, `reallocarray`).
@@ -36,42 +41,8 @@ use crate::sync::Mutex;
 use classes::{CLASS_SIZE, MAX_SMALL, NUM_CLASSES, class_for, class_for_aligned};
 use core::ffi::{c_int, c_void};
 use core::ptr;
-use core::sync::atomic::{AtomicUsize, Ordering};
-use segment::{Owner, Span};
-
-/// Per-process key for free list pointer encoding.
-static KEY: AtomicUsize = AtomicUsize::new(0);
-
-/// Seeds the pointer encoding key. Called once at startup.
-pub fn init(random: [u8; 8]) {
-    KEY.store(usize::from_ne_bytes(random) | 1, Ordering::Relaxed);
-}
-
-#[inline(always)]
-fn key() -> usize {
-    let k = KEY.load(Ordering::Relaxed);
-    if k != 0 { k } else { 0x9e37_79b9_7f4a_7c15 }
-}
-
-/// Encodes a free list link stored at `slot`. Null encodes as 0 so an
-/// empty list needs no key.
-#[inline(always)]
-fn encode(next: *mut u8, slot: usize) -> usize {
-    if next.is_null() {
-        0
-    } else {
-        next as usize ^ key() ^ slot.rotate_left(17)
-    }
-}
-
-#[inline(always)]
-fn decode(value: usize, slot: usize) -> *mut u8 {
-    if value == 0 {
-        ptr::null_mut()
-    } else {
-        (value ^ key() ^ slot.rotate_left(17)) as *mut u8
-    }
-}
+use core::sync::atomic::Ordering;
+use segment::{Owner, STATE_ALLOCATED, STATE_CACHED, STATE_FREE, Span};
 
 /// Reports heap corruption and aborts (panics under test).
 #[cold]
@@ -113,34 +84,30 @@ const RETAIN_MAX: usize = 64 << 20;
 const RETAIN_DECAY_MS: u64 = 250;
 
 /// Most entries a per-class block cache holds.
-const CACHE_MAX: usize = 32;
+const CACHE_MAX: usize = 128;
 
-/// A cached block: the block itself and its allocation bit, so handing
-/// it out is a store to the bit and nothing else. Blocks are 16-byte
-/// aligned, so the bit's index within its bitmap byte rides in the low
-/// bits of the pointer.
+/// `calloc` of blocks up to this size takes a cached block and clears
+/// it; bigger ones look for a block whose pages are known to be zero.
+const CALLOC_CACHED_MAX: u32 = 512;
+
+/// A cached block: the block itself and its state byte, so handing it
+/// out is a store to the byte and nothing else.
 #[derive(Clone, Copy)]
 #[repr(C)]
 struct Entry {
-    /// `ptr | bit`.
-    tagged: usize,
-    /// The bitmap byte holding the block's allocation bit.
+    ptr: *mut u8,
+    /// The block's state byte in its span.
     byte: *mut u8,
 }
 
 impl Entry {
     #[inline(always)]
-    fn new(ptr: *mut u8, bitmap: *mut u64, idx: u32) -> Entry {
+    fn new(ptr: *mut u8, states: *mut u8, idx: u32) -> Entry {
         Entry {
-            tagged: ptr as usize | (idx as usize & 7),
-            // SAFETY: the bitmap has a byte for every block.
-            byte: unsafe { (bitmap as *mut u8).add(idx as usize / 8) },
+            ptr,
+            // SAFETY: the span has a state byte for every block.
+            byte: unsafe { states.add(idx as usize) },
         }
-    }
-
-    #[inline(always)]
-    fn ptr(self) -> *mut u8 {
-        (self.tagged & !0xf) as *mut u8
     }
 
     /// Marks the block allocated and returns it.
@@ -150,91 +117,73 @@ impl Entry {
     #[inline(always)]
     unsafe fn take(self) -> *mut u8 {
         // SAFETY: caller contract.
-        unsafe { *self.byte |= 1 << (self.tagged & 7) };
-        self.ptr()
-    }
-
-    /// The block's index in its span.
-    fn index(self, bitmap: *mut u64) -> u32 {
-        ((self.byte as usize - bitmap as usize) * 8 + (self.tagged & 7)) as u32
+        unsafe { *self.byte = STATE_ALLOCATED };
+        self.ptr
     }
 }
 
-/// Per-class cache of free blocks in front of the span machinery (the
+/// Per-class caches of free blocks in front of the span machinery (the
 /// idea of glibc's tcache and tcmalloc's per-thread caches), holding
-/// blocks the span already counts as taken but whose allocation bit is
-/// clear. `malloc` pops one and sets the bit; `free` clears the bit
-/// after the usual validation and pushes. Refills and flushes move
-/// several blocks at once, so the span's free list, bitmap and the
-/// segment lookup are touched once per batch rather than per call. The
-/// cache stores no metadata inside freed blocks, and a block freed twice
-/// is still caught by its allocation bit.
-#[repr(C)]
-struct Cache {
-    count: u8,
-    cap: u8,
-    /// Only `entries[..count]` are initialised (leaving the rest
-    /// uninitialised keeps thread start-up from clearing the whole
-    /// table).
-    entries: [core::mem::MaybeUninit<Entry>; CACHE_MAX],
-}
+/// blocks in the *cached* state. `malloc` pops one and marks it
+/// allocated; `free` marks it cached after the usual validation and
+/// pushes. Refills and flushes move several blocks at once, so the
+/// span's states and the segment lookup are touched once per batch
+/// rather than per call, and neither touches the blocks themselves. A
+/// block freed twice is caught by its state whether it is cached or on
+/// the span. The entry tables are the bulk of a [`Heap`] and are left
+/// uninitialised (only `counts` says what is valid), so thread start-up
+/// does not pay for them.
+type CacheEntries = [core::mem::MaybeUninit<Entry>; CACHE_MAX];
 
-impl Cache {
-    const EMPTY: Cache = Cache {
-        count: 0,
-        cap: 0,
-        entries: [core::mem::MaybeUninit::uninit(); CACHE_MAX],
-    };
-
-    #[inline(always)]
-    fn get(&self, i: usize) -> Entry {
-        // SAFETY: callers only read entries below `count`.
-        unsafe { self.entries[i].assume_init() }
-    }
-
-    #[inline(always)]
-    fn set(&mut self, i: usize, e: Entry) {
-        self.entries[i] = core::mem::MaybeUninit::new(e);
-    }
-}
-
-/// Cache capacity for a class: 32 blocks for the small classes, fewer
-/// as the blocks grow so that at most 64 KiB or so is cached per class
+/// Cache capacity per class: 128 blocks for the small classes, fewer as
+/// the blocks grow so that at most 128 KiB or so is cached per class
 /// (one block for the big classes: enough for a free/malloc pair to
 /// hit, without pinning megabytes per thread).
-fn cache_cap(class: usize) -> u8 {
-    ((64 * 1024) / CLASS_SIZE[class] as usize).clamp(1, CACHE_MAX) as u8
-}
+const CACHE_CAP: [u8; NUM_CLASSES] = {
+    let mut caps = [0u8; NUM_CLASSES];
+    let mut c = 0;
+    while c < NUM_CLASSES {
+        let cap = (128 * 1024) / CLASS_SIZE[c] as usize;
+        caps[c] = if cap < 1 {
+            1
+        } else if cap > CACHE_MAX {
+            CACHE_MAX as u8
+        } else {
+            cap as u8
+        };
+        c += 1;
+    }
+    caps
+};
 
-/// The span whose bitmap `word` belongs to (the word lies in the span's
+/// The span whose state array `word` belongs to (it lies in the span's
 /// first unit, and unit 0's header maps every unit to its span).
 ///
 /// # Safety
-/// `word` must be a bitmap word of a live span.
+/// `word` must point into the state array of a live span.
 unsafe fn span_of_word(word: *mut u64) -> *mut Span {
     // SAFETY: caller contract.
     unsafe { segment::span_containing(word as *const u8) }
 }
 
-/// Frees of other threads' blocks waiting to be pushed on their spans'
-/// remote stacks in batches (one CAS per span per batch instead of one
-/// per block, the biggest cost of producer/consumer hand-offs).
+/// Frees of other threads' blocks waiting to be marked in their spans'
+/// remote bitmaps in batches (one atomic `or` per bitmap word per batch
+/// instead of one per block, the biggest cost of producer/consumer
+/// hand-offs).
 const REMOTE_BUF: usize = 64;
 
 #[derive(Clone, Copy)]
 #[repr(C)]
 struct RemoteEntry {
-    ptr: *mut u8,
     span: *mut Span,
+    idx: u32,
 }
 
 /// A thread's allocator state.
 #[repr(C)]
 pub struct Heap {
-    /// The block caches (see [`Cache`]).
-    cache: [Cache; NUM_CLASSES],
-    /// Pending remote frees (see [`REMOTE_BUF`]).
-    remote: [core::mem::MaybeUninit<RemoteEntry>; REMOTE_BUF],
+    /// Valid entries in each class's cache.
+    counts: [u8; NUM_CLASSES],
     remote_count: u8,
     /// Spans that have (or may have, pending remote frees) free blocks.
     avail: [*mut Span; NUM_CLASSES],
@@ -249,33 +198,48 @@ pub struct Heap {
     retained: usize,
     /// Cache refills and flushes, for the periodic reserve decay check.
     refills: u32,
+    /// Pending remote frees (see [`REMOTE_BUF`]).
+    remote: [core::mem::MaybeUninit<RemoteEntry>; REMOTE_BUF],
+    /// The block caches (see [`CacheEntries`]); last, and never
+    /// initialised as a whole.
+    cache: [CacheEntries; NUM_CLASSES],
 }
 
 impl Heap {
-    /// An empty heap.
-    pub const fn new() -> Self {
-        Heap {
-            cache: [Cache::EMPTY; NUM_CLASSES],
-            remote: [core::mem::MaybeUninit::uninit(); REMOTE_BUF],
-            remote_count: 0,
-            avail: [ptr::null_mut(); NUM_CLASSES],
-            full: [ptr::null_mut(); NUM_CLASSES],
-            empty: [ptr::null_mut(); TIERS],
-            empty_tail: [ptr::null_mut(); TIERS],
-            retained: 0,
-            refills: 0,
+    /// Initialises the heap at `this` (the caches' entry tables are left
+    /// as they are).
+    ///
+    /// # Safety
+    /// `this` must be valid for writes and not in use.
+    pub unsafe fn init(this: *mut Heap) {
+        // SAFETY: caller contract; field by field so the entry tables
+        // are not written.
+        unsafe {
+            ptr::addr_of_mut!((*this).counts).write([0; NUM_CLASSES]);
+            ptr::addr_of_mut!((*this).remote_count).write(0);
+            ptr::addr_of_mut!((*this).avail).write([ptr::null_mut(); NUM_CLASSES]);
+            ptr::addr_of_mut!((*this).full).write([ptr::null_mut(); NUM_CLASSES]);
+            ptr::addr_of_mut!((*this).empty).write([ptr::null_mut(); TIERS]);
+            ptr::addr_of_mut!((*this).empty_tail).write([ptr::null_mut(); TIERS]);
+            ptr::addr_of_mut!((*this).retained).write(0);
+            ptr::addr_of_mut!((*this).refills).write(0);
+        }
+    }
+
+    /// The entry table of `class`'s cache.
+    #[inline(always)]
+    fn entries(this: *mut Heap, class: usize) -> *mut core::mem::MaybeUninit<Entry> {
+        // SAFETY: in bounds of the heap.
+        unsafe {
+            ptr::addr_of_mut!((*this).cache)
+                .cast::<core::mem::MaybeUninit<Entry>>()
+                .add(class * CACHE_MAX)
         }
     }
 
     #[inline(always)]
     fn id(&self) -> usize {
         self as *const Heap as usize
-    }
-}
-
-impl Default for Heap {
-    fn default() -> Self {
-        Self::new()
     }
 }
 
@@ -329,9 +293,75 @@ unsafe fn list_remove(head: *mut *mut Span, span: *mut Span) {
 // ---------------------------------------------------------------------
 // Span operations (owner only).
 
-/// Takes a block from `span` like [`span_pop`], also saying whether the
-/// block is known to be zero-filled (never used since its pages were
-/// last cleared).
+/// Bit 0 of every byte of a word of states.
+const LOW_BITS: u64 = 0x0101_0101_0101_0101;
+
+/// The free blocks of a word of eight states, as a mask of their bytes'
+/// low bits (states only use the low two bits of a byte).
+#[inline(always)]
+fn free_blocks(word: u64) -> u64 {
+    !(word | (word >> 1)) & LOW_BITS
+}
+
+/// Moves up to `want - got` free blocks of `span` into the cache table
+/// `entries` (from slot `got` on) as cached blocks, lowest addresses
+/// first, and returns the new count. Touches only the states.
+///
+/// # Safety
+/// The calling thread must own `span`; `entries` must be its cache
+/// table for the span's class.
+unsafe fn span_take_cached(
+    span: *mut Span,
+    entries: *mut core::mem::MaybeUninit<Entry>,
+    mut got: usize,
+    want: usize,
+) -> usize {
+    // SAFETY: caller contract.
+    unsafe {
+        let s = &mut *span;
+        let words = s.words as usize;
+        let mut w = s.hint as usize;
+        while got < want && w < words {
+            let wp = (s.states as *mut u64).add(w);
+            let mut word = *wp;
+            let mut free = free_blocks(word);
+            if free == 0 {
+                w += 1;
+                continue;
+            }
+            let mut taken = 0;
+            while free != 0 && got < want {
+                let low = free.trailing_zeros();
+                free &= free - 1;
+                word |= (STATE_CACHED as u64) << low;
+                let idx = (w * 8) as u32 + low / 8;
+                entries
+                    .add(got)
+                    .write(core::mem::MaybeUninit::new(Entry::new(
+                        s.data.add(idx as usize * s.block_size as usize),
+                        s.states,
+                        idx,
+                    )));
+                got += 1;
+                taken += 1;
+                if idx >= s.bump {
+                    s.bump = idx + 1;
+                }
+            }
+            *wp = word;
+            s.used += taken;
+            if free == 0 {
+                w += 1;
+            }
+        }
+        s.hint = w as u32;
+        got
+    }
+}
+
+/// Takes one block of `span` straight into the allocated state, also
+/// saying whether it is known to be zero-filled (never handed out since
+/// the span's pages were fresh). Null if the span has none.
 ///
 /// # Safety
 /// The calling thread must own `span`.
@@ -340,119 +370,52 @@ unsafe fn span_pop_zeroed(span: *mut Span) -> (*mut u8, bool) {
     // SAFETY: caller contract.
     unsafe {
         let s = &mut *span;
-        if s.free == 0 && s.bump < s.capacity {
-            let zero = s.bump < s.zeroed;
-            (span_pop(span), zero)
-        } else {
-            (span_pop(span), false)
+        let words = s.words as usize;
+        let mut w = s.hint as usize;
+        while w < words {
+            let wp = (s.states as *mut u64).add(w);
+            let word = *wp;
+            let free = free_blocks(word);
+            if free == 0 {
+                w += 1;
+                continue;
+            }
+            let low = free.trailing_zeros();
+            *wp = word | ((STATE_ALLOCATED as u64) << low);
+            s.hint = w as u32;
+            s.used += 1;
+            let idx = (w * 8) as u32 + low / 8;
+            let zero = s.fresh && idx >= s.bump;
+            if idx >= s.bump {
+                s.bump = idx + 1;
+            }
+            return (s.data.add(idx as usize * s.block_size as usize), zero);
+        }
+        s.hint = w as u32;
+        (ptr::null_mut(), false)
+    }
+}
+
+/// Marks block `idx` of `span` free (from cached or allocated).
+///
+/// # Safety
+/// The calling thread must own `span`; `idx` must be a block that is
+/// not free.
+#[inline]
+unsafe fn span_free_block(span: *mut Span, idx: u32) {
+    // SAFETY: caller contract.
+    unsafe {
+        let s = &mut *span;
+        s.set_state(idx, STATE_FREE);
+        s.used -= 1;
+        let w = idx / 8;
+        if w < s.hint {
+            s.hint = w;
         }
     }
 }
 
-/// Takes a block from `span`, or returns null if it has none.
-///
-/// # Safety
-/// The calling thread must own `span`.
-#[inline]
-unsafe fn span_pop(span: *mut Span) -> *mut u8 {
-    // SAFETY: caller contract.
-    unsafe {
-        let s = &mut *span;
-        let p = if s.free != 0 {
-            let p = decode(s.free, ptr::addr_of!(s.free) as usize);
-            let Some(idx) = s.block_index(p) else {
-                corrupt("free list pointer")
-            };
-            if s.is_allocated(idx) {
-                corrupt("free list block is allocated");
-            }
-            let next = decode(*(p as *const usize), p as usize);
-            s.free = encode(next, ptr::addr_of!(s.free) as usize);
-            s.mark_allocated(idx);
-            p
-        } else if s.bump < s.capacity {
-            let p = s.data.add(s.bump as usize * s.block_size as usize);
-            s.mark_allocated(s.bump);
-            s.bump += 1;
-            p
-        } else {
-            return ptr::null_mut();
-        };
-        s.used += 1;
-        p
-    }
-}
-
-/// Takes a block from `span` for the cache: like [`span_pop`] but leaves
-/// the allocation bit clear (a cached block is counted in `used` and has
-/// its bit clear).
-///
-/// # Safety
-/// The calling thread must own `span`.
-#[inline]
-unsafe fn span_pop_cached(span: *mut Span) -> Option<Entry> {
-    // SAFETY: caller contract.
-    unsafe {
-        let s = &mut *span;
-        let (p, idx) = if s.free != 0 {
-            let p = decode(s.free, ptr::addr_of!(s.free) as usize);
-            let Some(idx) = s.block_index(p) else {
-                corrupt("free list pointer")
-            };
-            if s.is_allocated(idx) {
-                corrupt("free list block is allocated");
-            }
-            let next = decode(*(p as *const usize), p as usize);
-            s.free = encode(next, ptr::addr_of!(s.free) as usize);
-            (p, idx)
-        } else if s.bump < s.capacity {
-            let idx = s.bump;
-            s.bump += 1;
-            (s.data.add(idx as usize * s.block_size as usize), idx)
-        } else {
-            return None;
-        };
-        s.used += 1;
-        Some(Entry::new(p, s.bitmap, idx))
-    }
-}
-
-/// Puts block `idx` (at `p`) back on `span`'s local free list.
-///
-/// # Safety
-/// The calling thread must own `span`; `p` must be an allocated block.
-#[inline]
-unsafe fn span_push(span: *mut Span, p: *mut u8, idx: u32) {
-    // SAFETY: caller contract.
-    unsafe {
-        let s = &mut *span;
-        s.mark_free(idx);
-        let head = decode(s.free, ptr::addr_of!(s.free) as usize);
-        *(p as *mut usize) = encode(head, p as usize);
-        s.free = encode(p, ptr::addr_of!(s.free) as usize);
-        s.used -= 1;
-    }
-}
-
-/// Like [`span_push`] for a block whose allocation bit is already clear
-/// (it came from the cache).
-///
-/// # Safety
-/// As for [`span_push`].
-#[inline]
-unsafe fn span_push_cached(span: *mut Span, p: *mut u8, idx: u32) {
-    // SAFETY: caller contract.
-    unsafe {
-        let s = &mut *span;
-        debug_assert!(!s.is_allocated(idx));
-        let head = decode(s.free, ptr::addr_of!(s.free) as usize);
-        *(p as *mut usize) = encode(head, p as usize);
-        s.free = encode(p, ptr::addr_of!(s.free) as usize);
-        s.used -= 1;
-    }
-}
-
-/// Moves blocks freed by other threads onto the local free list.
+/// Frees the blocks other threads have marked in the remote bitmap.
 /// Returns true if any were collected.
 ///
 /// # Safety
@@ -460,20 +423,27 @@ unsafe fn span_push_cached(span: *mut Span, p: *mut u8, idx: u32) {
 unsafe fn span_collect_remote(span: *mut Span) -> bool {
     // SAFETY: caller contract.
     unsafe {
-        let mut p = (*span).remote.swap(0, Ordering::Acquire) as *mut u8;
-        if p.is_null() {
+        let s = &mut *span;
+        let mut groups = s.remote_summary.swap(0, Ordering::Acquire);
+        if groups == 0 {
             return false;
         }
-        while !p.is_null() {
-            let Some(idx) = (*span).block_index(p) else {
-                corrupt("remote free pointer")
-            };
-            if !(*span).is_allocated(idx) {
-                corrupt("double free (remote)");
+        let wpg = s.wpg as usize;
+        let remote_words = (s.capacity as usize).div_ceil(64);
+        while groups != 0 {
+            let g = groups.trailing_zeros() as usize;
+            groups &= groups - 1;
+            for w in g * wpg..((g + 1) * wpg).min(remote_words) {
+                let mut bits = (*s.remote_bits.add(w)).swap(0, Ordering::Acquire);
+                while bits != 0 {
+                    let idx = (w * 64) as u32 + bits.trailing_zeros();
+                    bits &= bits - 1;
+                    if idx >= s.capacity || s.state(idx) != STATE_ALLOCATED {
+                        corrupt("double free (remote)");
+                    }
+                    span_free_block(span, idx);
+                }
             }
-            let next = decode(*(p as *const usize), p as usize);
-            span_push(span, p, idx);
-            p = next;
         }
         true
     }
@@ -484,7 +454,7 @@ unsafe fn span_collect_remote(span: *mut Span) -> bool {
 #[inline(always)]
 unsafe fn span_has_free(span: *const Span) -> bool {
     // SAFETY: caller contract.
-    unsafe { (*span).free != 0 || (*span).bump < (*span).capacity }
+    unsafe { (*span).used < (*span).capacity }
 }
 
 // ---------------------------------------------------------------------
@@ -541,7 +511,7 @@ pub unsafe fn abandon(heap: *mut Heap) {
     unsafe {
         flush_remote(heap);
         for class in 0..NUM_CLASSES {
-            let n = (*heap).cache[class].count as usize;
+            let n = (*heap).counts[class] as usize;
             if n != 0 {
                 flush_cache(heap, class, n);
             }
@@ -757,11 +727,8 @@ unsafe fn maybe_decay(heap: *mut Heap) {
 unsafe fn alloc_slow(heap: *mut Heap, class: usize) -> *mut u8 {
     // SAFETY: the heap belongs to the calling thread.
     unsafe {
-        let cache = ptr::addr_of_mut!((*heap).cache[class]);
-        if (*cache).cap == 0 {
-            (*cache).cap = cache_cap(class);
-        }
-        let want = ((*cache).cap / 2).max(1) as usize;
+        let entries = Heap::entries(heap, class);
+        let want = (CACHE_CAP[class] / 2).max(1) as usize;
         // The reserve normally decays when it is touched; a thread that
         // stops needing spans altogether (its working set shrank and
         // settled) would otherwise hold its reserve forever, so check it
@@ -773,22 +740,15 @@ unsafe fn alloc_slow(heap: *mut Heap, class: usize) -> *mut u8 {
             if span.is_null() {
                 break;
             }
-            while got < want {
-                match span_pop_cached(span) {
-                    Some(e) => {
-                        (*cache).set(got, e);
-                        got += 1;
-                    }
-                    None => break,
-                }
-            }
+            got = span_take_cached(span, entries, got, want);
         }
         if got == 0 {
+            Errno::ENOMEM.set();
             return ptr::null_mut();
         }
         got -= 1;
-        (*cache).count = got as u8;
-        (*cache).get(got).take()
+        (*heap).counts[class] = got as u8;
+        (*entries.add(got)).assume_init().take()
     }
 }
 
@@ -873,18 +833,17 @@ pub fn alloc(size: usize) -> *mut u8 {
     let heap = current_heap();
     // SAFETY: the heap belongs to the calling thread.
     unsafe {
-        let cache = ptr::addr_of_mut!((*heap).cache[class]);
-        let n = (*cache).count;
+        debug_assert!(class < NUM_CLASSES);
+        let count = ptr::addr_of_mut!((*heap).counts).cast::<u8>().add(class);
+        let n = *count;
         if n != 0 {
             let n = n - 1;
-            (*cache).count = n;
-            return (*cache).get(n as usize).take();
+            *count = n;
+            return (*Heap::entries(heap, class).add(n as usize))
+                .assume_init()
+                .take();
         }
-        let p = alloc_slow(heap, class);
-        if p.is_null() {
-            Errno::ENOMEM.set();
-        }
-        p
+        alloc_slow(heap, class)
     }
 }
 
@@ -951,6 +910,23 @@ pub fn alloc_zeroed(size: usize) -> *mut u8 {
         };
     }
     let class = class_for(size);
+    // Clearing a small block costs less than bypassing the cache to
+    // find one that is known to be zero.
+    if CLASS_SIZE[class] <= CALLOC_CACHED_MAX {
+        let p = alloc(size);
+        if !p.is_null() {
+            // Clear the whole (16-byte aligned) block with a handful of
+            // wide stores rather than a call to `memset`.
+            // SAFETY: the block holds `CLASS_SIZE[class]` bytes.
+            unsafe {
+                let words = CLASS_SIZE[class] as usize / 16;
+                for i in 0..words {
+                    (p as *mut u128).add(i).write(0);
+                }
+            }
+        }
+        return p;
+    }
     let heap = current_heap();
     // SAFETY: the heap belongs to the calling thread.
     unsafe {
@@ -986,6 +962,10 @@ fn finish(p: Option<*mut u8>) -> *mut u8 {
 
 /// Frees a block.
 ///
+/// Only the common case (a block of a span this thread owns, with room
+/// in the cache) is handled here; everything else is a tail call into a
+/// cold function, so this path needs no stack frame or saved registers.
+///
 /// # Safety
 /// `p` must have come from this allocator and not be freed already.
 pub unsafe fn dealloc(p: *mut u8) {
@@ -995,69 +975,114 @@ pub unsafe fn dealloc(p: *mut u8) {
     // SAFETY: caller contract.
     unsafe {
         match segment::lookup(p) {
-            Owner::Huge(h) => {
-                if segment::huge_data(h) != p {
-                    corrupt("free of interior pointer of a large block");
-                }
-                segment::free_huge(h);
-            }
+            Owner::Huge(h) => dealloc_huge(h, p),
             Owner::Span(span) => {
                 let Some(idx) = (*span).block_index(p) else {
                     corrupt("free of invalid pointer")
                 };
-                if (*span).class == segment::LARGE_CLASS {
-                    segment::free_large(span, p);
-                    return;
+                let class = (*span).class as usize;
+                if class == segment::LARGE_CLASS as usize {
+                    return segment::free_large(span, p);
                 }
                 let heap = current_heap();
-                if (*span).owner.load(Ordering::Acquire) == (*heap).id() {
-                    if !(*span).is_allocated(idx) {
-                        corrupt("double free");
-                    }
-                    (*span).mark_free(idx);
-                    // Into the cache; flush half of it to the spans when
-                    // it is full.
-                    let class = (*span).class as usize;
-                    let cache = ptr::addr_of_mut!((*heap).cache[class]);
-                    if (*cache).cap == 0 {
-                        (*cache).cap = cache_cap(class);
-                    }
-                    if (*cache).count >= (*cache).cap {
-                        flush_cache(heap, class, ((*cache).cap / 2).max(1) as usize);
-                    }
-                    let n = (*cache).count as usize;
-                    (*cache).set(n, Entry::new(p, (*span).bitmap, idx));
-                    (*cache).count = (n + 1) as u8;
-                } else {
-                    // Not ours: batch it for the owner.
-                    let n = (*heap).remote_count as usize;
-                    if n == REMOTE_BUF {
-                        flush_remote(heap);
-                        (*heap).remote[0] =
-                            core::mem::MaybeUninit::new(RemoteEntry { ptr: p, span });
-                        (*heap).remote_count = 1;
-                    } else {
-                        (*heap).remote[n] =
-                            core::mem::MaybeUninit::new(RemoteEntry { ptr: p, span });
-                        (*heap).remote_count = (n + 1) as u8;
-                    }
+                if (*span).owner.load(Ordering::Acquire) != (*heap).id() {
+                    return dealloc_remote(heap, span, idx);
                 }
+                let byte = (*span).state_byte(idx);
+                if byte.load(Ordering::Relaxed) != STATE_ALLOCATED {
+                    corrupt("double free");
+                }
+                byte.store(STATE_CACHED, Ordering::Relaxed);
+                // Into the cache; flush half of it to the spans when it
+                // is full.
+                debug_assert!(class < NUM_CLASSES);
+                let count = ptr::addr_of_mut!((*heap).counts).cast::<u8>().add(class);
+                let n = *count as usize;
+                if n >= *CACHE_CAP.get_unchecked(class) as usize {
+                    return dealloc_full(heap, class, p, byte.as_ptr());
+                }
+                Heap::entries(heap, class)
+                    .add(n)
+                    .write(core::mem::MaybeUninit::new(Entry {
+                        ptr: p,
+                        byte: byte.as_ptr(),
+                    }));
+                *count = (n + 1) as u8;
             }
             Owner::Invalid => corrupt("free of pointer not from malloc"),
         }
     }
 }
 
-/// Returns `p` (block `idx` of `span`, owned by `heap`, its allocation
-/// bit already clear) to the span's free list and keeps the heap's span
-/// lists in order.
+/// `free` of a huge block.
 ///
 /// # Safety
-/// As stated; the block must not be in the cache.
-unsafe fn free_to_span(heap: *mut Heap, span: *mut Span, p: *mut u8, idx: u32) {
+/// `h` must be a live huge header.
+#[cold]
+#[inline(never)]
+unsafe fn dealloc_huge(h: *mut segment::Header, p: *mut u8) {
     // SAFETY: caller contract.
     unsafe {
-        span_push_cached(span, p, idx);
+        if segment::huge_data(h) != p {
+            corrupt("free of interior pointer of a large block");
+        }
+        segment::free_huge(h);
+    }
+}
+
+/// `free` into a full cache: flushes half of it first.
+///
+/// # Safety
+/// As for `dealloc`; the block's state is already cached.
+#[cold]
+#[inline(never)]
+unsafe fn dealloc_full(heap: *mut Heap, class: usize, p: *mut u8, byte: *mut u8) {
+    // SAFETY: caller contract.
+    unsafe {
+        flush_cache(heap, class, (CACHE_CAP[class] as usize / 2).max(1));
+        let n = (*heap).counts[class] as usize;
+        Heap::entries(heap, class)
+            .add(n)
+            .write(core::mem::MaybeUninit::new(Entry { ptr: p, byte }));
+        (*heap).counts[class] = (n + 1) as u8;
+    }
+}
+
+/// `free` of a block owned by another thread: batched for the owner.
+/// The state is the owner's to change, but a block that is not allocated
+/// is already a double free.
+///
+/// # Safety
+/// `span` must be a live span and `idx` one of its blocks.
+#[cold]
+#[inline(never)]
+unsafe fn dealloc_remote(heap: *mut Heap, span: *mut Span, idx: u32) {
+    // SAFETY: caller contract.
+    unsafe {
+        if (*span).state(idx) != STATE_ALLOCATED {
+            corrupt("double free (remote)");
+        }
+        let n = (*heap).remote_count as usize;
+        if n == REMOTE_BUF {
+            flush_remote(heap);
+            (*heap).remote[0] = core::mem::MaybeUninit::new(RemoteEntry { span, idx });
+            (*heap).remote_count = 1;
+        } else {
+            (*heap).remote[n] = core::mem::MaybeUninit::new(RemoteEntry { span, idx });
+            (*heap).remote_count = (n + 1) as u8;
+        }
+    }
+}
+
+/// Marks block `idx` of `span` (owned by `heap`, cached) free and keeps
+/// the heap's span lists in order.
+///
+/// # Safety
+/// As stated; the block must no longer be in the cache.
+unsafe fn free_to_span(heap: *mut Heap, span: *mut Span, idx: u32) {
+    // SAFETY: caller contract.
+    unsafe {
+        span_free_block(span, idx);
         let class = (*span).class as usize;
         if (*span).is_full {
             list_remove(ptr::addr_of_mut!((*heap).full[class]), span);
@@ -1081,43 +1106,55 @@ unsafe fn free_to_span(heap: *mut Heap, span: *mut Span, p: *mut u8, idx: u32) {
 /// # Safety
 /// The heap must belong to the calling thread.
 unsafe fn flush_remote(heap: *mut Heap) {
-    // SAFETY: caller contract; buffered entries are live blocks of
+    /// A (span, remote bitmap word) group of the batch.
+    #[derive(Clone, Copy)]
+    struct Group {
+        span: *mut Span,
+        word: u32,
+        bits: u64,
+    }
+    // SAFETY: caller contract; buffered entries name live blocks of
     // other threads' spans.
     unsafe {
         let n = (*heap).remote_count as usize;
-        let buf = (*heap).remote.as_mut_ptr() as *mut RemoteEntry;
+        let buf = (*heap).remote.as_ptr() as *const RemoteEntry;
+        // Group the batch by bitmap word in a small open-addressing table
+        // (one pass), then one atomic `or` per word and one per span's
+        // summary.
+        let mut groups = [Group {
+            span: ptr::null_mut(),
+            word: 0,
+            bits: 0,
+        }; REMOTE_BUF];
         for i in 0..n {
-            let first = *buf.add(i);
-            if first.span.is_null() {
-                continue;
-            }
-            // Chain every buffered block of this span: each links to the
-            // next one found, the last to whatever the stack holds.
-            let span = first.span;
-            let head = first.ptr;
-            let mut tail = first.ptr;
-            for j in i + 1..n {
-                let e = *buf.add(j);
-                if e.span == span {
-                    *(tail as *mut usize) = encode(e.ptr, tail as usize);
-                    tail = e.ptr;
-                    (*buf.add(j)).span = ptr::null_mut();
-                }
-            }
-            let remote = &(*span).remote;
-            let mut old = remote.load(Ordering::Relaxed);
+            let e = *buf.add(i);
+            let word = e.idx / 64;
+            let mut slot = ((e.span as usize >> 6) ^ word as usize) % REMOTE_BUF;
             loop {
-                *(tail as *mut usize) = encode(old as *mut u8, tail as usize);
-                match remote.compare_exchange_weak(
-                    old,
-                    head as usize,
-                    Ordering::Release,
-                    Ordering::Relaxed,
-                ) {
-                    Ok(_) => break,
-                    Err(h) => old = h,
+                let g = &mut groups[slot];
+                if g.span.is_null() {
+                    *g = Group {
+                        span: e.span,
+                        word,
+                        bits: 0,
+                    };
                 }
+                if g.span == e.span && g.word == word {
+                    g.bits |= 1 << (e.idx % 64);
+                    break;
+                }
+                slot = (slot + 1) % REMOTE_BUF;
             }
+        }
+        for g in groups.iter().filter(|g| !g.span.is_null()) {
+            let span = g.span;
+            let word = &*(*span).remote_bits.add(g.word as usize);
+            if word.fetch_or(g.bits, Ordering::AcqRel) & g.bits != 0 {
+                corrupt("double free (remote)");
+            }
+            (*span)
+                .remote_summary
+                .fetch_or(1 << (g.word / (*span).wpg as u32), Ordering::Release);
         }
         (*heap).remote_count = 0;
     }
@@ -1131,20 +1168,28 @@ unsafe fn flush_cache(heap: *mut Heap, class: usize, n: usize) {
     // SAFETY: caller contract; cached blocks belong to spans this heap
     // owns.
     unsafe {
-        let cache = ptr::addr_of_mut!((*heap).cache[class]);
-        let count = (*cache).count as usize;
+        let entries = Heap::entries(heap, class);
+        let count = (*heap).counts[class] as usize;
         let n = n.min(count);
         maybe_decay(heap);
+        // The entry's state byte says which span and block it is,
+        // without another lookup of the pointer; consecutive entries
+        // usually belong to the same span, so the lookup is skipped while
+        // the byte stays within the last span's state array.
+        let mut span: *mut Span = ptr::null_mut();
+        let (mut lo, mut hi) = (0usize, 0usize);
         for i in 0..n {
-            let e = (*cache).get(i);
-            // The entry's bitmap byte says which span and block it is,
-            // without another lookup of the pointer.
-            let span = span_of_word(e.byte as *mut u64);
-            let idx = e.index((*span).bitmap);
-            free_to_span(heap, span, e.ptr(), idx);
+            let e = (*entries.add(i)).assume_init();
+            let b = e.byte as usize;
+            if b < lo || b >= hi {
+                span = span_of_word(e.byte as *mut u64);
+                lo = (*span).states as usize;
+                hi = lo + (*span).capacity as usize;
+            }
+            free_to_span(heap, span, (b - lo) as u32);
         }
-        (*cache).entries.copy_within(n..count, 0);
-        (*cache).count = (count - n) as u8;
+        ptr::copy(entries.add(n), entries, count - n);
+        (*heap).counts[class] = (count - n) as u8;
     }
 }
 
@@ -1582,24 +1627,39 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "heap corruption")]
-    fn corrupted_free_list_is_detected() {
-        let _keep = alloc(64); // keeps the span from being recycled
+    #[should_panic(expected = "double free")]
+    fn double_free_of_cached_block_is_detected() {
         let p = alloc(64);
         let q = alloc(64);
-        // SAFETY: deliberately corrupting a free block.
+        // SAFETY: the second free of `p` is the bug under test.
         unsafe {
             dealloc(p);
             dealloc(q);
-            // Move both from the cache to the span's free list, where the
-            // links live inside the blocks; q is the list head.
-            let heap = current_heap();
-            let class = class_for(64);
-            let n = (*heap).cache[class].count as usize;
-            flush_cache(heap, class, n);
-            *(q as *mut usize) = 0x4141_4141_4141_4141;
-            let _ = alloc(64); // refills: pops q, then the smashed link
-            let _ = alloc(64);
+            // Both sit in the cache now (states: cached).
+            dealloc(p);
         }
+    }
+
+    #[test]
+    fn freed_block_contents_are_not_trusted() {
+        // Nothing the program writes into a freed block can affect the
+        // allocator: there is no metadata in user memory to corrupt.
+        let _keep = alloc(64);
+        let blocks: Vec<*mut u8> = (0..200).map(|_| alloc(64)).collect();
+        for &p in &blocks {
+            // SAFETY: live block, then deliberately scribbled after free.
+            unsafe {
+                dealloc(p);
+                ptr::write_bytes(p, 0x41, 64);
+            }
+        }
+        let again: Vec<*mut u8> = (0..200).map(|_| alloc(64)).collect();
+        for &p in &again {
+            assert_eq!(p as usize % 16, 0);
+            // SAFETY: live block.
+            unsafe { dealloc(p) };
+        }
+        // SAFETY: live block.
+        unsafe { dealloc(_keep) };
     }
 }

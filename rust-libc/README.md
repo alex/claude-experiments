@@ -8,13 +8,17 @@ A Linux libc written from scratch in Rust.
   itself at startup.
 * **Performance conscious.** SIMD string routines with runtime CPU
   dispatch (SSE2 / AVX2 / AVX-512BW on x86_64, NEON on AArch64), a
-  size-class allocator with per-thread caches, buffered stdio, the vDSO
-  for the clock calls, and benchmark harnesses that compare every hot
-  path and several allocator workloads against the host glibc.
+  size-class allocator with per-thread caches and no free lists (block
+  states live in a table, so refills, flushes and cross-thread frees
+  never touch the blocks), buffered stdio, the vDSO for the clock calls,
+  and benchmark harnesses that compare every hot path against the host
+  glibc and thirty allocator workloads against glibc, mimalloc, jemalloc
+  and tcmalloc.
 * **Security conscious.** Stack protector support out of the box, no
-  in-band allocator metadata next to user data, encoded free-list links,
-  an allocation bitmap and a registry of live mappings that turn double,
-  invalid and foreign frees into aborts, no `%n`, every length
+  allocator metadata in user memory at all (an overflow or a write into
+  a freed block cannot corrupt the allocator), per-block state tracking
+  and a registry of live mappings that turn double, invalid and foreign
+  frees into aborts, no `%n`, every length
   computation is checked, linear worst cases for `memmem`/`strstr` and
   `qsort`, DNS replies validated field by field. The code base has been
   through a systematic security review (see `docs/DESIGN.md`).
@@ -49,7 +53,9 @@ docs/DESIGN.md   design notes
 cargo xtask build        # builds target/sysroot/{include,lib/libc.a}
 cargo xtask test         # builds, then compiles and runs tests/c/*.c
 cargo xtask bench        # builds bench/bench.c against rustlibc and glibc
-cargo xtask bench alloc  # the allocator workloads in bench/alloc.c
+cargo xtask bench alloc  # the allocator workloads in bench/alloc.c, against
+                         # glibc, mimalloc, jemalloc and tcmalloc if installed
+cargo xtask bench alloc:tree   # only the workloads whose name contains "tree"
 cargo test -p rustlibc   # host unit tests of the pure Rust code
 cargo xtask --aarch64 test   # cross-build with aarch64-linux-gnu-gcc and
                              # run the suite under qemu-aarch64
@@ -132,38 +138,62 @@ after the current round of work:
 | strlen 64 B / 64 KiB | 30 / 137 GB/s | 25 / 97 GB/s | 1.19x / 1.42x |
 | strcmp 4 KiB / 64 KiB | 80 / 71 GB/s | 81 / 47 GB/s | 0.98x / 1.51x |
 | memmem 64 KiB | 32 GB/s | 9.5 GB/s | 3.35x |
-| malloc+free 64 B / 4 KiB / 1 MiB | 13.4 / 15.6 / 16.0 ns | 8.4 / 21.5 / 23.6 ns | 0.63x / 1.38x / 1.48x |
+| malloc+free 64 B / 4 KiB / 1 MiB | 13.6 / 15.7 / 15.8 ns | 14.0 / 33.7 / 36.0 ns | 1.03x / 2.15x / 2.28x |
 | snprintf `%d %s %x` / `%f` / `%e` | 92 / 197 / 208 ns | 93 / 267 / 216 ns | 1.01x / 1.36x / 1.04x |
 | snprintf `%g` | 189–232 ns | 143 ns | 0.62–0.76x |
 | strtod / sscanf `%d %d` | 42 / 81 ns | 83 / 107 ns | 1.98x / 1.33x |
 | qsort 100k ints | 129 ns/elem | 107 ns/elem | 0.83x |
-| pthread_create+join | 53 µs | 74 µs | 1.40x |
+| pthread_create+join | 57 µs | 61 µs | 1.05x |
 
 The remaining gaps are the sub-64-byte compare and search calls (glibc's
-hand-written assembly saves about 2 ns per call), `%g` (bounded by
-`core::fmt`'s digit generation) and the tiny-block `malloc` fast path
-(glibc's tcache does no integrity checks; ours validates the free-list
-link and the allocation bitmap on every operation).
+hand-written assembly saves about 2 ns per call) and `%g` (bounded by
+`core::fmt`'s digit generation).
 
-`cargo xtask bench alloc` runs allocator workloads modelled on real
-programs (`bench/alloc.c`). The single-threaded ones are stable on the
-shared machine used here; the threaded ones vary by 2-3x between runs
-and are quoted as ranges:
+`cargo xtask bench alloc` runs thirty allocator workloads modelled on
+the mimalloc-bench suite and on real programs (`bench/alloc.c`) against
+glibc, mimalloc, jemalloc and tcmalloc (the last three dynamically
+linked, from the distribution packages). The table below is one run on
+the same machine (a virtual machine with four CPUs, so the threaded rows
+vary between runs by up to 2x); ns per operation, lower is better.
 
-| workload | rustlibc | glibc | ratio |
-|---|---|---|---|
-| live set of 4096 blocks, 16-256 B | 30 ns/op | 24 ns/op | 0.8x |
-| live set of 2048 blocks, 256 B-8 KiB | 64 ns/op | 160 ns/op | 2.5x |
-| live set of 64 blocks, 64 KiB-1 MiB | 1.5-1.7 µs/op | 1.3 µs/op | 0.8-0.9x |
-| realloc doubling 16 B to 1 MiB | 3.1 µs/op | 1.0 µs/op | 0.33x |
-| tree build/teardown, 200k nodes | 9-10 ns/op | 20 ns/op | 2.0-2.7x |
-| larson, 4 threads | 30-85 ns/op | 25-32 ns/op | 0.3-1.1x |
-| producer/consumer, 400k blocks | 1.4-4.2 µs/block | 1.0-1.7 µs/block | 0.25-1.15x |
-| resident memory after everything is freed | 14 MiB | 18 MiB | 1.3x |
+| workload | rustlibc | glibc | mimalloc | jemalloc | tcmalloc |
+|---|---|---|---|---|---|
+| malloc+free 16 B / 4 KiB / 1 MiB | 13.4 / 15.8 / 16.0 | 13.2 / 30.7 / 33.3 | 12.1 / 16.6 / 263 | 11.3 / 14.3 / 449 | 6.8 / 7.8 / 69 |
+| live set, 16-256 B | 35 | 41 | 24 | 26 | 25 |
+| live set, 256 B-8 KiB | 37 | 164 | 58 | 72 | 33 |
+| live set, 64 KiB-1 MiB | 235 | 591 | 418 | 848 | 411 |
+| cfrac (LIFO bursts) | 15 | 25 | 7.8 | 11 | 9.0 |
+| alloc-test, 100k live | 106 | 369 | 115 | 173 | 155 |
+| sh6bench | 19 | 31 | 16 | 171 | 28 |
+| glibc-simple | 20 | 30 | 9.8 | 16 | 11 |
+| malloc-large, 1-16 MiB touched | 1.0 µs | 118 µs | 1.4 µs | 208 µs | 8.1 µs |
+| calloc 64 B / 64 KiB | 21 / 3.5 µs | 25 / 2.7 µs | 9.8 / 2.5 µs | 26 / 4.7 µs | 12 / 2.6 µs |
+| memalign 64 / aligned_alloc 4 KiB | 22 / 30 | 116 / 112 | 20 / 79 | 36 / 211 | 10 / 17 |
+| realloc growth 16 B to 1 MiB | 3.0 µs | 3.3 µs | 3.2 µs | 0.17 µs | 1.9 µs |
+| realloc vectors x1.5 | 444 | 477 | 531 | 596 | 448 |
+| tree build/teardown, 200k nodes | 9.4 | 14 | 6.5 | 11 | 15 |
+| larson, 4 threads | 32 | 46 | 27 | 29 | 28 |
+| producer/consumer, 4 threads | 621 | 997 | 542 | 740 | 606 |
+| xmalloc-test, 4 threads (all frees remote) | 33 | 176 | 57 | 14 | 14 |
+| mstress, 4 threads | 29 | 149 | 40 | 70 | 33 |
+| thread churn (create, 64 mallocs, exit, join) | 39 µs | 37 µs | 40 µs | 167 µs | 39 µs |
 
-The realloc row is glibc extending the sole live chunk in place at the
-top of its heap, which a size-class allocator cannot do; blocks above
-1 MiB are resized with `mremap` instead of copied.
+rustlibc is faster than glibc on every row but two within noise, and
+faster than every other allocator on the large-block and multi-threaded
+rows. mimalloc keeps a lead of about 2x on the small-block burst
+workloads (cfrac, glibc-simple, tree): its `free` is two stores with no
+validation, ours checks the mapping registry, the segment header, the
+block index and the block's state on every call. jemalloc's realloc row
+extends the sole live buffer in place. `BENCH_RSS=1` makes the program
+report its resident memory at the end and again after two idle seconds
+and a little activity: rustlibc holds 1-2 MiB after the single-threaded
+workloads, against 35-240 MiB for the others.
+
+The one row where rustlibc trails glibc by more than noise is the
+condition-variable ping-pong of `producer/consumer` with the allocator
+taken out (`bench alloc:sync`): about 3x, a scheduler interaction of the
+mutex hand-off that survived a rewrite of the mutex (see
+`docs/DESIGN.md`).
 
 ## Dependencies
 

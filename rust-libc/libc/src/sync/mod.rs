@@ -14,7 +14,7 @@ const UNLOCKED: u32 = 0;
 const LOCKED: u32 = 1;
 
 /// Load-only spin iterations before a contended acquire sleeps.
-const SPIN: u32 = 200;
+const SPIN: u32 = 40;
 
 /// A small futex based mutex.
 ///

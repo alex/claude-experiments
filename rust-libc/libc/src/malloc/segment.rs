@@ -13,9 +13,11 @@
 //! * a **huge mapping** for a single allocation larger than
 //!   [`LARGE_MAX`], with only the small [`Header`] in its first page.
 //!
-//! Each span starts with an allocation bitmap (one bit per block) followed
-//! by the page-aligned block area (a large span keeps its single bit in
-//! its metadata). The bitmap makes double and invalid frees detectable.
+//! Each span starts with its block states (a byte per block) and its
+//! remote-free bitmap (a bit per block) followed by the page-aligned
+//! block area (a large span keeps its single block's state in its
+//! metadata). No allocator metadata ever lives inside a block, and the
+//! states make double and invalid frees detectable.
 //!
 //! Units freed back to the pool keep their pages: they are returned to
 //! the kernel only once the segment has been idle for a while, or when
@@ -104,46 +106,64 @@ pub struct Span {
     pub class: u8,
     /// Units in this span.
     pub units: u8,
-    _pad0: [u8; 2],
+    /// Remote bitmap words per bit of `remote_summary`.
+    pub wpg: u8,
+    _pad0: u8,
     /// Number of blocks in the block area.
     pub capacity: u32,
-    _pad1: [u8; 4],
-    /// Allocation bitmap, one bit per block.
-    pub bitmap: *mut u64,
+    /// 64-bit words of the state array (eight blocks each).
+    pub words: u32,
+    /// Block states, one byte per block (see [`STATE_FREE`] and
+    /// friends), written by the owner only.
+    pub states: *mut u8,
     /// Start of the page-aligned block area.
     pub data: *mut u8,
     /// The owning heap, or null when orphaned.
     pub owner: AtomicUsize,
-    _pad2: [u8; 24],
+    /// Remote-free bitmap: one bit per block, set by the threads that
+    /// free blocks they do not own, cleared by the owner.
+    pub remote_bits: *mut AtomicU64,
+    _pad2: [u8; 16],
     // --- owner-hot ---
     /// Blocks `[bump, capacity)` have never been handed out.
     pub bump: u32,
-    /// Blocks currently allocated, as seen by the owning heap (remote
-    /// frees are not subtracted until collected).
+    /// Blocks not free (cached or allocated), as seen by the owning heap
+    /// (remote frees are not subtracted until collected).
     pub used: u32,
-    /// Blocks `[0, zeroed)` of a never-used bump area are known to be
-    /// zero (fresh pages), so `calloc` need not clear them.
-    pub zeroed: u32,
+    /// No word of the state array below this one holds a free block.
+    pub hint: u32,
+    /// The pages were fresh (all zeros) when the span was set up, so
+    /// blocks past `bump` are still zero.
+    pub fresh: bool,
     /// True while the span is on its heap's `full` list.
     pub is_full: bool,
-    _pad3: [u8; 3],
-    /// Head of the local free list, encoded (see `Heap`).
-    pub free: usize,
+    _pad3: [u8; 2],
     /// Previous span in the owning heap's per-class list (or orphan list).
     pub prev: *mut Span,
     /// Next span in the owning heap's per-class list (or orphan list).
     pub next: *mut Span,
     /// When the span entered a heap's reserve (milliseconds).
     pub retained_at: u64,
-    /// The allocation bitmap of a large span (a single bit), so its
-    /// block area needs no bitmap page.
+    /// The state array of a large span (a single block, in the low
+    /// byte), so its block area needs no metadata page.
     inline_bits: u64,
-    _pad4: [u8; 8],
+    _pad4: [u8; 16],
     // --- written by other threads ---
-    /// Head of the lock-free list of blocks freed by other threads.
-    pub remote: AtomicUsize,
+    /// One bit per group of `wpg` remote bitmap words that may hold set
+    /// bits; the owner swaps it out to find what to collect.
+    pub remote_summary: AtomicU64,
     _pad5: [u8; 56],
 }
+
+/// Block states, one byte each in [`Span::states`]. A block is free,
+/// held in a thread's cache, or allocated (handed to the program). Only
+/// the low two bits are used, so a word with any free block is spotted
+/// by combining the two bits of every byte.
+pub const STATE_FREE: u8 = 0;
+/// Held in a thread's per-class cache.
+pub const STATE_CACHED: u8 = 1;
+/// Handed to the program.
+pub const STATE_ALLOCATED: u8 = 3;
 
 const _: () = assert!(core::mem::size_of::<Span>() == 192);
 
@@ -153,25 +173,27 @@ impl Span {
         block_size: 0,
         class: 0,
         units: 0,
-        _pad0: [0; 2],
+        wpg: 1,
+        _pad0: 0,
         capacity: 0,
-        _pad1: [0; 4],
-        bitmap: ptr::null_mut(),
+        words: 0,
+        states: ptr::null_mut(),
         data: ptr::null_mut(),
         owner: AtomicUsize::new(0),
-        _pad2: [0; 24],
+        remote_bits: ptr::null_mut(),
+        _pad2: [0; 16],
         bump: 0,
         used: 0,
-        zeroed: 0,
+        hint: 0,
+        fresh: false,
         is_full: false,
-        _pad3: [0; 3],
-        free: 0,
+        _pad3: [0; 2],
         prev: ptr::null_mut(),
         next: ptr::null_mut(),
         retained_at: 0,
         inline_bits: 0,
-        _pad4: [0; 8],
-        remote: AtomicUsize::new(0),
+        _pad4: [0; 16],
+        remote_summary: AtomicU64::new(0),
         _pad5: [0; 56],
     };
 
@@ -185,7 +207,9 @@ impl Span {
         }
     }
 
-    /// Index of the block containing `p`, if `p` is a valid block start.
+    /// Index of the block containing `p`, if `p` is a valid block start
+    /// (a block that was never handed out passes here and is caught by
+    /// its state).
     #[inline]
     pub fn block_index(&self, p: *mut u8) -> Option<u32> {
         let off = (p as usize).wrapping_sub(self.data as usize);
@@ -198,47 +222,80 @@ impl Span {
         }
         // Division by multiplication (see `CLASS_INV`); the multiply-back
         // check makes the result exact for any `off`, valid or not.
-        let idx =
-            ((off as u64).wrapping_mul(CLASS_INV[self.class as usize]) >> CLASS_INV_SHIFT) as usize;
-        if idx >= self.bump as usize || idx * bs != off {
+        debug_assert!((self.class as usize) < CLASS_INV.len());
+        // SAFETY: `class` is allocator metadata, always a valid class
+        // for a live span (the large class was handled above).
+        let inv = unsafe { *CLASS_INV.get_unchecked(self.class as usize) };
+        let idx = ((off as u64).wrapping_mul(inv) >> CLASS_INV_SHIFT) as usize;
+        if idx >= self.capacity as usize || idx * bs != off {
             None
         } else {
             Some(idx as u32)
         }
     }
 
-    /// Tests the allocation bit of block `idx`.
+    /// The state byte of block `idx`, as an atomic: the owner uses plain
+    /// (relaxed) loads and stores, and a thread freeing a block it does
+    /// not own may read it.
     ///
     /// # Safety
-    /// The span must be live (its bitmap mapped) and `idx < capacity`,
+    /// The span must be live (its states mapped) and `idx < capacity`,
     /// which [`Span::block_index`] guarantees for its results.
+    #[inline(always)]
+    pub unsafe fn state_byte(&self, idx: u32) -> &AtomicU8 {
+        debug_assert!(idx < self.capacity);
+        // SAFETY: caller contract.
+        unsafe { &*(self.states as *const AtomicU8).add(idx as usize) }
+    }
+
+    /// The state of block `idx`.
+    ///
+    /// # Safety
+    /// As for [`Span::state_byte`].
+    #[inline(always)]
+    pub unsafe fn state(&self, idx: u32) -> u8 {
+        // SAFETY: caller contract.
+        unsafe { self.state_byte(idx).load(Ordering::Relaxed) }
+    }
+
+    /// Sets the state of block `idx` (owner only).
+    ///
+    /// # Safety
+    /// As for [`Span::state_byte`].
+    #[inline(always)]
+    pub unsafe fn set_state(&self, idx: u32, state: u8) {
+        // SAFETY: caller contract.
+        unsafe { self.state_byte(idx).store(state, Ordering::Relaxed) }
+    }
+
+    /// Whether block `idx` is allocated (handed to the program).
+    ///
+    /// # Safety
+    /// As for [`Span::state`].
     #[inline]
     pub unsafe fn is_allocated(&self, idx: u32) -> bool {
-        debug_assert!(idx < self.capacity);
         // SAFETY: caller contract.
-        unsafe { *self.bitmap.add(idx as usize / 64) & (1 << (idx % 64)) != 0 }
+        unsafe { self.state(idx) == STATE_ALLOCATED }
     }
 
-    /// Sets the allocation bit of block `idx`.
+    /// Marks block `idx` allocated.
     ///
     /// # Safety
-    /// As for [`Span::is_allocated`].
+    /// As for [`Span::state`].
     #[inline]
-    pub unsafe fn mark_allocated(&mut self, idx: u32) {
-        debug_assert!(idx < self.capacity);
+    pub unsafe fn mark_allocated(&self, idx: u32) {
         // SAFETY: caller contract.
-        unsafe { *self.bitmap.add(idx as usize / 64) |= 1 << (idx % 64) }
+        unsafe { self.set_state(idx, STATE_ALLOCATED) }
     }
 
-    /// Clears the allocation bit of block `idx`.
+    /// Marks block `idx` free.
     ///
     /// # Safety
-    /// As for [`Span::is_allocated`].
+    /// As for [`Span::state`].
     #[inline]
-    pub unsafe fn mark_free(&mut self, idx: u32) {
-        debug_assert!(idx < self.capacity);
+    pub unsafe fn mark_free(&self, idx: u32) {
         // SAFETY: caller contract.
-        unsafe { *self.bitmap.add(idx as usize / 64) &= !(1 << (idx % 64)) }
+        unsafe { self.set_state(idx, STATE_FREE) }
     }
 }
 
@@ -614,8 +671,9 @@ pub fn alloc_large(size: usize) -> Option<(*mut u8, bool)> {
         (*span).capacity = 1;
         (*span).bump = 1;
         (*span).used = 1;
-        (*span).inline_bits = 1;
-        (*span).bitmap = ptr::addr_of_mut!((*span).inline_bits);
+        (*span).inline_bits = STATE_ALLOCATED as u64;
+        (*span).words = 1;
+        (*span).states = ptr::addr_of_mut!((*span).inline_bits) as *mut u8;
         (*span).data = (seg as usize + first * UNIT_SIZE) as *mut u8;
         Some(((*span).data, !dirty))
     }
@@ -631,7 +689,10 @@ pub unsafe fn free_large(span: *mut Span, p: *mut u8) {
     let mut pool = POOL.lock();
     // SAFETY: caller contract; the pool lock protects the metadata.
     unsafe {
-        if (*span).class != LARGE_CLASS || (*span).data != p || (*span).inline_bits != 1 {
+        if (*span).class != LARGE_CLASS
+            || (*span).data != p
+            || (*span).inline_bits != STATE_ALLOCATED as u64
+        {
             super::corrupt("double free of a large block");
         }
         (*span).inline_bits = 0;
@@ -704,26 +765,36 @@ unsafe fn init_span(span: *mut Span, seg: *mut Segment, first: usize, class: usi
         if first == 0 {
             start += HEADER_SIZE;
         }
-        // Capacity, taking the bitmap page(s) into account: with one bit
-        // per block a page of bitmap covers 32768 blocks, and even the
-        // smallest class fits fewer than that per unit.
+        // Capacity, taking the metadata into account: a state byte and a
+        // remote bit per block, then the page-aligned block area.
         let max_blocks = (end - start) / block_size;
-        let bitmap_bytes = max_blocks.div_ceil(64) * 8;
-        let data = (start + bitmap_bytes).next_multiple_of(MIN_PAGE_SIZE);
+        let state_bytes = max_blocks.div_ceil(8) * 8;
+        let remote_words = max_blocks.div_ceil(64);
+        let meta = state_bytes + remote_words * 8;
+        let data = (start + meta).next_multiple_of(MIN_PAGE_SIZE);
         let capacity = ((end - data) / block_size) as u32;
-        ptr::write_bytes(start as *mut u8, 0, bitmap_bytes);
+        let words = capacity.div_ceil(8);
+        ptr::write_bytes(start as *mut u8, 0, meta);
+        // The bytes past the capacity in the last word read as allocated,
+        // so a scan for free blocks never finds them.
+        for i in capacity as usize..words as usize * 8 {
+            *(start as *mut u8).add(i) = STATE_ALLOCATED;
+        }
         (*span).block_size = block_size as u32;
         (*span).class = class as u8;
+        (*span).wpg = remote_words.div_ceil(64).max(1) as u8;
         (*span).is_full = false;
         (*span).capacity = capacity;
+        (*span).words = words;
         (*span).bump = 0;
         (*span).used = 0;
-        (*span).free = 0;
-        (*span).zeroed = if zeroed { capacity } else { 0 };
-        (*span).remote.store(0, Ordering::Relaxed);
+        (*span).hint = 0;
+        (*span).fresh = zeroed;
+        (*span).remote_summary.store(0, Ordering::Relaxed);
         (*span).prev = ptr::null_mut();
         (*span).next = ptr::null_mut();
-        (*span).bitmap = start as *mut u64;
+        (*span).states = start as *mut u8;
+        (*span).remote_bits = (start + state_bytes) as *mut AtomicU64;
         (*span).data = data as *mut u8;
     }
 }
@@ -938,7 +1009,9 @@ pub unsafe fn span_containing(p: *const u8) -> *mut Span {
     unsafe {
         let unit = (p as usize - seg as usize) / UNIT_SIZE;
         let first = (*seg).span_of[unit].load(Ordering::Relaxed) as usize;
-        ptr::addr_of_mut!((*seg).spans[first])
+        ptr::addr_of_mut!((*seg).spans)
+            .cast::<Span>()
+            .add(first & (UNITS - 1))
     }
 }
 
@@ -972,7 +1045,13 @@ pub fn lookup(p: *mut u8) -> Owner {
                 let seg = header as *mut Segment;
                 let unit = (p as usize - seg as usize) / UNIT_SIZE;
                 let first = (*seg).span_of[unit].load(Ordering::Relaxed) as usize;
-                Owner::Span(ptr::addr_of_mut!((*seg).spans[first]))
+                // (`span_of` only ever holds unit indices; the mask makes
+                // that a fact for the compiler without a branch.)
+                Owner::Span(
+                    ptr::addr_of_mut!((*seg).spans)
+                        .cast::<Span>()
+                        .add(first & (UNITS - 1)),
+                )
             }
             _ => Owner::Invalid,
         }
@@ -1228,10 +1307,14 @@ mod tests {
             assert!((*span).is_allocated(70));
             (*span).mark_free(70);
             assert!(!(*span).is_allocated(70));
-            (*span).bump = 10;
             assert_eq!((*span).block_index((*span).data.add(32)), Some(2));
             assert_eq!((*span).block_index((*span).data.add(33)), None);
-            assert_eq!((*span).block_index((*span).data.add(160)), None);
+            let cap = (*span).capacity as usize;
+            assert_eq!(
+                (*span).block_index((*span).data.add(16 * (cap - 1))),
+                Some(cap as u32 - 1)
+            );
+            assert_eq!((*span).block_index((*span).data.add(16 * cap)), None);
             match lookup((*span).data) {
                 Owner::Span(s) => assert_eq!(s, span),
                 _ => panic!("wrong owner"),

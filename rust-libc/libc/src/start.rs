@@ -169,7 +169,7 @@ pub unsafe extern "C" fn start_c(sp: *const usize) -> ! {
     } else if crate::sys::getrandom_exact(&mut random).is_err() {
         crate::exit::abort_now();
     }
-    let (canary_seed, heap_seed) = random.split_at(8);
+    let (canary_seed, _) = random.split_at(8);
     let canary = crate::thread::canary_from_random(canary_seed.try_into().unwrap_or([0; 8]));
     // Without a TCB slot for it, gcc reads the canary from this global.
     #[cfg(target_arch = "aarch64")]
@@ -177,7 +177,6 @@ pub unsafe extern "C" fn start_c(sp: *const usize) -> ! {
     unsafe {
         __stack_chk_guard = canary;
     }
-    crate::malloc::init(heap_seed.try_into().unwrap_or([0; 8]));
     let size = tls::round_up(tls::region_size(), crate::sys::page_size());
     // SAFETY: anonymous private mapping with no address hint.
     let region = unsafe {

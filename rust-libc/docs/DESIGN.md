@@ -147,38 +147,66 @@ the total stays linear.
 Sixteen-mebibyte aligned segments are carved into 256 KiB units; spans of
 one, four or eight units hold blocks of one of 60 size classes (16-byte
 steps to 128 bytes, then four classes per power of two up to 1 MiB, the
-same territory glibc's dynamic mmap threshold covers). Metadata lives in
-the segment header, never next to user data. Each thread owns a heap
-with per-class lists of spans; blocks freed by another thread go on the
-span's lock-free remote stack and are collected by the owner.
+same territory glibc's dynamic mmap threshold covers), and a *large
+span* of any number of units holds a single block of up to 16 MiB.
+Metadata lives in the segment header, never next to user data. Each
+thread owns a heap with per-class lists of spans.
 
-Security measures on the fast path: free-list links (local and remote)
-are XOR-encoded with a per-process key and the slot address and validated
-when popped; an allocation bitmap per span makes double and interior
-frees abort; a bitmap of live 16 MiB-aligned mappings (2 MiB of `.bss`,
-touched lazily) is consulted before any header is read, so a pointer
-that never came from the allocator, or one into the middle of a block
-larger than a segment, is rejected instead of having user data
-interpreted as metadata.
+Spans keep no free list. Every block has a one-byte state in a table at
+the start of its span: free, cached (held in a thread's per-class cache)
+or allocated. `malloc` pops a cached block and sets its state, `free`
+checks the state and pushes; a cache is refilled by scanning the state
+table for free blocks (eight per 64-bit word, a hint word saves the
+scan) and flushed by clearing states, so neither refill nor flush reads
+or writes the blocks themselves, and address-ordered reuse keeps a
+thread's working set compact. Blocks freed by another thread are marked
+in the span's remote-free bitmap, batched per freeing thread (one atomic
+`or` per bitmap word per batch of 64) with a summary word the owner
+swaps out to find what to collect; collecting is again metadata only.
+The state bytes cost 6% of the smallest class and under 1% from 128
+bytes up, the same order as glibc's chunk headers and far less than the
+cost of trusting freed memory.
 
-Larger requests are direct mappings with a header page, resized with
-`mremap` (in place when the address space allows, otherwise into a fresh
-aligned reservation with `MREMAP_FIXED`) rather than copied; freed
-mappings are cached (eight, at most 64 MiB each, 32 MiB of them kept
-resident) so that programs which repeatedly allocate large buffers do
-not pay for `mmap`, page faults and `munmap` every time. `calloc` zeroes
-recycled mappings explicitly.
+Security measures on the fast path: no allocator metadata is ever
+stored in user memory, so an overflow or a write into a freed block
+cannot corrupt the allocator; a block's state makes a double free abort
+whether the block is cached or not, and an interior or never-allocated
+pointer is rejected by the block index check (multiplication by the
+class's reciprocal and multiplying back); a bitmap of live 16 MiB-aligned
+mappings (2 MiB of `.bss`, touched lazily) is consulted before any
+header is read, so a pointer that never came from the allocator, or one
+into the middle of a block larger than a segment, is rejected instead of
+having user data interpreted as metadata. The hot paths are a single
+straight line each: everything unusual (a full cache, a foreign block,
+a large block, corruption) is a tail call into a cold function, so
+`free` keeps no stack frame or saved registers.
+
+Blocks from 1 MiB to 16 MiB are large spans carved from the segments at
+unit granularity, so a program cycling through big buffers of varying
+size reuses resident memory without a system call (the earlier design,
+one cached mapping per block, either trimmed the mapping or faulted the
+pages in again on every reuse); `realloc` of one grows or shrinks it in
+place at unit granularity when it can. Anything bigger is a direct
+mapping with a header page, resized with `mremap` rather than copied,
+and cached after being freed (32 mappings, best fit).
 
 Memory goes back to the kernel deliberately, because `MADV_DONTNEED`
-costs a TLB shootdown and the next use faults the pages in again: a
-heap keeps one empty single-unit span per class (the only span of a
-class is always kept, so a block freed and reallocated in a loop never
-faults); larger spans are returned as soon as they are empty; a thread
-that exits hands its empty spans to the orphan lists for the next
-thread, one per class; and single-unit spans returned to a segment keep
-their pages until three quarters of the segment is free, when they are
-returned in bulk. An entirely free segment is unmapped unless it is the
-last one.
+costs a TLB shootdown and the next use faults the pages in again. Units
+freed to the pool keep their pages until the segment has had nothing
+freed into it for 250 ms (checked whenever the pool is used) or the
+resident free units exceed a budget (64 MiB, or as much as is allocated
+when that is more), in which case the least recently used segments are
+swept, though a segment that had a free within the last 10 ms is spared
+until twice the budget; an entirely free segment is unmapped once idle
+unless it is the last one. Each heap also keeps up to 64 MiB of empty
+spans in reserve for reuse without the pool lock, decaying after 250 ms
+(checked from the refill and flush paths and from big allocations, so a
+thread whose working set shrank does not hold its reserve forever), and
+a thread that exits hands its reserve to the orphan lists, where the
+next thread adopts spans with a list pop instead of a walk of the
+segment bitmaps (which serialised a burst of short-lived threads on the
+pool lock); orphans nobody adopts decay too. The big size classes cache
+a single block per thread so that idle threads do not pin megabytes.
 
 ## Security review
 
@@ -218,6 +246,16 @@ other case, and any request for more than 15 digits, uses the exact mode.
 
 * Mutexes skip the atomic read-modify-write while the process has one
   thread (the flag flips before `clone`); stdio locks do the same.
+* The mutex keeps an exact waiter count in a second word (musl's
+  design) rather than the classic three-state futex word: an unlock only
+  makes the `futex_wake` system call when somebody is asleep, and the
+  futex word stays stable while the lock is held so sleepers are not
+  woken with `EAGAIN` as other waiters arrive. On a four-thread
+  producer/consumer workload this measured 5-10x faster than the
+  three-state design, which keeps waking after every contended acquire.
+  A contended acquire spins briefly (reading only, and not at all once
+  somebody sleeps on the lock) before sleeping. Condition variable
+  signals and broadcasts skip the sequence bump when nobody waits.
 * `pthread_join` keeps the finished thread's stack mapping for the next
   `pthread_create`.
 * `qsort` is an introsort with three-way partitioning, so equal keys and
