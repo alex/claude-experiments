@@ -137,6 +137,28 @@ theorem read_sub (m : Mem) (a : Addr) (n k w : Nat) (hk : k + w ≤ n) (hn : n �
   congr 3
   apply BitVec.eq_of_toNat_eq; simp [Nat.add_mod]
 
+/-- Little-endian write of a `w`-bit value (`w` a multiple of 8). -/
+def writeW (m : Mem) (a : Addr) {w : Nat} (v : BitVec w) : Mem :=
+  m.write a (w / 8) (v.setWidth (8 * (w / 8)))
+
+theorem readW_writeW_same (m : Mem) (a : Addr) {w : Nat} (v : BitVec w) (hw : w % 8 = 0)
+    (hn : w / 8 ≤ 2 ^ 64) : (m.writeW a v).readW a w = v := by
+  rw [readW, writeW, read_write_same _ _ _ _ hn]
+  apply BitVec.eq_of_getLsbD_eq; intro i hi
+  simp only [BitVec.getLsbD_setWidth]
+  have : i < 8 * (w / 8) := by omega
+  simp [this, hi]
+
+theorem readW_writeW_sep (m : Mem) (a : Addr) {w : Nat} (v : BitVec w) (b : Addr) (w' : Nat)
+    (h : Sep a (w / 8) b (w' / 8)) : (m.writeW a v).readW b w' = m.readW b w' := by
+  rw [readW, writeW, read_write_sep _ _ _ _ _ _ h, readW]
+
+theorem writeW_apply_sep (m : Mem) (a : Addr) {w : Nat} (v : BitVec w) (b : Addr)
+    (h : Sep a (w / 8) b 1) : (m.writeW a v) b = m b := by
+  have := h.not_lt 0 (by omega)
+  simp only [writeW, write_apply]
+  rw [if_neg (by simpa using this)]
+
 end Mem
 
 /-! ## Regions -/

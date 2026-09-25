@@ -11,3 +11,7 @@ rev = "master"
 
 [[lean_lib]]
 name = "ClaudeCrypto"
+
+[[lean_exe]]
+name = "emit"
+root = "Emit.Main"

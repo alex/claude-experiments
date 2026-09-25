@@ -205,7 +205,7 @@ def loadW (s : State) (w : Nat) (a : Addr) : Option (BitVec w) :=
   if InRegions (s.rd ++ s.wr) a (w / 8) then some (s.mem.readW a w) else none
 
 def storeW (s : State) {w : Nat} (a : Addr) (v : BitVec w) : Option State :=
-  s.store a (w / 8) (v.setWidth _)
+  if InRegions s.wr a (w / 8) then some { s with mem := s.mem.writeW a v } else none
 
 end State
 
@@ -236,17 +236,17 @@ def execAlu (w : Nat) (op : AluOp) (dst : Reg) (src : Src) (s : State) : Option 
   let a := s.readW w dst
   match op with
   | .add => let r := a + b
-    some ((arithFlags s r (decide (a.toNat + b.toNat ≥ 2 ^ w)) (addOverflow a b r)).writeW dst r)
+    some ((arithFlags s r (Nat.ble (2 ^ w) (a.toNat + b.toNat)) (addOverflow a b r)).writeW dst r)
   | .adc => s.cf.map fun c =>
     let r := a + b + (BitVec.ofBool c).setWidth w
-    (arithFlags s r (decide (a.toNat + b.toNat + c.toNat ≥ 2 ^ w)) (addOverflow a b r)).writeW dst r
+    (arithFlags s r (Nat.ble (2 ^ w) (a.toNat + b.toNat + c.toNat)) (addOverflow a b r)).writeW dst r
   | .sub => let r := a - b
-    some ((arithFlags s r (decide (a.toNat < b.toNat)) (subOverflow a b r)).writeW dst r)
+    some ((arithFlags s r (Nat.blt a.toNat b.toNat) (subOverflow a b r)).writeW dst r)
   | .sbb => s.cf.map fun c =>
     let r := a - b - (BitVec.ofBool c).setWidth w
-    (arithFlags s r (decide (a.toNat < b.toNat + c.toNat)) (subOverflow a b r)).writeW dst r
+    (arithFlags s r (Nat.blt a.toNat (b.toNat + c.toNat)) (subOverflow a b r)).writeW dst r
   | .cmp => let r := a - b
-    some (arithFlags s r (decide (a.toNat < b.toNat)) (subOverflow a b r))
+    some (arithFlags s r (Nat.blt a.toNat b.toNat) (subOverflow a b r))
   | .and => let r := a &&& b; some ((arithFlags s r false false).writeW dst r)
   | .or => let r := a ||| b; some ((arithFlags s r false false).writeW dst r)
   | .xor => let r := a ^^^ b; some ((arithFlags s r false false).writeW dst r)
@@ -337,7 +337,7 @@ def evalCond (c : Cond) (s : State) : Option Bool :=
   | .be => do let c ← s.cf; let z ← s.zf; pure (c || z)
   | .a => do let c ← s.cf; let z ← s.zf; pure (!c && !z)
 
-def isa : ISA where
+@[reducible] def isa : ISA where
   State := State
   Instr := Instr
   Cond := Cond

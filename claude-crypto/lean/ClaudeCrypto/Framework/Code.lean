@@ -129,6 +129,10 @@ theorem block {is : List M.Instr} {s : M.State} {Q : M.State → Prop}
     (h : ∃ p, execBlock M is s = some p ∧ Q p.1) : WP M (.block is) s Q := by
   obtain ⟨⟨s', t⟩, h1, h2⟩ := h; exact ⟨t, s', .block h1, h2⟩
 
+theorem block_intro {is : List M.Instr} {s : M.State} {Q : M.State → Prop}
+    (p : M.State × List Leak) (h : execBlock M is s = some p) (hq : Q p.1) : WP M (.block is) s Q :=
+  ⟨p.2, p.1, .block h, hq⟩
+
 theorem seq {c₁ c₂ : Prog M} {s : M.State} {Q : M.State → Prop}
     (h : WP M c₁ s (fun s₁ => WP M c₂ s₁ Q)) : WP M (.seq c₁ c₂) s Q := by
   obtain ⟨t, s₁, h1, t', s₂, h2, hq⟩ := h; exact ⟨_, _, .seq h1 h2, hq⟩
