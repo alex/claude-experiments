@@ -11,7 +11,9 @@ exposes them.
 | | AArch64 | ARMv8 crypto extensions | ✅ `CC.Arm.SHA256Ce.correct` | ✅ `…Ce.constant_time` |
 | | ppc64le | POWER8 vector crypto | ✅ `CC.Ppc.SHA256P8.correct` | ✅ `…P8.constant_time` |
 | ECDSA P-384 signature verification | IR (below) | Montgomery field arithmetic, Fermat inversion, Shamir double-scalar ladder | ✅ `CC.P384.main_ok` | n/a (public inputs) |
-| | x86-64 / AArch64 / ppc64le | compiled from the IR by verified compilers | in progress (machine-level wrappers) | n/a |
+| | x86-64 (BMI2) | compiled from the IR by a verified compiler | ✅ `CC.P384.x86_correct` | n/a |
+| | AArch64 | compiled from the IR by a verified compiler | ✅ `CC.P384.arm_correct` | n/a |
+| | ppc64le | compiled from the IR by a verified compiler | in progress | n/a |
 
 ## What is proven, and what you have to trust
 
