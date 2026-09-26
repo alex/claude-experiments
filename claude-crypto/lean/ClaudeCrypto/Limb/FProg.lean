@@ -26,6 +26,11 @@ def dst : FOp → Nat
 def srcs : FOp → List Nat
   | mul _ a b | add _ a b | sub _ a b => [a, b]
 
+/-- The sources that must be reduced (`montMul` only needs its first operand `< N`). -/
+def rsrcs : FOp → List Nat
+  | mul _ a _ => [a]
+  | add _ a b | sub _ a b => [a, b]
+
 /-- Frame offset of slot `i`. -/
 def off (base i : Nat) : Nat := base + 48 * i
 
@@ -53,10 +58,11 @@ def FProg.run {N : Nat} : List FOp → (Nat → ZMod N) → (Nat → ZMod N)
   | [], v => v
   | o :: os, v => FProg.run os (o.run v)
 
-/-- Every slot read has been initialized (is in `init`) or written before; all slots `< K`. -/
+/-- Every slot that must be reduced has been initialized (is in `init`) or written before;
+all slots `< K`. -/
 def FProg.wf (K : Nat) : List FOp → List Nat → Bool
   | [], _ => true
-  | o :: os, init => (o.srcs.all fun i => init.contains i) && decide (o.dst < K) &&
+  | o :: os, init => (o.rsrcs.all fun i => init.contains i) && decide (o.dst < K) &&
       (o.srcs.all fun i => decide (i < K)) && FProg.wf K os (o.dst :: init)
 
 /-! ## Decoding Montgomery representations -/
@@ -159,7 +165,7 @@ structure OpPost (offN offMp base K N : Nat) (o : FOp) (s q : State) : Prop wher
   labels : q.labels = s.labels
 
 theorem op_ok (offN offMp base K N : Nat) (o : FOp) (s : State) (hl : Layout offN offMp base K N s)
-    (hd : o.dst < K) (hs : ∀ i ∈ o.srcs, i < K ∧ slotVal base s i < N) :
+    (hd : o.dst < K) (hk : ∀ i ∈ o.srcs, i < K) (hs : ∀ i ∈ o.rsrcs, slotVal base s i < N) :
     WP isa (o.code offN offMp base) s (OpPost offN offMp base K N o s) := by
   have hpre : ∀ a b d, a < K → b < K → d < K → OpPre (FOp.off base a) (FOp.off base b) (FOp.off base d) offN s :=
     fun a b d ha hb hd => ⟨by unfold FOp.off; nlinarith [hl.hoffs], hl.hoffN,
@@ -179,8 +185,8 @@ theorem op_ok (offN offMp base K N : Nat) (o : FOp) (s : State) (hl : Layout off
     · exact h
   cases o with
   | mul d a b =>
-    obtain ⟨ha, hA⟩ := hs a (by simp [FOp.srcs])
-    obtain ⟨hb, hB⟩ := hs b (by simp [FOp.srcs])
+    have ha := hk a (by simp [FOp.srcs]); have hA := hs a (by simp [FOp.rsrcs])
+    have hb := hk b (by simp [FOp.srcs])
     have h := hpre a b d ha hb hd
     refine WP.mono (montMul_ok _ _ _ offN offMp s h.hoffD h.hoffN (by rw [hNv]; exact hA)
       (by rw [hNv]; exact hl.hmp) h.pA h.pB h.pN hl.pM h.pD h.sep) ?_
@@ -196,8 +202,8 @@ theorem op_ok (offN offMp base K N : Nat) (o : FOp) (s : State) (hl : Layout off
       rw [e1]
       exact decode_mul _ _ _ _ hl.cop hmod
   | add d a b =>
-    obtain ⟨ha, hA⟩ := hs a (by simp [FOp.srcs])
-    obtain ⟨hb, hB⟩ := hs b (by simp [FOp.srcs])
+    have ha := hk a (by simp [FOp.srcs]); have hA := hs a (by simp [FOp.rsrcs])
+    have hb := hk b (by simp [FOp.srcs]); have hB := hs b (by simp [FOp.rsrcs])
     have h := hpre a b d ha hb hd
     refine WP.mono (addMod_ok _ _ _ offN s h (by rw [hNv]; exact hA) (by rw [hNv]; exact hB)) ?_
     rintro q ⟨hv, hag, h13, h14, hrd, hwr, hl'⟩
@@ -212,8 +218,8 @@ theorem op_ok (offN offMp base K N : Nat) (o : FOp) (s : State) (hl : Layout off
       rw [e1]
       exact decode_add _ _ _ _ hv
   | sub d a b =>
-    obtain ⟨ha, hA⟩ := hs a (by simp [FOp.srcs])
-    obtain ⟨hb, hB⟩ := hs b (by simp [FOp.srcs])
+    have ha := hk a (by simp [FOp.srcs]); have hA := hs a (by simp [FOp.rsrcs])
+    have hb := hk b (by simp [FOp.srcs]); have hB := hs b (by simp [FOp.rsrcs])
     have h := hpre a b d ha hb hd
     refine WP.mono (subMod_ok _ _ _ offN s h (by rw [hNv]; exact hA) (by rw [hNv]; exact hB)) ?_
     rintro q ⟨hv, hag, h13, h14, hrd, hwr, hl'⟩
@@ -257,7 +263,7 @@ theorem FOp.run_congr {N : Nat} (o : FOp) (K : Nat) (hs : ∀ i ∈ o.srcs, i < 
     · simp only [Function.update_of_ne e]; exact h i hi
 
 theorem FProg.wf_cons {K : Nat} {o : FOp} {os : List FOp} {init : List Nat} (h : FProg.wf K (o :: os) init = true) :
-    (∀ i ∈ o.srcs, i ∈ init) ∧ o.dst < K ∧ (∀ i ∈ o.srcs, i < K) ∧ FProg.wf K os (o.dst :: init) = true := by
+    (∀ i ∈ o.rsrcs, i ∈ init) ∧ o.dst < K ∧ (∀ i ∈ o.srcs, i < K) ∧ FProg.wf K os (o.dst :: init) = true := by
   simp only [FProg.wf, Bool.and_eq_true, List.all_eq_true, List.contains_iff_mem, decide_eq_true_eq] at h
   exact ⟨h.1.1.1, h.1.1.2, h.1.2, h.2⟩
 
@@ -316,7 +322,7 @@ theorem prog_ok (offN offMp base K N : Nat) : ∀ (ops : List FOp) (init : List 
   | o :: os, init, s, hwf, hl, hi => by
     obtain ⟨w1, w2, w3, w4⟩ := FProg.wf_cons hwf
     apply WP.seq
-    refine WP.mono (op_ok offN offMp base K N o s hl w2 (fun i hi' => ⟨w3 i hi', (hi i (w1 i hi')).2⟩)) ?_
+    refine WP.mono (op_ok offN offMp base K N o s hl w2 w3 (fun i hi' => (hi i (w1 i hi')).2)) ?_
     intro q1 h1
     have hi1 : ∀ i ∈ o.dst :: init, i < K ∧ slotVal base q1 i < N := by
       intro i hmem

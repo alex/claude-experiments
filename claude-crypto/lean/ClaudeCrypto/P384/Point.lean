@@ -21,7 +21,7 @@ def dblProg (x y z t : Nat) : List FOp :=
     .sub δ δ x, .mul δ a δ, .mul γ γ γ, .add γ γ γ, .add γ γ γ, .add γ γ γ, .sub y δ γ ]
 
 theorem dbl_run (v : Nat → F) :
-    let r := FProg.run (dblProg 0 1 2 3) v
+    let r := FProg.run (dblProg 0 1 2 6) v
     let X := v 0; let Y := v 1; let Z := v 2
     let δ := Z ^ 2
     let γ := Y ^ 2
