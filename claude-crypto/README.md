@@ -13,7 +13,7 @@ exposes them.
 | ECDSA P-384 signature verification | IR (below) | Montgomery field arithmetic, Fermat inversion, Shamir double-scalar ladder | ✅ `CC.P384.main_ok` | n/a (public inputs) |
 | | x86-64 (BMI2) | compiled from the IR by a verified compiler | ✅ `CC.P384.x86_correct` | n/a |
 | | AArch64 | compiled from the IR by a verified compiler | ✅ `CC.P384.arm_correct` | n/a |
-| | ppc64le | compiled from the IR by a verified compiler | in progress | n/a |
+| | ppc64le | compiled from the IR by a verified compiler | ✅ `CC.P384.ppc_correct` | n/a |
 
 ## What is proven, and what you have to trust
 
