@@ -52,3 +52,8 @@ import ClaudeCrypto.Limb.Row
 import ClaudeCrypto.Limb.Small
 import ClaudeCrypto.Limb.MontMath
 import ClaudeCrypto.Limb.MontRow
+import ClaudeCrypto.Limb.Chain
+import ClaudeCrypto.Limb.AddSub
+import ClaudeCrypto.Limb.Field
+import ClaudeCrypto.Limb.MontFinal
+import ClaudeCrypto.Limb.MontMul
