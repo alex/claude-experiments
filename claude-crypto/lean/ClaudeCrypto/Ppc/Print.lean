@@ -59,6 +59,26 @@ def Instr.asm : Instr → List String
       "mtlr 0",
       s!"addis {rt.num},{rt.num},({l}-1b)@ha",
       s!"addi {rt.num},{rt.num},({l}-1b)@l" ]
+  | .add rt ra rb => [s!"add {rt.num},{ra.num},{rb.num}"]
+  | .subf rt ra rb => [s!"subf {rt.num},{ra.num},{rb.num}"]
+  | .addc rt ra rb => [s!"addc {rt.num},{ra.num},{rb.num}"]
+  | .adde rt ra rb => [s!"adde {rt.num},{ra.num},{rb.num}"]
+  | .subfc rt ra rb => [s!"subfc {rt.num},{ra.num},{rb.num}"]
+  | .subfe rt ra rb => [s!"subfe {rt.num},{ra.num},{rb.num}"]
+  | .mulld rt ra rb => [s!"mulld {rt.num},{ra.num},{rb.num}"]
+  | .mulhdu rt ra rb => [s!"mulhdu {rt.num},{ra.num},{rb.num}"]
+  | .and ra rs rb => [s!"and {ra.num},{rs.num},{rb.num}"]
+  | .or ra rs rb => [s!"or {ra.num},{rs.num},{rb.num}"]
+  | .xor ra rs rb => [s!"xor {ra.num},{rs.num},{rb.num}"]
+  | .rldicl ra rs sh mb => [s!"rldicl {ra.num},{rs.num},{sh},{mb}"]
+  | .rldicr ra rs sh me => [s!"rldicr {ra.num},{rs.num},{sh},{me}"]
+  | .ori ra rs ui => [s!"ori {ra.num},{rs.num},{ui}"]
+  | .oris ra rs ui => [s!"oris {ra.num},{rs.num},{ui}"]
+  | .ld rt ra ds => [s!"ld {rt.num},{ds}({ra.num})"]
+  | .std rx ra ds => [s!"std {rx.num},{ds}({ra.num})"]
+  | .ldx rt ra rb => [s!"ldx {rt.num},{ra.num},{rb.num}"]
+  | .stdx rx ra rb => [s!"stdx {rx.num},{ra.num},{rb.num}"]
+  | .ldbrx rt ra rb => [s!"ldbrx {rt.num},{ra.num},{rb.num}"]
 
 def Cond.branch (c : Cond) (l : String) : String :=
   match c with

@@ -62,6 +62,16 @@ def step (i : Instr) (t : TState) : Option TState :=
   | .neg rt ra => some (t.setPub rt (t.pub ra))
   | .cmpldi ra _ => some { t with flags := t.pub ra }
   | .adr rt _ => some ((t.setPub .r0 false).setPub rt true)
+  | .add rt ra rb | .subf rt ra rb | .addc rt ra rb | .subfc rt ra rb | .mulld rt ra rb
+  | .mulhdu rt ra rb | .and rt ra rb | .or rt ra rb | .xor rt ra rb =>
+    some (t.setPub rt (t.pub ra && t.pub rb))
+  | .adde rt _ _ | .subfe rt _ _ => some (t.setPub rt false)
+  | .rldicl ra rs _ _ | .rldicr ra rs _ _ | .ori ra rs _ | .oris ra rs _ =>
+    some (t.setPub ra (t.pub rs))
+  | .ld rt ra _ => if t.raPub ra then some (t.setPub rt false) else none
+  | .std _ ra _ => if t.raPub ra then some t else none
+  | .ldx rt ra rb | .ldbrx rt ra rb => if t.raPub ra && t.pub rb then some (t.setPub rt false) else none
+  | .stdx _ ra rb => if t.raPub ra && t.pub rb then some t else none
 
 def condOk (_ : Cond) (t : TState) : Bool := t.flags
 
@@ -120,6 +130,12 @@ theorem Agree.setV {t : TState} {s₁ s₂ : State} (h : t.Agree s₁ s₂) (r :
 theorem Agree.mem {t : TState} {s₁ s₂ : State} (h : t.Agree s₁ s₂) (m₁ m₂ : Mem) :
     t.Agree { s₁ with mem := m₁ } { s₂ with mem := m₂ } := ⟨h.1, h.2.1, h.2.2⟩
 
+theorem Agree.setGCA {t : TState} {s₁ s₂ : State} (h : t.Agree s₁ s₂) (r : GReg) (b : Bool)
+    (p₁ p₂ : BitVec 64 × Bool) (hv : b = true → p₁.1 = p₂.1) :
+    (t.setPub r b).Agree (s₁.setGCA r p₁) (s₂.setGCA r p₂) :=
+  let h' := h.setG r b p₁.1 p₂.1 hv
+  ⟨h'.1, h'.2.1, h'.2.2⟩
+
 theorem ea_eq {t : TState} {s₁ s₂ : State} (h : t.Agree s₁ s₂) (ra rb : GReg)
     (hp : (t.raPub ra && t.pub rb) = true) : s₁.ea ra rb = s₂.ea ra rb := by
   simp only [Bool.and_eq_true] at hp
@@ -166,6 +182,70 @@ theorem exec_sound (i : Instr) (t t' : TState) (s₁ s₂ s₁' s₂' : State) (
     change t.pub ra = true at hp
     have e := hag.1 ra hp
     exact ⟨by rw [e], by rw [e], by rw [e]⟩
+  | add rt ra rb | subf rt ra rb | mulld rt ra rb | mulhdu rt ra rb | and rt ra rb | or rt ra rb
+  | xor rt ra rb =>
+    simp only [step, Option.some.injEq] at hstep; subst hstep
+    simp only [exec, Option.some.injEq] at h1 h2; subst h1; subst h2
+    refine hag.setG _ _ _ _ (fun hp => ?_)
+    simp only [Bool.and_eq_true] at hp
+    rw [hag.1 ra hp.1, hag.1 rb hp.2]
+  | addc rt ra rb | subfc rt ra rb =>
+    simp only [step, Option.some.injEq] at hstep; subst hstep
+    simp only [exec, Option.some.injEq] at h1 h2; subst h1; subst h2
+    refine hag.setGCA _ _ _ _ (fun hp => ?_)
+    simp only [Bool.and_eq_true] at hp
+    rw [hag.1 ra hp.1, hag.1 rb hp.2]
+  | adde rt ra rb | subfe rt ra rb =>
+    simp only [step, Option.some.injEq] at hstep; subst hstep
+    simp only [exec] at h1 h2
+    cases hc1 : s₁.ca with
+    | none => rw [hc1] at h1; cases h1
+    | some c₁ =>
+      cases hc2 : s₂.ca with
+      | none => rw [hc2] at h2; cases h2
+      | some c₂ =>
+        rw [hc1, Option.map_some, Option.some.injEq] at h1
+        rw [hc2, Option.map_some, Option.some.injEq] at h2
+        subst h1; subst h2
+        exact hag.setGCA _ _ _ _ (fun h => by cases h)
+  | rldicl ra rs sh mb | rldicr ra rs sh mb =>
+    simp only [step, Option.some.injEq] at hstep; subst hstep
+    simp only [exec] at h1 h2
+    split at h1
+    · simp only [Option.some.injEq] at h1; subst h1
+      rw [if_pos (by assumption), Option.some.injEq] at h2; subst h2
+      exact hag.setG _ _ _ _ (fun hp => by rw [hag.1 rs hp])
+    · cases h1
+  | ori ra rs ui | oris ra rs ui =>
+    simp only [step, Option.some.injEq] at hstep; subst hstep
+    simp only [exec, Option.some.injEq] at h1 h2; subst h1; subst h2
+    exact hag.setG _ _ _ _ (fun hp => by rw [hag.1 rs hp])
+  | ld rt ra ds =>
+    simp only [step] at hstep
+    split at hstep
+    · cases hstep
+      simp only [exec, State.load64] at h1 h2
+      split at h1 <;> split at h2 <;>
+        simp only [reduceCtorEq, Option.map_some, Option.map_none, Option.some.injEq] at h1 h2
+      subst h1; subst h2; exact hag.setG _ _ _ _ (fun h => by cases h)
+    · cases hstep
+  | ldx rt ra rb | ldbrx rt ra rb =>
+    simp only [step] at hstep
+    split at hstep
+    · cases hstep
+      simp only [exec, State.load64] at h1 h2
+      split at h1 <;> split at h2 <;>
+        simp only [reduceCtorEq, Option.map_some, Option.map_none, Option.some.injEq] at h1 h2
+      subst h1; subst h2; exact hag.setG _ _ _ _ (fun h => by cases h)
+    · cases hstep
+  | std rx ra ds | stdx rx ra ds =>
+    simp only [step] at hstep
+    split at hstep
+    · cases hstep
+      simp only [exec, State.store64] at h1 h2
+      split at h1 <;> split at h2 <;> simp only [reduceCtorEq, Option.some.injEq] at h1 h2
+      subst h1; subst h2; exact hag.mem _ _
+    · cases hstep
   | adr rt l =>
     simp only [step, Option.some.injEq] at hstep; subst hstep
     cases rt <;> simp only [exec, Option.some.injEq, reduceCtorEq] at h1 h2 <;>
@@ -176,10 +256,15 @@ open TState in
 theorem addrs_sound (i : Instr) (t t' : TState) (s₁ s₂ : State) (hstep : t.step i = some t')
     (hag : t.Agree s₁ s₂) : addrs i s₁ = addrs i s₂ := by
   cases i with
-  | lxvw4x _ ra rb | stxvw4x _ ra rb =>
+  | lxvw4x _ ra rb | stxvw4x _ ra rb | ldx _ ra rb | stdx _ ra rb | ldbrx _ ra rb =>
     simp only [step] at hstep
     split at hstep
     · rename_i hp; simp only [addrs, ea_eq hag ra rb hp]
+    · cases hstep
+  | ld _ ra ds | std _ ra ds =>
+    simp only [step] at hstep
+    split at hstep
+    · rename_i hp; simp only [addrs, hag.raOr0 ra hp]
     · cases hstep
   | _ => rfl
 

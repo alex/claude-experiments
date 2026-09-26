@@ -68,3 +68,4 @@ import ClaudeCrypto.Ppc.Taint
 import ClaudeCrypto.Ppc.SHA256.P8
 import ClaudeCrypto.Ppc.SHA256.P8Main
 import ClaudeCrypto.Ppc.SHA256.P8CT
+import ClaudeCrypto.Limb.Ppc

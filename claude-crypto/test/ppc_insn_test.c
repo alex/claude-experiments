@@ -89,6 +89,111 @@ static void (*const t_sig[32])(const vec *, const vec *, const vec *, vec *) = {
   }
 CMP(0) CMP(1) CMP(64) CMP(65535)
 
+// ---- 64-bit scalar integer instructions ----
+static int get_ca(void) __attribute__((unused));
+static int get_ca(void) {
+  uint64_t x;
+  __asm__ volatile("mfxer %0" : "=r"(x));
+  return (int)((x >> 29) & 1);  // XER.CA is bit 34 (ISA numbering) = bit 29 from the right
+}
+#define RRR(NAME, INSN)                                                        \
+  static uint64_t NAME(uint64_t a, uint64_t b) {                               \
+    uint64_t r;                                                                \
+    __asm__ volatile(INSN " %0,%1,%2" : "=r"(r) : "r"(a), "r"(b));             \
+    return r;                                                                  \
+  }
+RRR(t_add, "add") RRR(t_subf, "subf") RRR(t_mulld, "mulld") RRR(t_mulhdu, "mulhdu")
+RRR(t_and, "and") RRR(t_or, "or") RRR(t_xor, "xor")
+// carrying: result and CA (CA read right after, with no instruction in between that sets it)
+#define RRC(NAME, INSN)                                                        \
+  static uint64_t NAME(uint64_t a, uint64_t b, int cin, int *cout) {           \
+    uint64_t r, x;                                                             \
+    __asm__ volatile("mtxer %3\n\t" INSN " %0,%2,%4\n\tmfxer %1"               \
+                     : "=&r"(r), "=&r"(x) : "r"(a), "r"((uint64_t)cin << 29), "r"(b) : "xer"); \
+    *cout = (int)((x >> 29) & 1);                                              \
+    return r;                                                                  \
+  }
+RRC(t_addc, "addc") RRC(t_adde, "adde") RRC(t_subfc, "subfc") RRC(t_subfe, "subfe")
+
+#define RLDL(SH, MB) static uint64_t t_rldicl_##SH##_##MB(uint64_t a) { uint64_t r; \
+  __asm__ volatile("rldicl %0,%1," #SH "," #MB : "=r"(r) : "r"(a)); return r; }
+#define RLDR(SH, ME) static uint64_t t_rldicr_##SH##_##ME(uint64_t a) { uint64_t r; \
+  __asm__ volatile("rldicr %0,%1," #SH "," #ME : "=r"(r) : "r"(a)); return r; }
+RLDL(0, 0) RLDL(63, 1) RLDL(57, 7) RLDL(32, 32) RLDL(1, 63) RLDL(5, 3) RLDL(17, 40) RLDL(63, 0)
+RLDR(0, 63) RLDR(1, 62) RLDR(7, 56) RLDR(32, 31) RLDR(63, 0) RLDR(5, 3) RLDR(40, 17) RLDR(0, 0)
+static const struct { int sh, mb; uint64_t (*f)(uint64_t); } rldl[] = {
+  {0, 0, t_rldicl_0_0}, {63, 1, t_rldicl_63_1}, {57, 7, t_rldicl_57_7}, {32, 32, t_rldicl_32_32},
+  {1, 63, t_rldicl_1_63}, {5, 3, t_rldicl_5_3}, {17, 40, t_rldicl_17_40}, {63, 0, t_rldicl_63_0}};
+static const struct { int sh, me; uint64_t (*f)(uint64_t); } rldr[] = {
+  {0, 63, t_rldicr_0_63}, {1, 62, t_rldicr_1_62}, {7, 56, t_rldicr_7_56}, {32, 31, t_rldicr_32_31},
+  {63, 0, t_rldicr_63_0}, {5, 3, t_rldicr_5_3}, {40, 17, t_rldicr_40_17}, {0, 0, t_rldicr_0_0}};
+
+#define ORI(UI) static uint64_t t_ori_##UI(uint64_t a) { uint64_t r; \
+  __asm__ volatile("ori %0,%1," #UI : "=r"(r) : "r"(a)); return r; } \
+  static uint64_t t_oris_##UI(uint64_t a) { uint64_t r; \
+  __asm__ volatile("oris %0,%1," #UI : "=r"(r) : "r"(a)); return r; }
+ORI(0) ORI(1) ORI(32768) ORI(65535) ORI(4660)
+static const struct { int ui; uint64_t (*f)(uint64_t); uint64_t (*g)(uint64_t); } oris[] = {
+  {0, t_ori_0, t_oris_0}, {1, t_ori_1, t_oris_1}, {32768, t_ori_32768, t_oris_32768},
+  {65535, t_ori_65535, t_oris_65535}, {4660, t_ori_4660, t_oris_4660}};
+
+#define LDD(DS) static uint64_t t_ld_##DS(const uint8_t *p) { uint64_t r; \
+  __asm__ volatile("ld %0," #DS "(%1)" : "=r"(r) : "b"(p) : "memory"); return r; } \
+  static void t_std_##DS(uint8_t *p, uint64_t v) { \
+  __asm__ volatile("std %1," #DS "(%0)" : : "b"(p), "r"(v) : "memory"); }
+LDD(0) LDD(4) LDD(8) LDD(12) LDD(16)
+static const struct { int ds; uint64_t (*ld)(const uint8_t *); void (*st)(uint8_t *, uint64_t); } lds[] = {
+  {0, t_ld_0, t_std_0}, {4, t_ld_4, t_std_4}, {8, t_ld_8, t_std_8}, {12, t_ld_12, t_std_12},
+  {16, t_ld_16, t_std_16}};
+
+static void scalar_tests(int i) {
+  uint64_t a = rnd(), b = rnd();
+  if (i % 8 == 0) b = ~a;                     // carries propagate / borrow boundaries
+  if (i % 8 == 1) b = a;
+  if (i % 16 == 2) a = 0;
+  if (i % 16 == 3) b = 0xffffffffffffffffULL;
+  static const char *nm[] = {"add", "subf", "mulld", "mulhdu", "and", "or", "xor"};
+  uint64_t (*const fs[])(uint64_t, uint64_t) = {t_add, t_subf, t_mulld, t_mulhdu, t_and, t_or, t_xor};
+  for (int k = 0; k < 7; k++)
+    printf("%s %016llx %016llx %016llx\n", nm[k], (unsigned long long)a, (unsigned long long)b,
+           (unsigned long long)fs[k](a, b));
+  static const char *cn[] = {"addc", "adde", "subfc", "subfe"};
+  uint64_t (*const cs[])(uint64_t, uint64_t, int, int *) = {t_addc, t_adde, t_subfc, t_subfe};
+  for (int k = 0; k < 4; k++) {
+    int cin = (int)(rnd() & 1), cout;
+    uint64_t r = cs[k](a, b, cin, &cout);
+    printf("%s %016llx %016llx %d %016llx %d\n", cn[k], (unsigned long long)a, (unsigned long long)b,
+           cin, (unsigned long long)r, cout);
+  }
+  int k = i % 8;
+  printf("rldicl %d %d %016llx %016llx\n", rldl[k].sh, rldl[k].mb, (unsigned long long)a,
+         (unsigned long long)rldl[k].f(a));
+  printf("rldicr %d %d %016llx %016llx\n", rldr[k].sh, rldr[k].me, (unsigned long long)a,
+         (unsigned long long)rldr[k].f(a));
+  k = i % 5;
+  printf("ori %d %016llx %016llx\n", oris[k].ui, (unsigned long long)a, (unsigned long long)oris[k].f(a));
+  printf("oris %d %016llx %016llx\n", oris[k].ui, (unsigned long long)a, (unsigned long long)oris[k].g(a));
+  // loads: 32 random bytes, RA = &buf[o] (unaligned), displacement / index
+  uint8_t buf[32];
+  for (int j = 0; j < 32; j++) buf[j] = (uint8_t)rnd();
+  int o = (int)(rnd() % 8), ds = lds[i % 5].ds;
+  printf("ld %d %d", o, ds); pbytes(buf, 32);
+  printf(" %016llx\n", (unsigned long long)lds[i % 5].ld(buf + o));
+  uint64_t r1, r2;
+  int x = (int)(rnd() % 24);
+  __asm__ volatile("ldx %0,%1,%2" : "=r"(r1) : "b"(buf), "r"((uint64_t)x) : "memory");
+  __asm__ volatile("ldbrx %0,%1,%2" : "=r"(r2) : "b"(buf), "r"((uint64_t)x) : "memory");
+  printf("ldx %d", x); pbytes(buf, 32); printf(" %016llx\n", (unsigned long long)r1);
+  printf("ldbrx %d", x); pbytes(buf, 32); printf(" %016llx\n", (unsigned long long)r2);
+  // stores into a zeroed buffer
+  memset(buf, 0, 32);
+  lds[i % 5].st(buf + o, a);
+  printf("std %d %d %016llx", o, ds, (unsigned long long)a); pbytes(buf, 32); printf("\n");
+  memset(buf, 0, 32);
+  __asm__ volatile("stdx %0,%1,%2" : : "r"(b), "b"(buf), "r"((uint64_t)x) : "memory");
+  printf("stdx %d %016llx", x, (unsigned long long)b); pbytes(buf, 32); printf("\n");
+}
+
 int main(void) {
   static const char *three[] = {"vadduwm", "vxor", "vor", "vsel", "vperm", "vmrghw"};
   static void (*const f3[])(const vec *, const vec *, const vec *, vec *) = {
@@ -164,6 +269,7 @@ int main(void) {
       __asm__ volatile("neg %0,%1" : "=r"(r) : "r"(x));
       printf("neg %016llx %016llx\n", (unsigned long long)x, (unsigned long long)r);
     }
+    scalar_tests(i);
   }
   return 0;
 }

@@ -41,10 +41,13 @@ the register), the word at `EA + 4` into `word[1]`, and so on.
   instruction touches; the link register `LR`; the `LT`, `GT` and `EQ` bits of
   CR field 0; CR fields 1–7; memory; the permitted memory regions; and the
   (link-time) addresses of the data labels of the program.
-* Each CR0 bit is an `Option Bool`; `none` means "unknown".  Reading an
-  unknown bit faults, so verified code never depends on one.  `CR0.SO` (a copy
-  of `XER.SO`) and `XER` are not modelled: no modelled instruction reads them,
-  and the only modelled writer of `CR0.SO` is `cmpli`.
+* Each CR0 bit, and the carry bit `XER.CA`, is an `Option Bool`; `none`
+  means "unknown".  Reading an unknown bit faults, so verified code never
+  depends on one.  `CR0.SO` (a copy of `XER.SO`) and the rest of `XER`
+  (`SO`, `OV`, `OV32`, `CA32`) are not modelled: no modelled instruction reads
+  them, and the only modelled writer of `CR0.SO` is `cmpli`.  (The modelled
+  carrying instructions are the non-`o`, non-record forms, which write only
+  `CA` (and, on ISA 3.0, `CA32`).)
 * VSX instructions (`lxvw4x`, `stxvw4x`, `xxpermdi`) are only modelled with
   operands `VSR32`–`VSR63`, i.e. the vector registers `VR0`–`VR31`; the
   printer emits the VSR number `32 + n` for `VRn`.
@@ -55,9 +58,13 @@ the register), the word at `EA + 4` into `word[1]`, and so on.
   `stxvw4x` permit arbitrary alignment.
 * The block function counts its blocks up from `-n` to 0 (`neg` once, then
   `addi r5,r5,1`), so only non-negative `addi` immediates are used.
+* 64-bit scalar loads and stores check all 8 bytes against the regions;
+  alignment is not modelled (`ld`, `std`, `ldx`, `stdx` and `ldbrx` permit
+  unaligned accesses to normal memory in problem state).
 * Immediate operands are unrestricted numbers in the model; the assembler
   rejects any that are not encodable (e.g. `SH > 15` for `vsldoi`, a `SIX`
-  field wider than 4 bits, `SI` outside `[-2^15, 2^15)`), so the emitted code
+  field wider than 4 bits, `SI` outside `[-2^15, 2^15)`, a `DS`-form
+displacement that is not a multiple of 4 below `2^15`, `UI ≥ 2^16`), so the emitted code
   is exactly the modelled code.
 * `adr rt, label` is a *pseudo-instruction* (the one trusted multi-instruction
   macro, see `Ppc/Print.lean`): it expands to the position-independent
@@ -325,6 +332,8 @@ structure State where
   eq : Option Bool
   /-- CR fields 1–7 (CR1 most significant); no modelled instruction writes them. -/
   cr1to7 : BitVec 28
+  /-- The carry bit `XER.CA`. -/
+  ca : Option Bool
   mem : Mem
   /-- Regions the code may read (in addition to `wr`). -/
   rd : List Region
@@ -364,6 +373,47 @@ inductive Instr
   | cmpldi (ra : GReg) (ui : Nat)
   /-- The address of a data label (pseudo-instruction, see the module doc). -/
   | adr (rt : GReg) (label : String)
+  -- 64-bit scalar integer instructions (non-`o`, non-record forms)
+  /-- `add RT,RA,RB` -/
+  | add (rt ra rb : GReg)
+  /-- `subf RT,RA,RB` (`RB - RA`) -/
+  | subf (rt ra rb : GReg)
+  /-- `addc RT,RA,RB` (sets `CA`) -/
+  | addc (rt ra rb : GReg)
+  /-- `adde RT,RA,RB` (reads and sets `CA`) -/
+  | adde (rt ra rb : GReg)
+  /-- `subfc RT,RA,RB` (`RB - RA`; sets `CA`) -/
+  | subfc (rt ra rb : GReg)
+  /-- `subfe RT,RA,RB` (`¬RA + RB + CA`; reads and sets `CA`) -/
+  | subfe (rt ra rb : GReg)
+  /-- `mulld RT,RA,RB` -/
+  | mulld (rt ra rb : GReg)
+  /-- `mulhdu RT,RA,RB` -/
+  | mulhdu (rt ra rb : GReg)
+  /-- `and RA,RS,RB` -/
+  | and (ra rs rb : GReg)
+  /-- `or RA,RS,RB` (`mr RA,RS` when `RB = RS`) -/
+  | or (ra rs rb : GReg)
+  /-- `xor RA,RS,RB` -/
+  | xor (ra rs rb : GReg)
+  /-- `rldicl RA,RS,SH,MB` (`srdi RA,RS,n` is `rldicl RA,RS,64-n,n`) -/
+  | rldicl (ra rs : GReg) (sh mb : Nat)
+  /-- `rldicr RA,RS,SH,ME` (`sldi RA,RS,n` is `rldicr RA,RS,n,63-n`) -/
+  | rldicr (ra rs : GReg) (sh me : Nat)
+  /-- `ori RA,RS,UI` -/
+  | ori (ra rs : GReg) (ui : Nat)
+  /-- `oris RA,RS,UI` -/
+  | oris (ra rs : GReg) (ui : Nat)
+  /-- `ld RT,DS(RA)`, with `ds` the byte displacement (a multiple of 4) -/
+  | ld (rt ra : GReg) (ds : Nat)
+  /-- `std RS,DS(RA)`, with `ds` the byte displacement (a multiple of 4) -/
+  | std (rs ra : GReg) (ds : Nat)
+  /-- `ldx RT,RA,RB` -/
+  | ldx (rt ra rb : GReg)
+  /-- `stdx RS,RA,RB` -/
+  | stdx (rs ra rb : GReg)
+  /-- `ldbrx RT,RA,RB` (Load Doubleword Byte-Reverse Indexed) -/
+  | ldbrx (rt ra rb : GReg)
   deriving DecidableEq, Repr
 
 /-- Branch conditions on CR0 (`bc 12,2,target` = `beq`, `bc 4,2,target` = `bne`). -/
@@ -387,7 +437,40 @@ def raOr0 (s : State) (ra : GReg) : BitVec 64 :=
 /-- The effective address of an X-form access: `EA ← (RA|0) + (RB)`. -/
 def ea (s : State) (ra rb : GReg) : Addr := s.raOr0 ra + s.getG rb
 
+/-- `MEM(EA, 8)`, faulting outside the readable regions. -/
+def load64 (s : State) (a : Addr) : Option (BitVec 64) :=
+  if InRegions (s.rd ++ s.wr) a 8 then some (s.mem.readW a 64) else none
+
+/-- `MEM(EA, 8) ← v`, faulting outside the writable regions. -/
+def store64 (s : State) (a : Addr) (v : BitVec 64) : Option State :=
+  if InRegions s.wr a 8 then some { s with mem := s.mem.writeW a v } else none
+
+/-- Write `RT` and `CA`. -/
+def setGCA (s : State) (r : GReg) (p : BitVec 64 × Bool) : State :=
+  { s.setG r p.1 with ca := some p.2 }
+
 end State
+
+/-- The 64-bit sum `x + y + c` and its carry out of bit 0 (the `CA` of the
+carrying add/subtract-from instructions in 64-bit mode). -/
+def addCarry (x y : BitVec 64) (c : Bool) : BitVec 64 × Bool :=
+  let sum := x.toNat + y.toNat + c.toNat
+  (BitVec.ofNat 64 sum, Nat.ble (2 ^ 64) sum)
+
+/-- `ROTL64(x, n)` -/
+def rotl64 (x : BitVec 64) (n : Nat) : BitVec 64 := x.rotateLeft n
+
+/-- `MASK(mb, 63)`: ones in ISA bits `mb … 63` (the `64 - mb` least significant bits). -/
+def maskFrom (mb : Nat) : BitVec 64 := BitVec.allOnes 64 >>> mb
+
+/-- `MASK(0, me)`: ones in ISA bits `0 … me` (the `me + 1` most significant bits). -/
+def maskTo (me : Nat) : BitVec 64 := BitVec.allOnes 64 <<< (63 - me)
+
+/-- `ldbrx`: `RT ← load_data[56:63] || load_data[48:55] || … || load_data[0:7]`,
+i.e. the eight bytes of the (little-endian) doubleword in reverse order. -/
+def revBytes64 (x : BitVec 64) : BitVec 64 :=
+  x.extractLsb' 0 8 ++ x.extractLsb' 8 8 ++ x.extractLsb' 16 8 ++ x.extractLsb' 24 8 ++
+    x.extractLsb' 32 8 ++ x.extractLsb' 40 8 ++ x.extractLsb' 48 8 ++ x.extractLsb' 56 8
 
 /-- Instruction semantics. -/
 def exec (i : Instr) (s : State) : Option State :=
@@ -435,11 +518,55 @@ def exec (i : Instr) (s : State) : Option State :=
     match rt with
     | .r0 | .r1 => none
     | _ => some ((s.setG .r0 s.lr).setG rt (s.labels l))
+  -- RT ← (RA) + (RB)
+  | .add rt ra rb => some (s.setG rt (s.getG ra + s.getG rb))
+  -- RT ← ¬(RA) + (RB) + 1
+  | .subf rt ra rb => some (s.setG rt (~~~(s.getG ra) + s.getG rb + 1))
+  -- RT ← (RA) + (RB); CA ← carry
+  | .addc rt ra rb => some (s.setGCA rt (addCarry (s.getG ra) (s.getG rb) false))
+  -- RT ← (RA) + (RB) + CA; CA ← carry
+  | .adde rt ra rb => s.ca.map fun c => s.setGCA rt (addCarry (s.getG ra) (s.getG rb) c)
+  -- RT ← ¬(RA) + (RB) + 1; CA ← carry
+  | .subfc rt ra rb => some (s.setGCA rt (addCarry (~~~(s.getG ra)) (s.getG rb) true))
+  -- RT ← ¬(RA) + (RB) + CA; CA ← carry
+  | .subfe rt ra rb => s.ca.map fun c => s.setGCA rt (addCarry (~~~(s.getG ra)) (s.getG rb) c)
+  -- prod[0:127] ← (RA) × (RB); RT ← prod[64:127]   (the low 64 bits)
+  | .mulld rt ra rb => some (s.setG rt (BitVec.ofNat 64 ((s.getG ra).toNat * (s.getG rb).toNat)))
+  -- prod[0:127] ← (RA) ×ᵤ (RB); RT ← prod[0:63]   (the high 64 bits)
+  | .mulhdu rt ra rb =>
+    some (s.setG rt (BitVec.ofNat 64 ((s.getG ra).toNat * (s.getG rb).toNat / 2 ^ 64)))
+  -- RA ← (RS) & (RB), (RS) | (RB), (RS) ⊕ (RB)
+  | .and ra rs rb => some (s.setG ra (s.getG rs &&& s.getG rb))
+  | .or ra rs rb => some (s.setG ra (s.getG rs ||| s.getG rb))
+  | .xor ra rs rb => some (s.setG ra (s.getG rs ^^^ s.getG rb))
+  -- n ← sh; r ← ROTL64((RS), n); m ← MASK(mb, 63); RA ← r & m
+  | .rldicl ra rs sh mb =>
+    if sh < 64 ∧ mb < 64 then some (s.setG ra (rotl64 (s.getG rs) sh &&& maskFrom mb)) else none
+  -- n ← sh; r ← ROTL64((RS), n); m ← MASK(0, me); RA ← r & m
+  | .rldicr ra rs sh me =>
+    if sh < 64 ∧ me < 64 then some (s.setG ra (rotl64 (s.getG rs) sh &&& maskTo me)) else none
+  -- RA ← (RS) | (48 0 || UI)
+  | .ori ra rs ui => some (s.setG ra (s.getG rs ||| BitVec.ofNat 64 (ui % 2 ^ 16)))
+  -- RA ← (RS) | (32 0 || UI || 16 0)
+  | .oris ra rs ui => some (s.setG ra (s.getG rs ||| BitVec.ofNat 64 (ui % 2 ^ 16 * 2 ^ 16)))
+  -- EA ← (RA|0) + EXTS(DS || 0b00); RT ← MEM(EA, 8)
+  | .ld rt ra ds => (s.load64 (s.raOr0 ra + BitVec.ofNat 64 ds)).map fun x => s.setG rt x
+  -- EA ← (RA|0) + EXTS(DS || 0b00); MEM(EA, 8) ← (RS)
+  | .std rx ra ds => s.store64 (s.raOr0 ra + BitVec.ofNat 64 ds) (s.getG rx)
+  -- EA ← (RA|0) + (RB); RT ← MEM(EA, 8)
+  | .ldx rt ra rb => (s.load64 (s.ea ra rb)).map fun x => s.setG rt x
+  -- EA ← (RA|0) + (RB); MEM(EA, 8) ← (RS)
+  | .stdx rx ra rb => s.store64 (s.ea ra rb) (s.getG rx)
+  -- EA ← (RA|0) + (RB); load_data ← MEM(EA, 8);
+  -- RT ← load_data[56:63] || load_data[48:55] || … || load_data[0:7]
+  | .ldbrx rt ra rb => (s.load64 (s.ea ra rb)).map fun x => s.setG rt (revBytes64 x)
 
 /-- The memory addresses accessed by an instruction. -/
 def addrs (i : Instr) (s : State) : List Addr :=
   match i with
   | .lxvw4x _ ra rb | .stxvw4x _ ra rb => [s.ea ra rb]
+  | .ld _ ra ds | .std _ ra ds => [s.raOr0 ra + BitVec.ofNat 64 ds]
+  | .ldx _ ra rb | .stdx _ ra rb | .ldbrx _ ra rb => [s.ea ra rb]
   | _ => []
 
 /-- `bc 12,2` (branch if `CR0.EQ` = 1) and `bc 4,2` (branch if `CR0.EQ` = 0). -/

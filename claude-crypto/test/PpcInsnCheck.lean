@@ -22,7 +22,7 @@ def hexBytes (s : String) : List (BitVec 8) :=
 def s0 : State :=
   { g := GRegs.mk 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0,
     v := VRegs.mk 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0,
-    vsr := fun _ => 0, lr := 0, lt := none, gt := none, eq := none, cr1to7 := 0,
+    vsr := fun _ => 0, lr := 0, lt := none, gt := none, eq := none, cr1to7 := 0, ca := none,
     mem := fun _ => 0, rd := [], wr := [], labels := fun _ => 0 }
 
 def v (s : String) : BitVec 128 := BitVec.ofNat 128 (hexVal s)
@@ -37,6 +37,25 @@ def base : Addr := 0x10000
 def memOf (bs : List (BitVec 8)) : Mem := fun a =>
   let k := (a - base).toNat
   if k < bs.length then bs[k]! else 0
+
+def w64 (s : String) : BitVec 64 := BitVec.ofNat 64 (hexVal s)
+
+/-- `r3 := a op b` via `op r3,r4,r5`. -/
+def rrr (i : Instr) (a b r : String) : Bool :=
+  ((exec i ((s0.setG .r4 (w64 a)).setG .r5 (w64 b))).map (·.getG .r3)) == some (w64 r)
+
+/-- Carrying instructions: result and `CA`. -/
+def rrc (i : Instr) (a b cin r cout : String) : Bool :=
+  match exec i { ((s0.setG .r4 (w64 a)).setG .r5 (w64 b)) with ca := some (cin == "1") } with
+  | some s => s.getG .r3 == w64 r && s.ca == some (cout == "1")
+  | none => false
+
+/-- A state with 32 bytes at `base`, readable and writable, and `r4 = base + o`, `r5 = x`. -/
+def memSt (bytes : String) (o x : Nat) : State :=
+  { ((s0.setG .r4 (base + BitVec.ofNat 64 o)).setG .r5 (BitVec.ofNat 64 x)) with
+    mem := memOf (hexBytes bytes), wr := [⟨base, 32⟩] }
+
+def bytesAt (s : State) : List (BitVec 8) := (List.range 32).map fun i => s.mem (base + BitVec.ofNat 64 i)
 
 def check (line : String) : Bool :=
   let three (i : Instr) (a b c d : String) : Bool :=
@@ -77,6 +96,47 @@ def check (line : String) : Bool :=
   | ["neg", x, r] =>
     ((exec (.neg .r3 .r9) (s0.setG .r9 (BitVec.ofNat 64 (hexVal x)))).map (·.getG .r3)) ==
       some (BitVec.ofNat 64 (hexVal r))
+  | [op, a, b, r] =>
+    match op with
+    | "add" => rrr (.add .r3 .r4 .r5) a b r
+    | "subf" => rrr (.subf .r3 .r4 .r5) a b r
+    | "mulld" => rrr (.mulld .r3 .r4 .r5) a b r
+    | "mulhdu" => rrr (.mulhdu .r3 .r4 .r5) a b r
+    | "and" => rrr (.and .r3 .r4 .r5) a b r
+    | "or" => rrr (.or .r3 .r4 .r5) a b r
+    | "xor" => rrr (.xor .r3 .r4 .r5) a b r
+    | "ori" => ((exec (.ori .r3 .r4 a.toNat!) (s0.setG .r4 (w64 b))).map (·.getG .r3)) == some (w64 r)
+    | "oris" => ((exec (.oris .r3 .r4 a.toNat!) (s0.setG .r4 (w64 b))).map (·.getG .r3)) == some (w64 r)
+    | "ldx" | "ldbrx" =>
+      -- `ldx r3,r4,r5` with r4 = base, r5 = index
+      let i : Instr := if op == "ldx" then .ldx .r3 .r4 .r5 else .ldbrx .r3 .r4 .r5
+      ((exec i (memSt b 0 a.toNat!)).map (·.getG .r3)) == some (w64 r)
+    | "stdx" =>
+      -- `stdx r6,r4,r5` with r4 = base, r5 = index, into a zeroed buffer
+      match exec (.stdx .r6 .r4 .r5) ((memSt (String.ofList (List.replicate 64 '0')) 0 a.toNat!).setG .r6 (w64 b)) with
+      | some s => bytesAt s == hexBytes r
+      | none => false
+    | _ => false
+  | [op, a, b, cin, r, cout] =>
+    match op with
+    | "addc" => rrc (.addc .r3 .r4 .r5) a b cin r cout
+    | "adde" => rrc (.adde .r3 .r4 .r5) a b cin r cout
+    | "subfc" => rrc (.subfc .r3 .r4 .r5) a b cin r cout
+    | "subfe" => rrc (.subfe .r3 .r4 .r5) a b cin r cout
+    | _ => false
+  | [op, x, y, a, r] =>
+    match op with
+    | "rldicl" => ((exec (.rldicl .r3 .r4 x.toNat! y.toNat!) (s0.setG .r4 (w64 a))).map (·.getG .r3)) == some (w64 r)
+    | "rldicr" => ((exec (.rldicr .r3 .r4 x.toNat! y.toNat!) (s0.setG .r4 (w64 a))).map (·.getG .r3)) == some (w64 r)
+    | "ld" =>
+      -- `ld r3,ds(r4)` with r4 = base + o
+      ((exec (.ld .r3 .r4 y.toNat!) (memSt a x.toNat! 0)).map (·.getG .r3)) == some (w64 r)
+    | "std" =>
+      -- `std r6,ds(r4)` with r4 = base + o, into a zeroed buffer
+      match exec (.std .r6 .r4 y.toNat!) ((memSt (String.ofList (List.replicate 64 '0')) x.toNat! 0).setG .r6 (w64 a)) with
+      | some s => bytesAt s == hexBytes r
+      | none => false
+    | _ => false
   | _ => false
 
 def main (args : List String) : IO UInt32 := do
