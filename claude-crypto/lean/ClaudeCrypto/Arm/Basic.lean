@@ -8,8 +8,8 @@ used by our implementations.  This file is part of the trusted computing
 base: each instruction's semantics here must agree with the *Arm
 Architecture Reference Manual for A-profile* (Arm ARM, DDI 0487).  The
 pseudocode functions of the Arm ARM that we transcribe are named in the
-comments.  (The semantics of the vector/crypto instructions and of `subs` are
-additionally cross-checked against QEMU by `test/arm_insn_test.c` +
+comments.  (The semantics of the vector/crypto instructions and of the scalar
+integer instructions (including their flags) are additionally cross-checked against QEMU by `test/arm_insn_test.c` +
 `test/ArmInsnCheck.lean`, and the complete generated function by the
 differential tests in `test/`; see `test/run_aarch64.sh`.)
 
@@ -317,6 +317,16 @@ structure State where
 inductive Arr | b16 | s4
   deriving DecidableEq, Repr
 
+/-- Branch conditions: `b.<cond>` on the flags, and compare-and-branch.  The
+flag conditions are also the `cond` operand of `csetm`. -/
+inductive Cond
+  | eq | ne | hs | lo | hi | ls
+  /-- `CBZ Xt, label` -/
+  | cbz (t : XReg)
+  /-- `CBNZ Xt, label` -/
+  | cbnz (t : XReg)
+  deriving DecidableEq, Repr
+
 inductive Instr
   /-- `LDR Qt, [Xn, #off]` (unsigned offset) -/
   | ldrq (t : VReg) (n : XReg) (off : Nat)
@@ -351,15 +361,50 @@ inductive Instr
   | subsi (d n : XReg) (imm : Nat)
   /-- `MOV Xd, Xn` (alias of `ORR Xd, XZR, Xn`) -/
   | mov (d n : XReg)
-  deriving DecidableEq, Repr
-
-/-- Branch conditions: `b.<cond>` on the flags, and compare-and-branch. -/
-inductive Cond
-  | eq | ne | hs | lo | hi | ls
-  /-- `CBZ Xt, label` -/
-  | cbz (t : XReg)
-  /-- `CBNZ Xt, label` -/
-  | cbnz (t : XReg)
+  -- Scalar integer instructions (all 64-bit, `sf = 1`).
+  /-- `ADD Xd, Xn, Xm` (shifted register, `LSL #0`) -/
+  | addr (d n m : XReg)
+  /-- `SUB Xd, Xn, Xm` (shifted register, `LSL #0`) -/
+  | subr (d n m : XReg)
+  /-- `ADDS Xd, Xn, Xm` (shifted register, `LSL #0`; sets NZCV) -/
+  | adds (d n m : XReg)
+  /-- `ADCS Xd, Xn, Xm` (sets NZCV) -/
+  | adcs (d n m : XReg)
+  /-- `SUBS Xd, Xn, Xm` (shifted register, `LSL #0`; sets NZCV) -/
+  | subs (d n m : XReg)
+  /-- `SBCS Xd, Xn, Xm` (sets NZCV) -/
+  | sbcs (d n m : XReg)
+  /-- `MUL Xd, Xn, Xm` (alias of `MADD Xd, Xn, Xm, XZR`) -/
+  | mul (d n m : XReg)
+  /-- `UMULH Xd, Xn, Xm` -/
+  | umulh (d n m : XReg)
+  /-- `AND Xd, Xn, Xm` (shifted register, `LSL #0`; flags unchanged) -/
+  | and (d n m : XReg)
+  /-- `ORR Xd, Xn, Xm` (shifted register, `LSL #0`) -/
+  | orr (d n m : XReg)
+  /-- `EOR Xd, Xn, Xm` (shifted register, `LSL #0`) -/
+  | eor (d n m : XReg)
+  /-- `LSL Xd, Xn, #sh` (alias of `UBFM Xd, Xn, #(-sh MOD 64), #(63-sh)`; `sh < 64`) -/
+  | lsl (d n : XReg) (sh : Nat)
+  /-- `LSR Xd, Xn, #sh` (alias of `UBFM Xd, Xn, #sh, #63`; `sh < 64`) -/
+  | lsr (d n : XReg) (sh : Nat)
+  /-- `REV Xd, Xn` (reverse the eight bytes) -/
+  | rev (d n : XReg)
+  /-- `MOVZ Xd, #imm, LSL #(16 * hw)` (`hw < 4`) -/
+  | movz (d : XReg) (imm : BitVec 16) (hw : Nat)
+  /-- `MOVK Xd, #imm, LSL #(16 * hw)` (`hw < 4`) -/
+  | movk (d : XReg) (imm : BitVec 16) (hw : Nat)
+  /-- `CSETM Xd, cond` (alias of `CSINV Xd, XZR, XZR, invert(cond)`); `cond` must be one
+  of the flag conditions -/
+  | csetm (d : XReg) (c : Cond)
+  /-- `LDR Xt, [Xn, #off]` (64-bit, unsigned offset: `off` a multiple of 8 below 32768) -/
+  | ldr (t n : XReg) (off : Nat)
+  /-- `LDR Xt, [Xn, Xm]` (64-bit, register offset, `LSL #0`) -/
+  | ldrr (t n m : XReg)
+  /-- `STR Xt, [Xn, #off]` (64-bit, unsigned offset) -/
+  | str (t n : XReg) (off : Nat)
+  /-- `STR Xt, [Xn, Xm]` (64-bit, register offset, `LSL #0`) -/
+  | strr (t n m : XReg)
   deriving DecidableEq, Repr
 
 namespace State
@@ -407,6 +452,45 @@ def addWithCarry (x y : BitVec 64) (carry : Bool) : BitVec 64 × Bool × Bool ×
   let r := BitVec.ofNat 64 usum
   (r, r.msb, r == 0, Nat.ble (2 ^ 64) usum, x.msb == y.msb && r.msb != x.msb)
 
+/-- `ConditionHolds(cond)` for the flag conditions (`none` if a flag it reads is
+undefined):
+```
+case cond<3:1> of
+    when '000' result = (PSTATE.Z == '1');                          // EQ or NE
+    when '001' result = (PSTATE.C == '1');                          // CS or CC
+    when '100' result = (PSTATE.C == '1' && PSTATE.Z == '0');       // HI or LS
+if cond<0> == '1' && cond != '1111' then result = !result;
+```
+Compare-and-branch "conditions" are not condition codes: `none`. -/
+def condHolds (c : Cond) (s : State) : Option Bool :=
+  match c with
+  | .eq => s.zf
+  | .ne => s.zf.map (!·)
+  | .hs => s.cf
+  | .lo => s.cf.map (!·)
+  | .hi => do let c ← s.cf; let z ← s.zf; pure (c && !z)
+  | .ls => do let c ← s.cf; let z ← s.zf; pure (!c || z)
+  | .cbz _ | .cbnz _ => none
+
+/-- `REV Xd, Xn` with `datasize = container_size = 64`:
+```
+for e = 0 to 7
+    result<rev_index+7:rev_index> = operand<index+7:index>;   // rev_index = 56 - index
+```
+i.e. byte `e` of the operand becomes byte `7 - e` of the result. -/
+def revBytes64 (x : BitVec 64) : BitVec 64 :=
+  x.extractLsb' 0 8 ++ x.extractLsb' 8 8 ++ x.extractLsb' 16 8 ++ x.extractLsb' 24 8 ++
+    x.extractLsb' 32 8 ++ x.extractLsb' 40 8 ++ x.extractLsb' 48 8 ++ x.extractLsb' 56 8
+
+/-- `MOVK`: `result = X[d]; result<pos+15:pos> = imm16;` with `pos = 16 * hw`. -/
+def movkVal (x : BitVec 64) (imm : BitVec 16) (pos : Nat) : BitVec 64 :=
+  (x &&& ~~~(BitVec.ofNat 64 0xFFFF <<< pos)) ||| (imm.setWidth 64 <<< pos)
+
+/-- The flag-setting data-processing instructions: write the result of
+`AddWithCarry` to `Xd` and its `nzcv` to `PSTATE.<N,Z,C,V>`. -/
+def State.setNZCV (s : State) (d : XReg) (r : BitVec 64 × Bool × Bool × Bool × Bool) : State :=
+  { s with nf := some r.2.1, zf := some r.2.2.1, cf := some r.2.2.2.1, vf := some r.2.2.2.2 }.setX d r.1
+
 /-- Instruction semantics. -/
 def exec (i : Instr) (s : State) : Option State :=
   match i with
@@ -436,11 +520,51 @@ def exec (i : Instr) (s : State) : Option State :=
     some ({ s with nf := some r.2.1, zf := some r.2.2.1, cf := some r.2.2.2.1,
                    vf := some r.2.2.2.2 }.setX d r.1)
   | .mov d n => some (s.setX d (s.getX n))
+  -- `ADD`/`SUB` (shifted register), with `shift_amount = 0`:
+  -- `result = AddWithCarry(operand1, operand2, '0')` resp.
+  -- `AddWithCarry(operand1, NOT(operand2), '1')`; the result only (flags unchanged)
+  | .addr d n m => some (s.setX d (s.getX n + s.getX m))
+  | .subr d n m => some (s.setX d (s.getX n - s.getX m))
+  -- `(result, nzcv) = AddWithCarry(operand1, operand2, '0')`
+  | .adds d n m => some (s.setNZCV d (addWithCarry (s.getX n) (s.getX m) false))
+  -- `(result, nzcv) = AddWithCarry(operand1, operand2, PSTATE.C)`
+  | .adcs d n m => s.cf.map fun c => s.setNZCV d (addWithCarry (s.getX n) (s.getX m) c)
+  -- `operand2 = NOT(operand2); (result, nzcv) = AddWithCarry(operand1, operand2, '1')`
+  | .subs d n m => some (s.setNZCV d (addWithCarry (s.getX n) (~~~(s.getX m)) true))
+  -- `operand2 = NOT(operand2); (result, nzcv) = AddWithCarry(operand1, operand2, PSTATE.C)`
+  | .sbcs d n m => s.cf.map fun c => s.setNZCV d (addWithCarry (s.getX n) (~~~(s.getX m)) c)
+  -- `MADD`: `result = UInt(operand3) + UInt(operand1) * UInt(operand2); X[d] = result<63:0>`
+  -- with `operand3 = X[31] = Zeros()`
+  | .mul d n m => some (s.setX d (BitVec.ofNat 64 ((s.getX n).toNat * (s.getX m).toNat)))
+  -- `UMULH`: `result = Int(operand1, TRUE) * Int(operand2, TRUE); X[d] = result<127:64>`
+  | .umulh d n m => some (s.setX d (BitVec.ofNat 64 ((s.getX n).toNat * (s.getX m).toNat / 2 ^ 64)))
+  -- logical (shifted register), `shift_amount = 0`, no flags (`AND`, not `ANDS`)
+  | .and d n m => some (s.setX d (s.getX n &&& s.getX m))
+  | .orr d n m => some (s.setX d (s.getX n ||| s.getX m))
+  | .eor d n m => some (s.setX d (s.getX n ^^^ s.getX m))
+  -- `LSL`/`LSR` (immediate) are `UBFM` aliases computing `LSL(X[n], sh)` / `LSR(X[n], sh)`
+  | .lsl d n sh => some (s.setX d (s.getX n <<< sh))
+  | .lsr d n sh => some (s.setX d (s.getX n >>> sh))
+  | .rev d n => some (s.setX d (revBytes64 (s.getX n)))
+  -- `MOVZ`: `result = Zeros(); result<pos+15:pos> = imm16;`
+  | .movz d imm hw => some (s.setX d (imm.setWidth 64 <<< (16 * hw)))
+  | .movk d imm hw => some (s.setX d (movkVal (s.getX d) imm (16 * hw)))
+  -- `CSINV Xd, XZR, XZR, invert(cond)`:
+  -- `if ConditionHolds(invert(cond)) then result = X[31] (= Zeros()) else result = NOT(X[31])`
+  | .csetm d c => (condHolds c s).map fun b => s.setX d (if b then BitVec.allOnes 64 else 0)
+  -- `LDR` (immediate/register): `address = X[n] + offset; data = Mem[address, 8]; X[t] = data`
+  | .ldr t n off => (s.loadW 64 (s.getX n + BitVec.ofNat 64 off)).map fun x => s.setX t x
+  | .ldrr t n m => (s.loadW 64 (s.getX n + s.getX m)).map fun x => s.setX t x
+  -- `STR`: `address = X[n] + offset; Mem[address, 8] = X[t]`
+  | .str t n off => s.storeW (s.getX n + BitVec.ofNat 64 off) (s.getX t)
+  | .strr t n m => s.storeW (s.getX n + s.getX m) (s.getX t)
 
 /-- The memory addresses accessed by an instruction. -/
 def addrs (i : Instr) (s : State) : List Addr :=
   match i with
   | .ldrq _ n off | .strq _ n off => [s.getX n + BitVec.ofNat 64 off]
+  | .ldr _ n off | .str _ n off => [s.getX n + BitVec.ofNat 64 off]
+  | .ldrr _ n m | .strr _ n m => [s.getX n + s.getX m]
   | .ld1 ts _ n _ | .st1 ts _ n _ => ldstAddrs (s.getX n) 0 ts
   | _ => []
 

@@ -30,6 +30,42 @@ def flagsNibble (s : State) : Option Nat := do
   let n ← s.nf; let z ← s.zf; let c ← s.cf; let vf ← s.vf
   pure (8 * n.toNat + 4 * z.toNat + 2 * c.toNat + vf.toNat)
 
+/-- Decimal, or hexadecimal with a `0x` prefix. -/
+def num (s : String) : Nat := if s.startsWith "0x" then hexVal (s.drop 2).toString else s.toNat!
+
+def x64 (s : String) : BitVec 64 := BitVec.ofNat 64 (hexVal s)
+
+/-- The state for a scalar test: `x0 = r0` (`0x5555` unless given), `x1 = x`, `x2 = y`,
+flags from the NZCV nibble. -/
+def scalarState (x y : String) (nzcv : Nat) (r0 : BitVec 64 := 0x5555) : State :=
+  { ((s0.setX .x0 r0).setX .x1 (x64 x)).setX .x2 (x64 y) with
+    nf := some (nzcv.testBit 3), zf := some (nzcv.testBit 2), cf := some (nzcv.testBit 1),
+    vf := some (nzcv.testBit 0) }
+
+/-- Run a scalar instruction and compare `x0` and the flags. -/
+def checkScalar (i : Instr) (x y fi r fo : String) (r0 : BitVec 64 := 0x5555) : Bool :=
+  match exec i (scalarState x y fi.toNat! r0) with
+  | some s => s.getX .x0 == x64 r && flagsNibble s == some fo.toNat!
+  | none => false
+
+def condOf : String → Option Cond
+  | "eq" => some .eq | "ne" => some .ne | "hs" => some .hs
+  | "lo" => some .lo | "hi" => some .hi | "ls" => some .ls
+  | _ => none
+
+/-- The 64-byte test buffer, placed at `bufBase`. -/
+def bufBase : Addr := 0x1000
+def bufBytes (hex : String) (k : Nat) : Byte :=
+  BitVec.ofNat 8 (hexVal ((hex.drop (2 * k)).take 2).toString)
+def bufMem (hex : String) : Mem := fun a =>
+  let k := (a - bufBase).toNat
+  if k < 64 then bufBytes hex k else 0
+def bufRegion : Region := ⟨bufBase, 64⟩
+
+/-- The memory after a store agrees with the dump `hex` on the buffer. -/
+def memIs (m : Mem) (hex : String) : Bool :=
+  (List.range 64).all fun k => m (bufBase + BitVec.ofNat 64 k) == bufBytes hex k
+
 def check (line : String) : Bool :=
   match line.splitOn " " with
   | ["sha256h", a, b, c, d] =>
@@ -47,6 +83,48 @@ def check (line : String) : Bool :=
   | ["subs", x, imm, r, f] =>
     match run (.subsi .x0 .x1 imm.toNat!) 0 0 0 (BitVec.ofNat 64 (hexVal x)) with
     | some s => s.getX .x0 == BitVec.ofNat 64 (hexVal r) && flagsNibble s == some f.toNat!
+    | none => false
+  | ["adds", x, y, fi, r, fo] => checkScalar (.adds .x0 .x1 .x2) x y fi r fo
+  | ["adcs", x, y, fi, r, fo] => checkScalar (.adcs .x0 .x1 .x2) x y fi r fo
+  | ["subs", x, y, fi, r, fo] => checkScalar (.subs .x0 .x1 .x2) x y fi r fo
+  | ["sbcs", x, y, fi, r, fo] => checkScalar (.sbcs .x0 .x1 .x2) x y fi r fo
+  | ["addr", x, y, fi, r, fo] => checkScalar (.addr .x0 .x1 .x2) x y fi r fo
+  | ["subr", x, y, fi, r, fo] => checkScalar (.subr .x0 .x1 .x2) x y fi r fo
+  | ["mul", x, y, fi, r, fo] => checkScalar (.mul .x0 .x1 .x2) x y fi r fo
+  | ["umulh", x, y, fi, r, fo] => checkScalar (.umulh .x0 .x1 .x2) x y fi r fo
+  | ["and", x, y, fi, r, fo] => checkScalar (.and .x0 .x1 .x2) x y fi r fo
+  | ["orr", x, y, fi, r, fo] => checkScalar (.orr .x0 .x1 .x2) x y fi r fo
+  | ["eor", x, y, fi, r, fo] => checkScalar (.eor .x0 .x1 .x2) x y fi r fo
+  | ["rev", x, y, fi, r, fo] => checkScalar (.rev .x0 .x1) x y fi r fo
+  | ["csetm", c, x, y, fi, r, fo] =>
+    match condOf c with
+    | some c => checkScalar (.csetm .x0 c) x y fi r fo
+    | none => false
+  | ["lsl", sh, x, y, fi, r, fo] => checkScalar (.lsl .x0 .x1 sh.toNat!) x y fi r fo
+  | ["lsr", sh, x, y, fi, r, fo] => checkScalar (.lsr .x0 .x1 sh.toNat!) x y fi r fo
+  | ["movz", imm, hw, x, y, fi, r, fo] =>
+    checkScalar (.movz .x0 (BitVec.ofNat 16 (num imm)) hw.toNat!) x y fi r fo
+  | ["movk", imm, hw, x, y, fi, r, fo] =>
+    checkScalar (.movk .x0 (BitVec.ofNat 16 (num imm)) hw.toNat!) x y fi r fo (r0 := x64 x)
+  | ["ldr", buf, off, r] =>
+    match exec (.ldr .x0 .x1 off.toNat!) ({ s0 with mem := bufMem buf, rd := [bufRegion] }.setX .x1 bufBase) with
+    | some s => s.getX .x0 == x64 r
+    | none => false
+  | ["ldrr", buf, off, r] =>
+    match exec (.ldrr .x0 .x1 .x2)
+        (({ s0 with mem := bufMem buf, rd := [bufRegion] }.setX .x1 bufBase).setX .x2 (BitVec.ofNat 64 off.toNat!)) with
+    | some s => s.getX .x0 == x64 r
+    | none => false
+  | ["str", buf, off, y, buf2] =>
+    match exec (.str .x2 .x1 off.toNat!)
+        (({ s0 with mem := bufMem buf, wr := [bufRegion] }.setX .x1 bufBase).setX .x2 (x64 y)) with
+    | some s => memIs s.mem buf2
+    | none => false
+  | ["strr", buf, off, y, buf2] =>
+    match exec (.strr .x3 .x1 .x2)
+        ((({ s0 with mem := bufMem buf, wr := [bufRegion] }.setX .x1 bufBase).setX .x2
+          (BitVec.ofNat 64 off.toNat!)).setX .x3 (x64 y)) with
+    | some s => memIs s.mem buf2
     | none => false
   | _ => false
 

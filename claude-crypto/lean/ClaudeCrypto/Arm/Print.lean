@@ -18,6 +18,17 @@ def VReg.arr (r : VReg) (a : String) : String := s!"v{r.idx}.{a}"
 def regList (ts : List VReg) (a : Arr) : String :=
   "{" ++ ", ".intercalate (ts.map (·.arr a.name)) ++ "}"
 
+/-- The condition-code suffix of a flag condition (compare-and-branch has none;
+`csetm` with one faults in the model, see `condHolds`). -/
+def Cond.code : Cond → String
+  | .eq => "eq"
+  | .ne => "ne"
+  | .hs => "hs"
+  | .lo => "lo"
+  | .hi => "hi"
+  | .ls => "ls"
+  | .cbz _ | .cbnz _ => "<invalid>"
+
 def Instr.asm : Instr → List String
   | .ldrq t n off => [s!"ldr q{t.idx}, [{n.name}, #{off}]"]
   | .strq t n off => [s!"str q{t.idx}, [{n.name}, #{off}]"]
@@ -37,17 +48,33 @@ def Instr.asm : Instr → List String
   | .subi d n imm => [s!"sub {d.name}, {n.name}, #{imm}"]
   | .subsi d n imm => [s!"subs {d.name}, {n.name}, #{imm}"]
   | .mov d n => [s!"mov {d.name}, {n.name}"]
+  | .addr d n m => [s!"add {d.name}, {n.name}, {m.name}"]
+  | .subr d n m => [s!"sub {d.name}, {n.name}, {m.name}"]
+  | .adds d n m => [s!"adds {d.name}, {n.name}, {m.name}"]
+  | .adcs d n m => [s!"adcs {d.name}, {n.name}, {m.name}"]
+  | .subs d n m => [s!"subs {d.name}, {n.name}, {m.name}"]
+  | .sbcs d n m => [s!"sbcs {d.name}, {n.name}, {m.name}"]
+  | .mul d n m => [s!"mul {d.name}, {n.name}, {m.name}"]
+  | .umulh d n m => [s!"umulh {d.name}, {n.name}, {m.name}"]
+  | .and d n m => [s!"and {d.name}, {n.name}, {m.name}"]
+  | .orr d n m => [s!"orr {d.name}, {n.name}, {m.name}"]
+  | .eor d n m => [s!"eor {d.name}, {n.name}, {m.name}"]
+  | .lsl d n sh => [s!"lsl {d.name}, {n.name}, #{sh}"]
+  | .lsr d n sh => [s!"lsr {d.name}, {n.name}, #{sh}"]
+  | .rev d n => [s!"rev {d.name}, {n.name}"]
+  | .movz d imm hw => [s!"movz {d.name}, #{imm.toNat}, lsl #{16 * hw}"]
+  | .movk d imm hw => [s!"movk {d.name}, #{imm.toNat}, lsl #{16 * hw}"]
+  | .csetm d c => [s!"csetm {d.name}, {c.code}"]
+  | .ldr t n off => [s!"ldr {t.name}, [{n.name}, #{off}]"]
+  | .ldrr t n m => [s!"ldr {t.name}, [{n.name}, {m.name}]"]
+  | .str t n off => [s!"str {t.name}, [{n.name}, #{off}]"]
+  | .strr t n m => [s!"str {t.name}, [{n.name}, {m.name}]"]
 
 def Cond.branch (c : Cond) (l : String) : String :=
   match c with
-  | .eq => s!"b.eq {l}"
-  | .ne => s!"b.ne {l}"
-  | .hs => s!"b.hs {l}"
-  | .lo => s!"b.lo {l}"
-  | .hi => s!"b.hi {l}"
-  | .ls => s!"b.ls {l}"
   | .cbz t => s!"cbz {t.name}, {l}"
   | .cbnz t => s!"cbnz {t.name}, {l}"
+  | _ => s!"b.{c.code} {l}"
 
 /-- `data` is emitted after the function (in `.text`, so that `adr` reaches it). -/
 def printer (data : List String := []) : Printer isa where

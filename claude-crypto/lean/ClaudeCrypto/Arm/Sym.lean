@@ -21,6 +21,7 @@ macro_rules
     simp only [CC.execBlock, CC.Arm.isa, CC.Arm.exec, CC.Arm.addrs, CC.Arm.ldstAddrs,
       CC.Arm.State.getX, CC.Arm.State.setX, CC.Arm.State.getV, CC.Arm.State.setV,
       CC.Arm.State.loadW, CC.Arm.State.storeW, CC.Arm.State.ld1Regs, CC.Arm.State.st1Regs,
+      CC.Arm.State.setNZCV, CC.Arm.condHolds,
       CC.Arm.XRegs.get, CC.Arm.XRegs.set, CC.Arm.VRegs.get, CC.Arm.VRegs.set,
       Option.map_some, Option.bind_some, Option.map, ite_true, ite_false, reduceIte,
       Bool.true_eq_false, Bool.false_eq_true, List.length_cons, List.length_nil,
