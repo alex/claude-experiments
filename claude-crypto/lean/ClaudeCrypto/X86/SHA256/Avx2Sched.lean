@@ -48,7 +48,7 @@ macro "slice_frame_tac" : tactic => `(tactic| (
 
 theorem slice0_exec (g : Nat) (hg1 : 4 ≤ g) (hg : g < 16) (WA WB : Nat → Word) (s : State)
     (hc : SliceCtx g WA WB s) (h0 : HoldsGroup (s.getV (ymm (g % 4))) WA WB (g - 4)) :
-    ∃ q, execBlock isa (schedSlice g 0) s = some q ∧ SliceFrame g s q.1 ∧
+    ∃ q, execBlock isa (schedSlice g 0) s = some q ∧ SliceFrame g s q.1 ∧ q.1.mem = s.mem ∧
       ∀ i < 8, lane 32 (q.1.getV (ymm (g % 4))) i = part0 WA WB g i := by
   obtain ⟨x1, x2, x3, -, -⟩ := hc
   interval_cases g
@@ -56,7 +56,7 @@ theorem slice0_exec (g : Nat) (hg1 : 4 ≤ g) (hg : g < 16) (WA WB : Nat → Wor
     simp only [schedSlice, ymm, Nat.reduceMod, Nat.reduceAdd, Nat.reduceSub] at x1 x2 x3 h0 ⊢
     simp only [execBlock, isa, exec, Instr.sz, execW, execV, State.getV, State.setV, VRegs.get,
       VRegs.set, readVSrc, Option.map_some, Option.bind_some, addrs, List.map_nil, List.nil_append]
-    refine ⟨_, rfl, by slice_frame_tac, ?_⟩
+    refine ⟨_, rfl, by slice_frame_tac, rfl, ?_⟩
     intro i hi
     simp only [HoldsGroup, State.getV, VRegs.get] at x1 x2 x3 h0
     interval_cases i <;>
@@ -71,7 +71,7 @@ def part1 (WA WB : Nat → Word) (g i : Nat) : Word :=
 theorem slice1_exec (g : Nat) (hg1 : 4 ≤ g) (hg : g < 16) (WA WB : Nat → Word) (hRA : Recur WA) (hRB : Recur WB)
     (s : State) (hc : SliceCtx g WA WB s)
     (h0 : ∀ i < 8, lane 32 (s.getV (ymm (g % 4))) i = part0 WA WB g i) :
-    ∃ q, execBlock isa (schedSlice g 1) s = some q ∧ SliceFrame g s q.1 ∧
+    ∃ q, execBlock isa (schedSlice g 1) s = some q ∧ SliceFrame g s q.1 ∧ q.1.mem = s.mem ∧
       ∀ i < 8, lane 32 (q.1.getV (ymm (g % 4))) i = part1 WA WB g i := by
   obtain ⟨-, -, x3, m10, -⟩ := hc
   interval_cases g
@@ -79,7 +79,7 @@ theorem slice1_exec (g : Nat) (hg1 : 4 ≤ g) (hg : g < 16) (WA WB : Nat → Wor
     simp only [schedSlice, ymm, Nat.reduceMod, Nat.reduceAdd, Nat.reduceSub] at x3 h0 ⊢
     simp only [execBlock, isa, exec, Instr.sz, execW, execV, State.getV, State.setV, VRegs.get,
       VRegs.set, readVSrc, Option.map_some, Option.bind_some, addrs, List.map_nil, List.nil_append]
-    refine ⟨_, rfl, by slice_frame_tac, ?_⟩
+    refine ⟨_, rfl, by slice_frame_tac, rfl, ?_⟩
     intro i hi
     simp only [HoldsGroup, State.getV, VRegs.get] at x3 h0 m10
     rw [m10, lane_vpaddd _ _ _ hi, h0 _ hi]
@@ -101,7 +101,7 @@ theorem slice1_exec (g : Nat) (hg1 : 4 ≤ g) (hg : g < 16) (WA WB : Nat → Wor
 theorem slice2_exec (g : Nat) (hg1 : 4 ≤ g) (hg : g < 16) (WA WB : Nat → Word) (hRA : Recur WA) (hRB : Recur WB)
     (s : State) (m11 : s.getV .y11 = maskV shufDC00)
     (h1 : ∀ i < 8, lane 32 (s.getV (ymm (g % 4))) i = part1 WA WB g i) :
-    ∃ q, execBlock isa (schedSlice g 2) s = some q ∧ SliceFrame g s q.1 ∧
+    ∃ q, execBlock isa (schedSlice g 2) s = some q ∧ SliceFrame g s q.1 ∧ q.1.mem = s.mem ∧
       HoldsGroup (q.1.getV (ymm (g % 4))) WA WB g := by
   have e : ∀ i < 8, lane 32 (s.getV (ymm (g % 4))) i =
       if i % 4 < 2 then sel WA WB i (4 * g + i % 4) else part0 WA WB g i := h1
@@ -115,7 +115,7 @@ theorem slice2_exec (g : Nat) (hg1 : 4 ≤ g) (hg : g < 16) (WA WB : Nat → Wor
       Nat.reduceMul, Nat.reduceLT, Nat.reduceDiv] at e0 e1 e2 e3 e4 e5 e6 e7 ⊢
     simp only [execBlock, isa, exec, Instr.sz, execW, execV, State.getV, State.setV, VRegs.get,
       VRegs.set, readVSrc, Option.map_some, addrs, List.map_nil, List.nil_append]
-    refine ⟨_, rfl, by slice_frame_tac, ?_⟩
+    refine ⟨_, rfl, by slice_frame_tac, rfl, ?_⟩
     intro i hi
     simp only [State.getV, VRegs.get] at e0 e1 e2 e3 e4 e5 e6 e7 m11
     rw [m11]
@@ -136,7 +136,7 @@ theorem slice2_exec (g : Nat) (hg1 : 4 ≤ g) (hg : g < 16) (WA WB : Nat → Wor
 def kAddr (s : State) (g : Nat) : Addr := s.labels kLabel + BitVec.ofNat 64 (32 * g)
 
 theorem slice3_exec (g : Nat) (hg : g < 16) (sp : Addr) (rest : List Region) (s : State)
-    (hK : InRegions s.rd (kAddr s g) 32) (hrsp : s.gpr.rsp = sp) (hwr : s.wr = ⟨sp, 512⟩ :: rest) :
+    (hK : InRegions s.rd (kAddr s g) 32) (hrsp : s.gpr.rsp = sp) (hwr : s.wr = ⟨sp, 560⟩ :: rest) :
     ∃ q, execBlock isa (schedSlice g 3) s = some q ∧ SliceFrame g s q.1 ∧
       q.1.getV (ymm (g % 4)) = s.getV (ymm (g % 4)) ∧
       q.1.mem = s.mem.writeW (sp + BitVec.ofNat 64 (32 * g))

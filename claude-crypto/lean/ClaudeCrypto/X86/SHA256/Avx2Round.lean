@@ -46,7 +46,7 @@ structure RoundPre (L t : Nat) (v : Vars) (p wk : Word) (sp : Addr) (rest : List
   hz : s.gpr.get (tZ t) = (v.b ^^^ v.c).setWidth 64
   hwk : s.mem.readW (sp + BitVec.ofNat 64 (wkOff L t)) 32 = wk
   hrsp : s.gpr.rsp = sp
-  hwr : s.wr = ⟨sp, 512⟩ :: rest
+  hwr : s.wr = ⟨sp, 560⟩ :: rest
 
 /-- The effect of a round. -/
 def RoundPost (t : Nat) (v : Vars) (wk : Word) (s s' : State) : Prop :=
