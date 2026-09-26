@@ -1,0 +1,24 @@
+[package]
+name = "claude-crypto"
+version = "0.1.0"
+edition = "2021"
+description = "Formally verified (Lean 4) assembly implementations of SHA-256 and P-384 ECDSA verification"
+license = "MIT"
+build = "build.rs"
+
+[lib]
+name = "claude_crypto"
+
+[build-dependencies]
+cc = "1"
+
+[dev-dependencies]
+sha2 = "0.10"
+
+# Only used by the benchmark, as a baseline; not available when cross-compiling.
+[target.'cfg(target_arch = "x86_64")'.dev-dependencies]
+openssl = "0.10"
+
+[[bench]]
+name = "bench"
+harness = false

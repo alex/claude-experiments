@@ -1,0 +1,6 @@
+lean/.lake/
+target/
+build/
+*.o
+rust/target/
+lean/Scratch/

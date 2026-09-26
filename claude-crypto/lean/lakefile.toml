@@ -1,0 +1,17 @@
+name = "ClaudeCrypto"
+defaultTargets = ["ClaudeCrypto"]
+
+[leanOptions]
+autoImplicit = false
+
+[[require]]
+name = "mathlib"
+git = "https://github.com/leanprover-community/mathlib4"
+rev = "master"
+
+[[lean_lib]]
+name = "ClaudeCrypto"
+
+[[lean_exe]]
+name = "emit"
+root = "Emit.Main"
