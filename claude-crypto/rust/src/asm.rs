@@ -28,3 +28,16 @@ extern "C" {
     /// Preserves all AAPCS64 callee-saved registers and uses no stack.
     pub fn cc_sha256_blocks_arm(state: *mut u32, data: *const u8, nblocks: usize);
 }
+
+#[cfg(all(target_arch = "powerpc64", target_endian = "little"))]
+extern "C" {
+    /// Compress `nblocks` 64-byte blocks from `data` into `state`.
+    ///
+    /// Verified contract (Lean: `CC.Ppc.SHA256P8.correct`): requires the
+    /// POWER8 (Power ISA 2.07) vector crypto instructions, which every
+    /// ppc64le (ELFv2) Linux system has; `data` must be readable for
+    /// `64 * nblocks` bytes and `state` readable and writable for 32 bytes.
+    /// Preserves all ELFv2 nonvolatile registers (uses only `r0`, `r3`–`r12`
+    /// and `v0`–`v19`) and uses no stack and no TOC.
+    pub fn cc_sha256_blocks_ppc64le(state: *mut u32, data: *const u8, nblocks: usize);
+}

@@ -35,6 +35,10 @@ fn compress(state: &mut [u32; 8], blocks: &[u8]) {
     unsafe {
         asm::cc_sha256_blocks_arm(state.as_mut_ptr(), blocks.as_ptr(), n)
     }
+    #[cfg(all(target_arch = "powerpc64", target_endian = "little"))]
+    unsafe {
+        asm::cc_sha256_blocks_ppc64le(state.as_mut_ptr(), blocks.as_ptr(), n)
+    }
 }
 
 /// Incremental SHA-256 hasher.

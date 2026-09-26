@@ -53,6 +53,8 @@ the register), the word at `EA + 4` into `word[1]`, and so on.
   `lxvw4x`/`stxvw4x`, which is stricter than the ISA's four word accesses);
   otherwise the instruction faults.  Alignment is not modelled: `lxvw4x` and
   `stxvw4x` permit arbitrary alignment.
+* The block function counts its blocks up from `-n` to 0 (`neg` once, then
+  `addi r5,r5,1`), so only non-negative `addi` immediates are used.
 * Immediate operands are unrestricted numbers in the model; the assembler
   rejects any that are not encodable (e.g. `SH > 15` for `vsldoi`, a `SIX`
   field wider than 4 bits, `SI` outside `[-2^15, 2^15)`), so the emitted code

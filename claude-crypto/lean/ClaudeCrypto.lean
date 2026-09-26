@@ -47,6 +47,7 @@ import ClaudeCrypto.Framework.Compile
 import ClaudeCrypto.Limb.Basic
 import ClaudeCrypto.Limb.Sym
 import ClaudeCrypto.Limb.X86
+import ClaudeCrypto.Limb.Arm
 import ClaudeCrypto.Limb.Mac
 import ClaudeCrypto.Limb.Row
 import ClaudeCrypto.Limb.Small
@@ -58,3 +59,12 @@ import ClaudeCrypto.Limb.Field
 import ClaudeCrypto.Limb.MontFinal
 import ClaudeCrypto.Limb.MontMul
 import ClaudeCrypto.Limb.FProg
+import ClaudeCrypto.Ppc.Basic
+import ClaudeCrypto.Ppc.Print
+import ClaudeCrypto.Ppc.Sym
+import ClaudeCrypto.Ppc.StateLemmas
+import ClaudeCrypto.Ppc.VecLemmas
+import ClaudeCrypto.Ppc.Taint
+import ClaudeCrypto.Ppc.SHA256.P8
+import ClaudeCrypto.Ppc.SHA256.P8Main
+import ClaudeCrypto.Ppc.SHA256.P8CT
