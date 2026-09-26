@@ -24,7 +24,7 @@ syntax "limb_sym" (" [" Lean.Parser.Tactic.simpLemma,* "]")? : tactic
 macro_rules
   | `(tactic| limb_sym) => `(tactic| limb_sym [])
   | `(tactic| limb_sym [$ts,*]) => `(tactic|
-    simp only [CC.execBlock, CC.Limb.isa, CC.Limb.exec, CC.Limb.addrs, CC.Limb.State.load,
+    simp (config := { decide := true }) only [CC.execBlock, CC.Limb.isa, CC.Limb.exec, CC.Limb.addrs, CC.Limb.State.load,
       CC.Limb.State.store, Option.map_some, Option.bind_some, Option.map_none,
       CC.Limb.State.set_r, CC.Limb.State.set_cf, CC.Limb.State.set_sub, CC.Limb.State.set_mem,
       CC.Limb.State.set_rd, CC.Limb.State.set_wr, CC.Limb.State.set_labels, Function.update_self,
