@@ -14,13 +14,22 @@ fn compress(state: &mut [u32; 8], blocks: &[u8]) {
     if n == 0 {
         return;
     }
-    // SAFETY: `state` is a valid, exclusively borrowed 32-byte buffer and
-    // `blocks` is valid for reads of `64 * n` bytes; they cannot overlap since
-    // one is borrowed mutably.  These are exactly the preconditions of the
-    // verified contract.
+    // SAFETY (all calls below): `state` is a valid, exclusively borrowed
+    // 32-byte buffer and `blocks` is valid for reads of `64 * n` bytes; they
+    // cannot overlap since one is borrowed mutably.  These are exactly the
+    // preconditions of the verified contracts; the required CPU features are
+    // checked at run time.
     #[cfg(target_arch = "x86_64")]
-    unsafe {
-        asm::cc_sha256_blocks_x86_scalar(state.as_mut_ptr(), blocks.as_ptr(), n)
+    {
+        match crate::cpu::x86_level() {
+            crate::cpu::X86Level::Avx2 => unsafe {
+                asm::cc_sha256_blocks_x86_avx2(state.as_mut_ptr(), blocks.as_ptr(), n)
+            },
+            crate::cpu::X86Level::Bmi2 => unsafe {
+                asm::cc_sha256_blocks_x86_scalar(state.as_mut_ptr(), blocks.as_ptr(), n)
+            },
+            crate::cpu::X86Level::Baseline => crate::portable::compress(state, blocks),
+        }
     }
     #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
     unsafe {
@@ -93,4 +102,40 @@ pub fn sha256(data: &[u8]) -> [u8; 32] {
     let mut h = Sha256::new();
     h.update(data);
     h.finalize()
+}
+
+#[cfg(all(test, target_arch = "x86_64"))]
+mod tests {
+    use super::*;
+    use crate::cpu::{x86_level, X86Level};
+
+    /// All implementations available on this CPU agree (the dispatcher only
+    /// ever picks one of them).
+    #[test]
+    fn implementations_agree() {
+        let level = x86_level();
+        let mut x: u64 = 0x9e37_79b9_7f4a_7c15;
+        let mut data = [0u8; 64 * 9];
+        for n in 0..=9 {
+            for b in data.iter_mut() {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                *b = x as u8;
+            }
+            let blocks = &data[..64 * n];
+            let mut reference = H0;
+            crate::portable::compress(&mut reference, blocks);
+            if level != X86Level::Baseline {
+                let mut s = H0;
+                unsafe { asm::cc_sha256_blocks_x86_scalar(s.as_mut_ptr(), blocks.as_ptr(), n) };
+                assert_eq!(s, reference, "scalar, {n} blocks");
+            }
+            if level == X86Level::Avx2 {
+                let mut s = H0;
+                unsafe { asm::cc_sha256_blocks_x86_avx2(s.as_mut_ptr(), blocks.as_ptr(), n) };
+                assert_eq!(s, reference, "avx2, {n} blocks");
+            }
+        }
+    }
 }

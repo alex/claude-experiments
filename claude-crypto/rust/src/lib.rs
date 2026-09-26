@@ -18,6 +18,10 @@
 #![deny(missing_docs)]
 
 mod asm;
+#[cfg(target_arch = "x86_64")]
+mod cpu;
+#[cfg(target_arch = "x86_64")]
+mod portable;
 pub mod sha256;
 
 pub use sha256::{sha256, Sha256};
