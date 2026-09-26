@@ -23,7 +23,7 @@ def varReg (t k : Nat) : Reg :=
   | 0 => .r8 | 1 => .r9 | 2 => .r10 | 3 => .r11
   | 4 => .r12 | 5 => .r13 | 6 => .r14 | _ => .r15
 
-def slot (j : Nat) : MemOp := { base := .rsp, disp := 4 * (j % 16) }
+def slot (j : Nat) : MemOp := { base := .rsp, disp := ((4 * (j % 16) : Nat) : Int) }
 
 /-- Round `t`: `h += Σ₁(e) + Ch(e,f,g) + Kₜ + Wₜ; d += h; h += Σ₀(a) + Maj(a,b,c)`. -/
 def roundCode (t : Nat) : List Instr :=
@@ -78,21 +78,27 @@ def schedCode (t : Nat) : List Instr :=
 
 /-- Load message word `j` (big-endian) into the schedule buffer. -/
 def loadCode (j : Nat) : List Instr :=
-  [ .movbe .d .rax { base := .rsi, disp := 4 * j },
+  [ .movbe .d .rax { base := .rsi, disp := ((4 * j : Nat) : Int) },
     .store .d (slot j) .rax ]
 
 def hReg (k : Nat) : Reg := varReg 0 k
 
-/-- The body of the per-block loop. -/
-def blockCode : List Instr :=
-  ((List.range 16).map loadCode).flatten ++
-  ((List.range 16).map roundCode).flatten ++
-  ((List.range 48).map fun i => schedCode (i + 16) ++ roundCode (i + 16)).flatten ++
+/-- Round `t`, including the message-schedule update for `t ≥ 16`. -/
+def roundAll (t : Nat) : List Instr := if t < 16 then roundCode t else schedCode t ++ roundCode t
+
+def loads : List Instr := ((List.range 16).map loadCode).flatten
+def rounds : List Instr := ((List.range 64).map roundAll).flatten
+
+/-- Add the working variables into the hash value, advance the data pointer. -/
+def finish : List Instr :=
   ((List.range 8).map fun k =>
-    [ .alu .add .d (hReg k) (.mem { base := .rdi, disp := 4 * k }),
-      .store .d { base := .rdi, disp := 4 * k } (hReg k) ]).flatten ++
+    [ .alu .add .d (hReg k) (.mem { base := .rdi, disp := ((4 * k : Nat) : Int) }),
+      .store .d { base := .rdi, disp := ((4 * k : Nat) : Int) } (hReg k) ]).flatten ++
   [ .alu .add .q .rsi (.imm 64),
     .dec .q .rdx ]
+
+/-- The body of the per-block loop. -/
+def blockCode : List Instr := loads ++ rounds ++ finish
 
 def prologue : List Instr :=
   [ .push .rbx, .push .rbp, .push .r12, .push .r13, .push .r14, .push .r15,
@@ -100,7 +106,7 @@ def prologue : List Instr :=
     .alu .test .q .rdx (.reg .rdx) ]
 
 def loadState : List Instr :=
-  (List.range 8).map fun k => .mov .d (hReg k) (.mem { base := .rdi, disp := 4 * k })
+  (List.range 8).map fun k => .mov .d (hReg k) (.mem { base := .rdi, disp := ((4 * k : Nat) : Int) })
 
 def epilogue : List Instr :=
   [ .alu .add .q .rsp (.imm 64),

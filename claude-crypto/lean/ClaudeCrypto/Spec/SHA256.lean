@@ -131,8 +131,13 @@ def compress (H : List Word) (M : List Word) : List Word :=
 def toBytes (H : List Word) : List (BitVec 8) :=
   H.flatMap (fun w => [w.extractLsb' 24 8, w.extractLsb' 16 8, w.extractLsb' 8 8, w.extractLsb' 0 8])
 
+/-- The hash computation of §6.2.2 applied to an already padded message:
+process each 512-bit block in turn, starting from the hash value `H`. -/
+def hashBlocks (H : List Word) (padded : List (BitVec 8)) : List Word :=
+  (parse padded).foldl compress H
+
 /-- SHA-256 of a message given as a list of bytes. -/
 def sha256 (msg : List (BitVec 8)) : List (BitVec 8) :=
-  toBytes ((parse (pad msg)).foldl compress H0)
+  toBytes (hashBlocks H0 (pad msg))
 
 end CC.Spec.SHA256

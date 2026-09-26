@@ -55,6 +55,41 @@ theorem Mem.Agree.apply {m m' : Mem} {base : Addr} {len : Nat} (h : Mem.Agree m 
   have := h b (by simpa using hs.not_contains 0 (by omega))
   exact this
 
+/-- `m'` agrees with `m` outside all of the regions `rs`. -/
+def Mem.AgreeL (m m' : Mem) (rs : List Region) : Prop :=
+  ∀ a, (∀ r ∈ rs, ¬ r.Contains a 1) → m' a = m a
+
+theorem Mem.AgreeL.refl (m : Mem) (rs : List Region) : Mem.AgreeL m m rs := fun _ _ => rfl
+
+theorem Mem.AgreeL.trans {m m' m'' : Mem} {rs : List Region} (h1 : Mem.AgreeL m m' rs)
+    (h2 : Mem.AgreeL m' m'' rs) : Mem.AgreeL m m'' rs := fun a ha => (h2 a ha).trans (h1 a ha)
+
+theorem Mem.AgreeL.of_agree {m m' : Mem} {r : Region} (rs : List Region) (h : Mem.Agree m m' r)
+    (hr : r ∈ rs) : Mem.AgreeL m m' rs := fun a ha => h a (ha r hr)
+
+theorem Mem.AgreeL.writeW {m m' : Mem} {rs : List Region} (h : Mem.AgreeL m m' rs) (r : Region)
+    (hr : r ∈ rs) (a : Addr) {w : Nat} (v : BitVec w) (hc : r.Contains a (w / 8)) :
+    Mem.AgreeL m (m'.writeW a v) rs := by
+  intro x hx
+  have := (Mem.Agree.writeW (m := m') (Mem.Agree.refl m' r) a v hc) x (hx r hr)
+  rw [this, h x hx]
+
+/-- Reading outside all the regions. -/
+theorem Mem.AgreeL.readW {m m' : Mem} {rs : List Region} (h : Mem.AgreeL m m' rs) (b : Addr)
+    (w : Nat) (hs : ∀ r ∈ rs, Mem.Sep r.base r.len b (w / 8)) : m'.readW b w = m.readW b w := by
+  unfold Mem.readW; congr 1
+  apply Mem.read_congr; intro i hi
+  exact h _ (fun r hr => (hs r hr).not_contains i hi)
+
+theorem Mem.AgreeL.apply {m m' : Mem} {rs : List Region} (h : Mem.AgreeL m m' rs) (b : Addr)
+    (hs : ∀ r ∈ rs, Mem.Sep r.base r.len b 1) : m' b = m b := by
+  have := h b (fun r hr => by simpa using (hs r hr).not_contains 0 (by omega))
+  exact this
+
+theorem Mem.AgreeL.mono {m m' : Mem} {rs rs' : List Region} (h : Mem.AgreeL m m' rs)
+    (hsub : ∀ a, (∀ r' ∈ rs', ¬ r'.Contains a 1) → (∀ r ∈ rs, ¬ r.Contains a 1)) :
+    Mem.AgreeL m m' rs' := fun a ha => h a (hsub a ha)
+
 /-! ## Separation of sub-ranges -/
 
 theorem toNat_sub_add_toNat_sub (a b : Addr) :
@@ -127,5 +162,16 @@ theorem inRegions_nil (a : Addr) (n : Nat) : InRegions [] a n ↔ False := by
     (m.writeW a v).readW a 128 = v := Mem.readW_writeW_same _ _ _ (by decide) (by decide)
 @[simp] theorem Mem.readW_writeW_same_256 (m : Mem) (a : Addr) (v : BitVec 256) :
     (m.writeW a v).readW a 256 = v := Mem.readW_writeW_same _ _ _ (by decide) (by decide)
+
+theorem add_sub_lit (x a b : Addr) : x + a - b = x + (a - b) := by abel
+theorem addr_add_sub_cancel (x a : Addr) : x + a - x = a := by abel
+theorem addr_sub_add_cancel (x a : Addr) : x - (x + a) = -a := by abel
+theorem addr_add_sub_add (x a b : Addr) : x + a - (x + b) = a - b := by abel
+theorem addr_sub_self (x : Addr) : x - x = 0 := by abel
+
+/-- `readW_writeW_sep` with the separation condition unfolded (better for `simp`). -/
+theorem Mem.readW_writeW_sep' (m : Mem) (a : Addr) {w : Nat} (v : BitVec w) (b : Addr) (w' : Nat)
+    (h1 : w / 8 ≤ (b - a).toNat) (h2 : w' / 8 ≤ (a - b).toNat) :
+    (m.writeW a v).readW b w' = m.readW b w' := Mem.readW_writeW_sep _ _ _ _ _ ⟨h1, h2⟩
 
 end CC

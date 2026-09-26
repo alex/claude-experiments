@@ -51,10 +51,22 @@ def RoundInv (g : Ghost) (blk t : Nat) (mb : Mem) (s : State) : Prop :=
 /-! ## Arithmetic facts about the round computation -/
 
 theorem ch_asm (e f g : Word) : (~~~e &&& g) + (f &&& e) = Ch e f g := by
-  simp only [Ch]; bv_decide
+  simp only [Ch]
+  rw [BitVec.add_eq_or_of_and_eq_zero]
+  · apply BitVec.eq_of_getLsbD_eq; intro i hi
+    simp only [BitVec.getLsbD_or, BitVec.getLsbD_and, BitVec.getLsbD_xor, BitVec.getLsbD_not, hi,
+      decide_true, Bool.true_and]
+    cases e.getLsbD i <;> cases f.getLsbD i <;> cases g.getLsbD i <;> rfl
+  · apply BitVec.eq_of_getLsbD_eq; intro i hi
+    simp only [BitVec.getLsbD_and, BitVec.getLsbD_not, hi, decide_true, Bool.true_and,
+      BitVec.getLsbD_zero]
+    cases e.getLsbD i <;> cases f.getLsbD i <;> cases g.getLsbD i <;> rfl
 
 theorem maj_asm (a b c : Word) : ((b ^^^ c) &&& a ^^^ b &&& c) = Maj a b c := by
-  simp only [Maj]; bv_decide
+  simp only [Maj]
+  apply BitVec.eq_of_getLsbD_eq; intro i hi
+  simp only [BitVec.getLsbD_and, BitVec.getLsbD_xor]
+  cases a.getLsbD i <;> cases b.getLsbD i <;> cases c.getLsbD i <;> rfl
 
 theorem SIGMA1_asm (e : Word) : (e.rotateRight 6 ^^^ e.rotateRight 11 ^^^ e.rotateRight 25) = SIGMA1 e := rfl
 theorem SIGMA0_asm (a : Word) : (a.rotateRight 2 ^^^ a.rotateRight 13 ^^^ a.rotateRight 22) = SIGMA0 a := rfl
@@ -71,9 +83,10 @@ theorem slotAddr_sep (sp : Addr) (i j : Nat) (hi : i < 16) (hj : j < 16) (hij : 
   omega
 
 theorem slots_write (m : Mem) (sp : Addr) (W : Nat → Word) (t : Nat) (ht : 16 ≤ t)
-    (hslots : ∀ j < 16, m.readW (slotAddr sp j) 32 = W (slotIdx t j)) (v : Word)
-    (hv : v = W t) :
-    ∀ j < 16, (m.writeW (slotAddr sp (t % 16)) v).readW (slotAddr sp j) 32 = W (slotIdx (t + 1) j) := by
+    (hslots : ∀ j < 16, m.readW (slotAddr sp j) 32 = W (slotIdx t j)) (a : Addr)
+    (ha : slotAddr sp (t % 16) = a) (v : Word) (hv : v = W t) :
+    ∀ j < 16, (m.writeW a v).readW (slotAddr sp j) 32 = W (slotIdx (t + 1) j) := by
+  subst ha
   intro j hj
   by_cases hjt : j = t % 16
   · subst hjt; rw [Mem.readW_writeW_same _ _ _ (by decide) (by decide), hv]
@@ -106,9 +119,6 @@ theorem add_ch_asm (x e f g : Word) : x + (~~~e &&& g) + (f &&& e) = x + Ch e f 
 
 /-! ## One round -/
 
-/-- The code of round `t`, including the message-schedule update for `t ≥ 16`. -/
-def roundAll (t : Nat) : List Instr := if t < 16 then roundCode t else schedCode t ++ roundCode t
-
 /-- The effect of round `t` on the machine state, in terms of abstract inputs. -/
 def RoundPost (t : Nat) (v : Vars) (W : Nat → Word) (sp : Addr) (s s' : State) : Prop :=
   let v' := Spec.SHA256.round v K[t]! (W t)
@@ -140,11 +150,11 @@ set_option hygiene false in
 /-- Symbolically execute one round (common part). -/
 macro "sha_round_exec" : tactic => `(tactic| (
   simp only [slotAddr, slotIdx, Nat.reduceMod, Nat.reduceAdd, Nat.reduceMul, Nat.reduceSub,
-    Nat.reduceLeDiff, reduceIte] at w0 w1 w2 w3
+    Nat.reduceLeDiff, reduceIte, BitVec.ofNat_eq_ofNat, BitVec.add_zero] at w0 w1 w2 w3
   simp only [varReg, Nat.reduceMod, Nat.reduceAdd, Nat.reduceSub, Regs.get] at ha hb hc hd he hf hg hh
   simp only [roundAll, schedCode, roundCode, varReg, slot, Nat.reduceMod, Nat.reduceAdd, Nat.reduceSub,
-    Nat.cast_ofNat, Int.reduceMod, Int.reduceMul, Nat.reduceLT, reduceIte, List.cons_append,
-    List.nil_append]
+    Nat.cast_ofNat, Nat.cast_zero, Nat.cast_one, BitVec.ofInt_natCast, Int.reduceMod, Int.reduceMul, Nat.reduceMul,
+    Nat.reduceLT, reduceIte, List.cons_append, List.nil_append]
   x86_sym [ha, hb, hc, hd, he, hf, hg, hh, hrsp, hwr, w0, w1, w2, w3]
   refine ⟨_, rfl, ?_⟩
   simp only [RoundPost, varReg, Regs.get, Nat.reduceMod, Nat.reduceAdd, Nat.reduceSub]
@@ -155,7 +165,8 @@ set_option hygiene false in
 macro "sha_round_hi" : tactic => `(tactic| (
   sha_round_exec
   refine ⟨?_, rfl, rfl, rfl, ?_, rfl, rfl, rfl,
-      slots_write _ _ W _ (by decide) hslots _ ?_,
+      slots_write _ _ W _ (by decide) hslots _
+        (by simp only [slotAddr, Nat.reduceMod, Nat.reduceMul, BitVec.ofNat_eq_ofNat, BitVec.add_zero]) _ ?_,
       trivial, trivial, trivial, trivial, Mem.Agree.writeW (Mem.Agree.refl _ _) _ _ ?_, trivial,
       hwr.symm⟩
   · rw [hW (by decide)]; simp only [Spec.SHA256.round, slotIdx, Nat.reduceMod, Nat.reduceAdd,
@@ -164,7 +175,7 @@ macro "sha_round_hi" : tactic => `(tactic| (
       Nat.reduceSub, Nat.reduceLeDiff, reduceIte]; refine congrArg _ ?_; ac_rfl
   · rw [hW (by decide)]; simp only [slotIdx, Nat.reduceMod, Nat.reduceAdd,
       Nat.reduceSub, Nat.reduceLeDiff, reduceIte]; ac_rfl
-  · rw [region_contains_add]; decide))
+  · first | (rw [region_contains_add]; decide) | (rw [region_contains_self]; decide)))
 
 set_option hygiene false in
 /-- A round without a message-schedule update (`t < 16`). -/

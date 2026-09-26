@@ -1,6 +1,5 @@
 import ClaudeCrypto.X86.Basic
 import ClaudeCrypto.Common.MemLemmas
-import Std.Tactic.BVDecide
 
 /-!
 # Symbolic execution support for the x86-64 model
@@ -19,7 +18,9 @@ theorem bswap32_readW (m : Mem) (a : Addr) :
   have e3 : a + 2 + 1 = a + 3 := by rw [BitVec.add_assoc]; rfl
   rw [e2, e3]
   generalize m a = b0; generalize m (a + 1) = b1; generalize m (a + 2) = b2; generalize m (a + 3) = b3
-  bv_decide
+  apply BitVec.eq_of_getLsbD_eq; intro i hi
+  simp only [BitVec.getLsbD_append, BitVec.getLsbD_extractLsb', BitVec.getLsbD_setWidth]
+  interval_cases i <;> simp
 
 theorem setWidth_32_64_32 (x : BitVec 32) : (x.setWidth 64).setWidth 32 = x := by simp
 theorem setWidth_64_64 (x : BitVec 64) : x.setWidth 64 = x := by simp
@@ -39,11 +40,11 @@ macro_rules
       Nat.reduceDiv, Nat.reduceMod, Nat.reduceAdd, Nat.reduceMul, Nat.reduceSub, Nat.reduceLeDiff,
       Nat.reduceLT, Nat.reduceGT, Nat.reduceEqDiff, reduceIte,
       Int.reduceMul, Int.reduceAdd, Int.reduceMod, Int.reduceNeg, Nat.cast_ofNat,
-      BitVec.ofInt_ofNat, BitVec.setWidth_setWidth_of_le, BitVec.setWidth_eq, BitVec.signExtend_eq,
-      CC.X86.setWidth_32_64_32, CC.X86.setWidth_64_64, BitVec.add_zero,
+      BitVec.ofInt_ofNat, BitVec.ofInt_natCast, BitVec.setWidth_setWidth_of_le, BitVec.setWidth_eq, BitVec.signExtend_eq,
+      CC.X86.setWidth_32_64_32, CC.X86.setWidth_64_64, BitVec.add_zero, add_zero, BitVec.and_self,
       CC.inRegions_append, CC.inRegions_cons, CC.inRegions_nil, CC.region_contains_add,
       CC.region_contains_self, true_or, or_true, or_false, false_or,
-      CC.Mem.readW_writeW_same_32, CC.Mem.readW_writeW_same_64, CC.Mem.readW_writeW_same_128, CC.Mem.readW_writeW_same_256, CC.Mem.readW_writeW_sep, CC.sep_add_add, CC.sep_self_add,
-      CC.sep_add_self, CC.Mem.Sep, BitVec.reduceSub, BitVec.reduceAdd, BitVec.reduceToNat,
+      CC.Mem.readW_writeW_same_32, CC.Mem.readW_writeW_same_64, CC.Mem.readW_writeW_same_128, CC.Mem.readW_writeW_same_256, CC.Mem.readW_writeW_sep', CC.sep_add_add, CC.sep_self_add,
+      CC.sep_add_self, CC.Mem.Sep, CC.addr_add_sub_cancel, CC.addr_sub_add_cancel, CC.addr_add_sub_add, CC.addr_sub_self, BitVec.reduceNeg, BitVec.reduceSignExtend, BitVec.reduceSub, BitVec.reduceAdd, BitVec.reduceToNat,
       and_true, true_and, decide_true, decide_false, List.map_cons, List.map_nil, List.cons_append,
       List.nil_append, $ts,*])
