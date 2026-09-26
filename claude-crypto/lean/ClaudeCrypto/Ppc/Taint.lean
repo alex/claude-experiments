@@ -70,6 +70,7 @@ def step (i : Instr) (t : TState) : Option TState :=
     some (t.setPub ra (t.pub rs))
   | .ld rt ra _ => if t.raPub ra then some (t.setPub rt false) else none
   | .std _ ra _ => if t.raPub ra then some t else none
+  | .stdu _ ra _ => if t.pub ra then some t else none
   | .ldx rt ra rb | .ldbrx rt ra rb => if t.raPub ra && t.pub rb then some (t.setPub rt false) else none
   | .stdx _ ra rb => if t.raPub ra && t.pub rb then some t else none
 
@@ -142,6 +143,12 @@ theorem ea_eq {t : TState} {s₁ s₂ : State} (h : t.Agree s₁ s₂) (ra rb : 
   simp only [State.ea, h.raOr0 ra hp.1, h.1 rb hp.2]
 
 end TState
+
+theorem exec_stdu (rx ra : GReg) (ds : Int) (s : State) :
+    exec (.stdu rx ra ds) s = if ra = .r0 then none else
+      (s.store64 (s.getG ra + BitVec.ofInt 64 ds) (s.getG rx)).map
+        fun s' => s'.setG ra (s.getG ra + BitVec.ofInt 64 ds) := by
+  cases ra <;> rfl
 
 open TState in
 theorem exec_sound (i : Instr) (t t' : TState) (s₁ s₂ s₁' s₂' : State) (hstep : t.step i = some t')
@@ -246,6 +253,27 @@ theorem exec_sound (i : Instr) (t t' : TState) (s₁ s₂ s₁' s₂' : State) (
       split at h1 <;> split at h2 <;> simp only [reduceCtorEq, Option.some.injEq] at h1 h2
       subst h1; subst h2; exact hag.mem _ _
     · cases hstep
+  | stdu rx ra ds =>
+    simp only [step] at hstep
+    split at hstep
+    · rename_i hp
+      cases hstep
+      have e : s₁.getG ra = s₂.getG ra := hag.1 ra hp
+      rw [exec_stdu] at h1 h2
+      split at h1
+      · cases h1
+      · rename_i hne
+        rw [if_neg hne] at h2
+        simp only [State.store64] at h1 h2
+        split at h1 <;> split at h2 <;> simp only [reduceCtorEq, Option.map_some, Option.map_none,
+          Option.some.injEq] at h1 h2
+        subst h1; subst h2
+        refine ⟨fun r hr => ?_, hag.2.1, hag.2.2⟩
+        rw [State.getG_setG, State.getG_setG]
+        split_ifs with h
+        · rw [e]
+        · exact hag.1 r hr
+    · cases hstep
   | adr rt l =>
     simp only [step, Option.some.injEq] at hstep; subst hstep
     cases rt <;> simp only [exec, Option.some.injEq, reduceCtorEq] at h1 h2 <;>
@@ -265,6 +293,11 @@ theorem addrs_sound (i : Instr) (t t' : TState) (s₁ s₂ : State) (hstep : t.s
     simp only [step] at hstep
     split at hstep
     · rename_i hp; simp only [addrs, hag.raOr0 ra hp]
+    · cases hstep
+  | stdu _ ra ds =>
+    simp only [step] at hstep
+    split at hstep
+    · rename_i hp; simp only [addrs, hag.1 ra hp]
     · cases hstep
   | _ => rfl
 

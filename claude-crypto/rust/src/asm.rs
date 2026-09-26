@@ -54,4 +54,12 @@ extern "C" {
     /// Preserves all ELFv2 nonvolatile registers (uses only `r0`, `r3`–`r12`
     /// and `v0`–`v19`) and uses no stack and no TOC.
     pub fn cc_sha256_blocks_ppc64le(state: *mut u32, data: *const u8, nblocks: usize);
+
+    /// ECDSA-P384 verification: returns 1 (valid) or 0 (invalid).
+    ///
+    /// Generated from `CC.P384.main` (Lean: `CC.Ppc.P384Wrap`, compiled by the
+    /// verified `CC.Limb.Ppc` compiler): `pubkey`, `digest` and `sig` must be
+    /// readable for 96, 48 and 96 bytes.  ELFv2; saves and restores `r14`–`r18`,
+    /// and uses 1872 bytes of stack.
+    pub fn cc_p384_verify_ppc64le(pubkey: *const u8, digest: *const u8, sig: *const u8) -> u64;
 }

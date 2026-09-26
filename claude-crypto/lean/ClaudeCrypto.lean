@@ -90,3 +90,5 @@ import ClaudeCrypto.X86.P384Main
 import ClaudeCrypto.Arm.P384Wrap
 import ClaudeCrypto.Arm.P384Main
 import ClaudeCrypto.P384.Machine
+import ClaudeCrypto.Ppc.P384Wrap
+import ClaudeCrypto.Ppc.P384Main

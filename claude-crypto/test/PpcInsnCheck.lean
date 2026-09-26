@@ -117,6 +117,15 @@ def check (line : String) : Bool :=
       | some s => bytesAt s == hexBytes r
       | none => false
     | _ => false
+  | ["stdu", o, ds, a, pa, r] =>
+    -- `stdu r6,ds(r4)` with r4 = base + o, into a zeroed buffer; r4 is updated
+    let dsI : Int := if ds.startsWith "-" then -((ds.drop 1).toString.toNat! : Int) else ds.toNat!
+    let st : State := { ((memSt (String.ofList (List.replicate 96 '0')) o.toNat! 0).setG .r6 (w64 a)) with
+      wr := [⟨base, 48⟩] }
+    match exec (.stdu .r6 .r4 dsI) st with
+    | some s => (List.range 48).map (fun i => s.mem (base + BitVec.ofNat 64 i)) == hexBytes r &&
+        s.getG .r4 == base + BitVec.ofNat 64 pa.toNat!
+    | none => false
   | [op, a, b, cin, r, cout] =>
     match op with
     | "addc" => rrc (.addc .r3 .r4 .r5) a b cin r cout

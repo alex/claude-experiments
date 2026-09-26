@@ -408,6 +408,9 @@ inductive Instr
   | ld (rt ra : GReg) (ds : Nat)
   /-- `std RS,DS(RA)`, with `ds` the byte displacement (a multiple of 4) -/
   | std (rs ra : GReg) (ds : Nat)
+  /-- `stdu RS,DS(RA)` (store with update, `RA ≠ 0`), with `ds` the signed byte
+  displacement (a multiple of 4) -/
+  | stdu (rs ra : GReg) (ds : Int)
   /-- `ldx RT,RA,RB` -/
   | ldx (rt ra rb : GReg)
   /-- `stdx RS,RA,RB` -/
@@ -553,6 +556,13 @@ def exec (i : Instr) (s : State) : Option State :=
   | .ld rt ra ds => (s.load64 (s.raOr0 ra + BitVec.ofNat 64 ds)).map fun x => s.setG rt x
   -- EA ← (RA|0) + EXTS(DS || 0b00); MEM(EA, 8) ← (RS)
   | .std rx ra ds => s.store64 (s.raOr0 ra + BitVec.ofNat 64 ds) (s.getG rx)
+  -- EA ← (RA) + EXTS(DS || 0b00); MEM(EA, 8) ← (RS); RA ← EA   (`RA = 0` is an invalid form)
+  | .stdu rx ra ds =>
+    match ra with
+    | .r0 => none
+    | _ =>
+      let ea := s.getG ra + BitVec.ofInt 64 ds
+      (s.store64 ea (s.getG rx)).map fun s' => s'.setG ra ea
   -- EA ← (RA|0) + (RB); RT ← MEM(EA, 8)
   | .ldx rt ra rb => (s.load64 (s.ea ra rb)).map fun x => s.setG rt x
   -- EA ← (RA|0) + (RB); MEM(EA, 8) ← (RS)
@@ -566,6 +576,7 @@ def addrs (i : Instr) (s : State) : List Addr :=
   match i with
   | .lxvw4x _ ra rb | .stxvw4x _ ra rb => [s.ea ra rb]
   | .ld _ ra ds | .std _ ra ds => [s.raOr0 ra + BitVec.ofNat 64 ds]
+  | .stdu _ ra ds => [s.getG ra + BitVec.ofInt 64 ds]
   | .ldx _ ra rb | .stdx _ ra rb | .ldbrx _ ra rb => [s.ea ra rb]
   | _ => []
 

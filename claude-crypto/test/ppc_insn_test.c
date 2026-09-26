@@ -146,6 +146,14 @@ static const struct { int ds; uint64_t (*ld)(const uint8_t *); void (*st)(uint8_
   {0, t_ld_0, t_std_0}, {4, t_ld_4, t_std_4}, {8, t_ld_8, t_std_8}, {12, t_ld_12, t_std_12},
   {16, t_ld_16, t_std_16}};
 
+#define STDU(DS) static uint8_t *t_stdu_##DS(uint8_t *p, uint64_t v) { \
+  __asm__ volatile("stdu %1," #DS "(%0)" : "+b"(p) : "r"(v) : "memory"); return p; }
+#define STDUN(N, DS) static uint8_t *t_stdu_m##N(uint8_t *p, uint64_t v) { \
+  __asm__ volatile("stdu %1," #DS "(%0)" : "+b"(p) : "r"(v) : "memory"); return p; }
+STDUN(16, -16) STDUN(8, -8) STDU(0) STDU(4) STDU(12)
+static const struct { int ds; uint8_t *(*f)(uint8_t *, uint64_t); } stdus[] = {
+  {-16, t_stdu_m16}, {-8, t_stdu_m8}, {0, t_stdu_0}, {4, t_stdu_4}, {12, t_stdu_12}};
+
 static void scalar_tests(int i) {
   uint64_t a = rnd(), b = rnd();
   if (i % 8 == 0) b = ~a;                     // carries propagate / borrow boundaries
@@ -192,6 +200,12 @@ static void scalar_tests(int i) {
   memset(buf, 0, 32);
   __asm__ volatile("stdx %0,%1,%2" : : "r"(b), "b"(buf), "r"((uint64_t)x) : "memory");
   printf("stdx %d %016llx", x, (unsigned long long)b); pbytes(buf, 32); printf("\n");
+  // stdu: RA = &buf[16 + o], store and update
+  uint8_t big[48];
+  memset(big, 0, 48);
+  uint8_t *p = stdus[i % 5].f(big + 16 + o, a);
+  printf("stdu %d %d %016llx %d", 16 + o, stdus[i % 5].ds, (unsigned long long)a, (int)(p - big));
+  pbytes(big, 48); printf("\n");
 }
 
 int main(void) {

@@ -4,6 +4,7 @@ import ClaudeCrypto.Arm.SHA256.Ce
 import ClaudeCrypto.Ppc.SHA256.P8
 import ClaudeCrypto.X86.P384Wrap
 import ClaudeCrypto.Arm.P384Wrap
+import ClaudeCrypto.Ppc.P384Wrap
 
 /-! Writes the generated assembly files.  Usage: `lake exe emit <outdir>` -/
 
@@ -13,7 +14,8 @@ def files : List (String × String) := [
   ("aarch64/sha256.S", CC.Arm.SHA256Ce.asm),
   ("ppc64le/sha256.S", CC.Ppc.SHA256P8.asm),
   ("x86_64/p384_verify.S", CC.X86.P384Wrap.asm),
-  ("aarch64/p384_verify.S", CC.Arm.P384Wrap.asm)
+  ("aarch64/p384_verify.S", CC.Arm.P384Wrap.asm),
+  ("ppc64le/p384_verify.S", CC.Ppc.P384Wrap.asm)
 ]
 
 def header : String :=

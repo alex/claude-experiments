@@ -2,7 +2,7 @@
 //!
 //! The verifier is the assembly generated from the limb-level program
 //! `CC.P384.main` of the Lean development (compiled by the verified limb-IR
-//! compilers to x86-64 and AArch64); its specification is
+//! compilers to x86-64, AArch64 and ppc64le); its specification is
 //! `CC.Spec.P384.verify`: the public key is validated (both coordinates
 //! `< p` and on the curve), `r` and `s` must lie in `[1, n − 1]`, and the
 //! signature is checked with `e` = the 48-byte digest as a big-endian integer
@@ -20,8 +20,8 @@ use core::fmt;
 
 /// The verified P-384 implementation is not available on this platform or CPU.
 ///
-/// It is available on AArch64 (little-endian) and on x86-64 CPUs with BMI2
-/// and MOVBE (Intel Haswell and AMD Excavator/Zen, and later).
+/// It is available on AArch64 (little-endian), on ppc64le, and on x86-64 CPUs
+/// with BMI2 and MOVBE (Intel Haswell and AMD Excavator/Zen, and later).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct Unsupported;
 
@@ -61,7 +61,7 @@ impl Verifier {
         // SAFETY: the three pointers are valid for reads of 96, 48 and 96
         // bytes (they come from references to arrays of those sizes), which
         // is the verified contract of the assembly; it writes only its own
-        // stack frame (1792 bytes plus saved registers).  The CPU
+        // stack frame (at most 1872 bytes, including saved registers).  The CPU
         // requirements were checked when `self` was created.
         #[cfg(target_arch = "x86_64")]
         {
@@ -71,7 +71,15 @@ impl Verifier {
         {
             unsafe { crate::asm::cc_p384_verify_aarch64(pubkey.as_ptr(), digest.as_ptr(), sig.as_ptr()) == 1 }
         }
-        #[cfg(not(any(target_arch = "x86_64", all(target_arch = "aarch64", target_endian = "little"))))]
+        #[cfg(all(target_arch = "powerpc64", target_endian = "little"))]
+        {
+            unsafe { crate::asm::cc_p384_verify_ppc64le(pubkey.as_ptr(), digest.as_ptr(), sig.as_ptr()) == 1 }
+        }
+        #[cfg(not(any(
+            target_arch = "x86_64",
+            all(target_arch = "aarch64", target_endian = "little"),
+            all(target_arch = "powerpc64", target_endian = "little")
+        )))]
         {
             let _ = (pubkey, digest, sig);
             unreachable!("a Verifier cannot be constructed on this platform")
@@ -87,11 +95,18 @@ pub fn is_supported() -> bool {
         // BMI2 (`mulx`) and MOVBE; the `Bmi2` level also implies BMI1.
         crate::cpu::x86_level() != crate::cpu::X86Level::Baseline
     }
-    #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
+    #[cfg(any(
+        all(target_arch = "aarch64", target_endian = "little"),
+        all(target_arch = "powerpc64", target_endian = "little")
+    ))]
     {
         true
     }
-    #[cfg(not(any(target_arch = "x86_64", all(target_arch = "aarch64", target_endian = "little"))))]
+    #[cfg(not(any(
+        target_arch = "x86_64",
+        all(target_arch = "aarch64", target_endian = "little"),
+        all(target_arch = "powerpc64", target_endian = "little")
+    )))]
     {
         false
     }

@@ -26,7 +26,8 @@ The `adr` pseudo-instruction is printed as the position-independent sequence
     addi rt,rt,(label-1b)@l     # rt ← 1b + (label - 1b)
 ```
 whose net effect is `r0 ← LR; rt ← label` (for `rt ∉ {r0, r1}`); this
-expansion is part of the trusted base.  The data tables are emitted in
+expansion is part of the trusted base, as is the long form of conditional
+branches (`Cond.longBranch`).  The data tables are emitted in
 `.text` after the function.
 -/
 
@@ -76,6 +77,7 @@ def Instr.asm : Instr → List String
   | .oris ra rs ui => [s!"oris {ra.num},{rs.num},{ui}"]
   | .ld rt ra ds => [s!"ld {rt.num},{ds}({ra.num})"]
   | .std rx ra ds => [s!"std {rx.num},{ds}({ra.num})"]
+  | .stdu rx ra ds => [s!"stdu {rx.num},{ds}({ra.num})"]
   | .ldx rt ra rb => [s!"ldx {rt.num},{ra.num},{rb.num}"]
   | .stdx rx ra rb => [s!"stdx {rx.num},{ra.num},{rb.num}"]
   | .ldbrx rt ra rb => [s!"ldbrx {rt.num},{ra.num},{rb.num}"]
@@ -85,11 +87,20 @@ def Cond.branch (c : Cond) (l : String) : String :=
   | .eq => s!"bc 12,2,{l}"
   | .ne => s!"bc 4,2,{l}"
 
+/-- A conditional branch to a possibly distant label (conditional branches only
+reach ±32 KiB): the inverted condition skips an unconditional branch (±32 MiB),
+`bc <not c>,2f; b label; 2:`. -/
+def Cond.longBranch (c : Cond) (l : String) : String :=
+  match c with
+  | .eq => s!"bc 4,2,2f\n\tb {l}\n2:"
+  | .ne => s!"bc 12,2,2f\n\tb {l}\n2:"
+
 /-- `data` is emitted after the function (in `.text`, next to the code that
-computes its address). -/
-def printer (data : List String := []) : Printer isa where
+computes its address).  With `long`, conditional branches use the long form
+`Cond.longBranch` (for functions larger than 32 KiB). -/
+def printer (data : List String := []) (long : Bool := false) : Printer isa where
   instr := Instr.asm
-  branch := Cond.branch
+  branch := if long then Cond.longBranch else Cond.branch
   jump l := s!"b {l}"
   ret := ["blr"]
   header name := ["\t.abiversion 2", "\t.machine power8", "\t.text", "\t.p2align 6",
