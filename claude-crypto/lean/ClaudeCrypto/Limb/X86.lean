@@ -235,11 +235,12 @@ theorem sim_instr (sp : Addr) (i : Limb.Instr) (s s' : Limb.State) (t : X86.Stat
     · rename_i hn
       simp only [Option.some.injEq] at he; subst he
       by_cases hn0 : n = 0
-      · subst hn0
+      · -- a zero count still writes (here: rewrites) the destination
+        subst hn0
         x86_step
-        refine ⟨_, rfl, ⟨fun v => ?_, fun c hc => by simp [Limb.State.set] at hc, hr.mem, hr.rd, hr.wr, hr.labels, hr.rsp⟩⟩
-        simp only [Limb.State.set, update_apply, BitVec.ushiftRight_zero]
-        split_ifs with h <;> [subst h; skip] <;> exact hr.regs _
+        refine ⟨_, rfl, ?_⟩
+        simp only [BitVec.ushiftRight_zero]
+        rel_fin
       · x86_step; simp only [Nat.mod_eq_of_lt hn, hn0, ite_false]
         refine ⟨_, rfl, ?_⟩; rel_fin
     · cases he
@@ -249,11 +250,12 @@ theorem sim_instr (sp : Addr) (i : Limb.Instr) (s s' : Limb.State) (t : X86.Stat
     · rename_i hn
       simp only [Option.some.injEq] at he; subst he
       by_cases hn0 : n = 0
-      · subst hn0
+      · -- a zero count still writes (here: rewrites) the destination
+        subst hn0
         x86_step
-        refine ⟨_, rfl, ⟨fun v => ?_, fun c hc => by simp [Limb.State.set] at hc, hr.mem, hr.rd, hr.wr, hr.labels, hr.rsp⟩⟩
-        simp only [Limb.State.set, update_apply, BitVec.shiftLeft_zero]
-        split_ifs with h <;> [subst h; skip] <;> exact hr.regs _
+        refine ⟨_, rfl, ?_⟩
+        simp only [BitVec.shiftLeft_zero]
+        rel_fin
       · x86_step; simp only [Nat.mod_eq_of_lt hn, hn0, ite_false]
         refine ⟨_, rfl, ?_⟩; rel_fin
     · cases he

@@ -78,9 +78,11 @@ def step (i : Instr) (t : TState) : Option TState :=
     some (({ t with flags := p && t.flags }).setPub dst p)
   -- SIMD: vector registers are not tracked (always secret); only addresses matter
   | .vload128 _ m | .vload256 _ m | .vstore256 m _ | .vinserti128hi _ _ m | .vbroadcasti128 _ m
-  | .vpaddd _ _ (.mem m) => if t.memPub m then some t else none
+  | .vpaddd _ _ (.mem m) | .movdquLd _ m | .movdquSt m _ => if t.memPub m then some t else none
   | .vpaddd _ _ (.reg _) | .vpshufb .. | .vpxor .. | .vpalignr .. | .vpsrld .. | .vpslld ..
-  | .vpsrlq .. | .vpshufd .. | .vzeroupper => some t
+  | .vpsrlq .. | .vpshufd .. | .vzeroupper
+  | .movdqa .. | .paddd .. | .pshufb .. | .pshufd .. | .palignr .. | .punpcklqdq .. | .punpckhqdq ..
+  | .sha256rnds2 .. | .sha256msg1 .. | .sha256msg2 .. => some t
   | .mulx hi lo src =>
     let p := t.pub .rdx && t.pub src
     some ((t.setPub lo p).setPub hi p)
@@ -240,7 +242,7 @@ theorem execAlu_sound (w : Nat) (op : AluOp) (dst : Reg) (src : Src) (t t' : TSt
 
 theorem execV_frame (i : Instr) (s s' : State) (h : execV i s = some s') :
     s'.gpr = s.gpr ∧ s'.cf = s.cf ∧ s'.zf = s.zf ∧ s'.sf = s.sf ∧ s'.of = s.of ∧ s'.labels = s.labels := by
-  cases i <;> simp only [execV, State.setV, State.storeW, readVSrc, Option.map] at h <;>
+  cases i <;> simp only [execV, State.setX, State.setV, State.storeW, readVSrc, Option.map] at h <;>
     (try split at h) <;> (try split at h) <;> (try simp only [Option.some.injEq, reduceCtorEq] at h) <;>
     (try subst h) <;> (try exact ⟨rfl, rfl, rfl, rfl, rfl, rfl⟩) <;> (try cases h)
 
@@ -309,15 +311,13 @@ theorem execW_sound (w : Nat) (bs : BitVec w → BitVec w) (i : Instr) (t t' : T
     simp only [step, Option.some.injEq] at hstep; subst hstep
     simp only [execW, execShift] at h1 h2
     split at h1
-    · -- zero count: nothing changes
+    · -- zero count: the flags are unchanged, the destination is rewritten (zero-extended)
       rename_i hz
       rw [if_pos hz] at h2
       cases h1; cases h2
-      refine ⟨fun r hr => ?_, fun hf => hag.2.1 (by simp only [setPub, Bool.and_eq_true] at hf; exact hf.2), hag.2.2⟩
-      rw [setPub_pub] at hr
-      split_ifs at hr with he
-      · subst he; exact hag.1 _ hr
-      · exact hag.1 _ hr
+      refine Agree.writeW (t := { t with flags := t.pub dst && t.flags })
+        (hag.weaken_flags _ (fun hf => by simp only [Bool.and_eq_true] at hf; exact hf.2)) _ _ _ _ ?_
+      intro hp; rw [hag.readW w dst hp]
     · rename_i hz
       rw [if_neg hz] at h2
       have hd : t.pub dst = true → s₁.readW w dst = s₂.readW w dst := hag.readW w dst
@@ -413,7 +413,9 @@ theorem execW_sound (w : Nat) (bs : BitVec w → BitVec w) (i : Instr) (t t' : T
     simpa [State.writeW, State.setReg] using a1
   | vload128 _ m | vload256 _ m | vstore256 m _ | vinserti128hi _ _ m | vbroadcasti128 _ m
   | vpshufb _ _ _ | vpxor _ _ _ | vpalignr _ _ _ _ | vpsrld _ _ _ | vpslld _ _ _ | vpsrlq _ _ _
-  | vpshufd _ _ _ | vzeroupper | vpaddd _ _ _ =>
+  | vpshufd _ _ _ | vzeroupper | vpaddd _ _ _
+  | movdquLd _ _ | movdquSt _ _ | movdqa _ _ | paddd _ _ | pshufb _ _ | pshufd _ _ _ | palignr _ _ _
+  | punpcklqdq _ _ | punpckhqdq _ _ | sha256rnds2 _ _ | sha256msg1 _ _ | sha256msg2 _ _ =>
     have ht : t' = t := by
       simp only [step] at hstep
       (try split at hstep) <;> simp_all
@@ -474,7 +476,8 @@ theorem addrs_sound (i : Instr) (t t' : TState) (s₁ s₂ : State) (hstep : t.s
     split at hstep
     · rename_i hsp; simp only [addrs, State.getReg, hag.1 _ hsp]
     · cases hstep
-  | vload128 _ m | vload256 _ m | vstore256 m _ | vinserti128hi _ _ m | vbroadcasti128 _ m =>
+  | vload128 _ m | vload256 _ m | vstore256 m _ | vinserti128hi _ _ m | vbroadcasti128 _ m
+  | movdquLd _ m | movdquSt m _ =>
     simp only [step] at hstep
     split at hstep
     · rename_i hm; simp only [addrs, hag.ea m hm]

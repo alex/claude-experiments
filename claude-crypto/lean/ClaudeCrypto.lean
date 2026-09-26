@@ -37,6 +37,12 @@ import ClaudeCrypto.X86.SHA256.Avx2Small
 import ClaudeCrypto.X86.SHA256.Avx2Iter
 import ClaudeCrypto.X86.SHA256.Avx2Main
 import ClaudeCrypto.X86.SHA256.Avx2CT
+import ClaudeCrypto.X86.SHA256.ShaNi
+import ClaudeCrypto.X86.SHA256.ShaNiLemmas
+import ClaudeCrypto.X86.SHA256.ShaNiPhases
+import ClaudeCrypto.X86.SHA256.ShaNiBlock
+import ClaudeCrypto.X86.SHA256.ShaNiMain
+import ClaudeCrypto.X86.SHA256.ShaNiCT
 import ClaudeCrypto.Spec.Pratt
 import ClaudeCrypto.Spec.P384Cert
 import ClaudeCrypto.Spec.P384Facts

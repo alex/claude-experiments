@@ -211,6 +211,32 @@ inductive Instr
   | mulx (hi lo src : Reg)
   /-- `movabs dst, imm64` -/
   | movabs (dst : Reg) (v : BitVec 64)
+  -- Legacy-SSE (non-VEX) 128-bit instructions.  They operate on the low
+  -- 128 bits (`xmm`) of the vector registers and leave bits 255:128 unmodified.
+  /-- `movdqu xmm, m128` -/
+  | movdquLd (dst : VReg) (m : MemOp)
+  /-- `movdqu m128, xmm` -/
+  | movdquSt (m : MemOp) (src : VReg)
+  /-- `movdqa xmm1, xmm2` (register form) -/
+  | movdqa (dst src : VReg)
+  /-- `paddd xmm1, xmm2` -/
+  | paddd (dst src : VReg)
+  /-- `pshufb xmm1, xmm2` -/
+  | pshufb (dst src : VReg)
+  /-- `pshufd xmm1, xmm2, imm8` -/
+  | pshufd (dst src : VReg) (imm : Nat)
+  /-- `palignr xmm1, xmm2, imm8` -/
+  | palignr (dst src : VReg) (imm : Nat)
+  /-- `punpcklqdq xmm1, xmm2` -/
+  | punpcklqdq (dst src : VReg)
+  /-- `punpckhqdq xmm1, xmm2` -/
+  | punpckhqdq (dst src : VReg)
+  /-- `sha256rnds2 xmm1, xmm2, <xmm0>` (SHA extensions) -/
+  | sha256rnds2 (dst src : VReg)
+  /-- `sha256msg1 xmm1, xmm2` -/
+  | sha256msg1 (dst src : VReg)
+  /-- `sha256msg2 xmm1, xmm2` -/
+  | sha256msg2 (dst src : VReg)
   deriving DecidableEq, Repr
 
 /-- Branch conditions (`jcc` suffixes). -/
@@ -302,11 +328,12 @@ def execAlu (w : Nat) (op : AluOp) (dst : Reg) (src : Src) (s : State) : Option 
   | .test => let r := a &&& b; some (arithFlags s r false false)
 
 /-- Shifts and rotates by an immediate count.  The count is masked to 5 (32-bit)
-or 6 (64-bit) bits; a zero count changes nothing.  OF is only defined for a
-count of 1. -/
+or 6 (64-bit) bits; a zero count leaves the flags unaffected, but the
+destination is still written, so a 32-bit destination is zero-extended
+(SDM Vol. 1 §3.4.1.1).  OF is only defined for a count of 1. -/
 def execShift (w : Nat) (op : ShiftOp) (dst : Reg) (n : Nat) (s : State) : Option State :=
   let cnt := n % w
-  if cnt = 0 then some s else
+  if cnt = 0 then some (s.writeW dst (s.readW w dst)) else
   let v := s.readW w dst
   match op with
   | .ror => let r := v.rotateRight cnt
@@ -372,6 +399,123 @@ def zeroUpper (v : VRegs) : VRegs :=
   ⟨z v.y0, z v.y1, z v.y2, z v.y3, z v.y4, z v.y5, z v.y6, z v.y7,
    z v.y8, z v.y9, z v.y10, z v.y11, z v.y12, z v.y13, z v.y14, z v.y15⟩
 
+/-! ### Legacy SSE (128-bit, non-VEX encodings) and the SHA extensions
+
+The legacy-SSE forms of these instructions write `DEST[127:0]` and leave
+`DEST[MAXVL-1:128]` unmodified (the "`DEST[MAXVL-1:128] (Unmodified)`" line of
+their SDM pseudocode). -/
+
+/-- The low 128 bits (`xmm`) of a vector register. -/
+def State.getX (s : State) (v : VReg) : BitVec 128 := (s.getV v).setWidth 128
+
+/-- Write `xmm` as a legacy-SSE instruction does: bits 255:128 are unmodified. -/
+def State.setX (s : State) (v : VReg) (x : BitVec 128) : State :=
+  s.setV v ((s.getV v).extractLsb' 128 128 ++ x)
+
+/-- `PADDD` (128-bit): `DEST[31:0] := DEST[31:0] + SRC[31:0]; …;
+DEST[127:96] := DEST[127:96] + SRC[127:96]`. -/
+def padddX (x y : BitVec 128) : BitVec 128 :=
+  BitVec.lanes 4 fun i => BitVec.lane 32 x i + BitVec.lane 32 y i
+
+/-- `PUNPCKLQDQ` (128-bit): `INTERLEAVE_QWORDS(DEST, SRC)`, i.e.
+`DEST[63:0] := DEST[63:0]; DEST[127:64] := SRC[63:0]`. -/
+def punpcklqdqX (dst src : BitVec 128) : BitVec 128 := src.extractLsb' 0 64 ++ dst.extractLsb' 0 64
+
+/-- `PUNPCKHQDQ` (128-bit): `INTERLEAVE_HIGH_QWORDS(DEST, SRC)`, i.e.
+`DEST[63:0] := DEST[127:64]; DEST[127:64] := SRC[127:64]`. -/
+def punpckhqdqX (dst src : BitVec 128) : BitVec 128 := src.extractLsb' 64 64 ++ dst.extractLsb' 64 64
+
+/-! The SHA extensions (SDM Vol. 2, `SHA256RNDS2`, `SHA256MSG1`, `SHA256MSG2`),
+with the functions their pseudocode uses:
+```
+Ch(E,F,G)  := (E AND F) XOR ((NOT E) AND G)
+Maj(A,B,C) := (A AND B) XOR (A AND C) XOR (B AND C)
+Σ0(A) := (A ROR 2) XOR (A ROR 13) XOR (A ROR 22)
+Σ1(E) := (E ROR 6) XOR (E ROR 11) XOR (E ROR 25)
+σ0(W) := (W ROR 7) XOR (W ROR 18) XOR (W >> 3)
+σ1(W) := (W ROR 17) XOR (W ROR 19) XOR (W >> 10)
+``` -/
+
+def shaCh (e f g : BitVec 32) : BitVec 32 := (e &&& f) ^^^ (~~~e &&& g)
+def shaMaj (a b c : BitVec 32) : BitVec 32 := (a &&& b) ^^^ (a &&& c) ^^^ (b &&& c)
+def shaSIGMA0 (a : BitVec 32) : BitVec 32 := a.rotateRight 2 ^^^ a.rotateRight 13 ^^^ a.rotateRight 22
+def shaSIGMA1 (e : BitVec 32) : BitVec 32 := e.rotateRight 6 ^^^ e.rotateRight 11 ^^^ e.rotateRight 25
+def shaSigma0 (w : BitVec 32) : BitVec 32 := w.rotateRight 7 ^^^ w.rotateRight 18 ^^^ w >>> 3
+def shaSigma1 (w : BitVec 32) : BitVec 32 := w.rotateRight 17 ^^^ w.rotateRight 19 ^^^ w >>> 10
+
+/-- `SHA256RNDS2 xmm1, xmm2/m128, <XMM0>` with `SRC1 = xmm1`, `SRC2 = xmm2`:
+```
+A_0 := SRC2[127:96]; B_0 := SRC2[95:64]; C_0 := SRC1[127:96]; D_0 := SRC1[95:64];
+E_0 := SRC2[63:32];  F_0 := SRC2[31:0];  G_0 := SRC1[63:32];  H_0 := SRC1[31:0];
+WK0 := XMM0[31:0]; WK1 := XMM0[63:32];
+FOR i = 0 to 1
+  A_(i+1) := Ch(E_i, F_i, G_i) + Σ1(E_i) + WK_i + H_i + Maj(A_i, B_i, C_i) + Σ0(A_i);
+  B_(i+1) := A_i; C_(i+1) := B_i; D_(i+1) := C_i;
+  E_(i+1) := Ch(E_i, F_i, G_i) + Σ1(E_i) + WK_i + H_i + D_i;
+  F_(i+1) := E_i; G_(i+1) := F_i; H_(i+1) := G_i;
+ENDFOR
+DEST[127:96] := A_2; DEST[95:64] := B_2; DEST[63:32] := E_2; DEST[31:0] := F_2;
+```
+-/
+def sha256rnds2 (src1 src2 xmm0 : BitVec 128) : BitVec 128 :=
+  let A0 := src2.extractLsb' 96 32
+  let B0 := src2.extractLsb' 64 32
+  let C0 := src1.extractLsb' 96 32
+  let D0 := src1.extractLsb' 64 32
+  let E0 := src2.extractLsb' 32 32
+  let F0 := src2.extractLsb' 0 32
+  let G0 := src1.extractLsb' 32 32
+  let H0 := src1.extractLsb' 0 32
+  let WK0 := xmm0.extractLsb' 0 32
+  let WK1 := xmm0.extractLsb' 32 32
+  -- i = 0
+  let A1 := shaCh E0 F0 G0 + shaSIGMA1 E0 + WK0 + H0 + shaMaj A0 B0 C0 + shaSIGMA0 A0
+  let B1 := A0
+  let C1 := B0
+  let D1 := C0
+  let E1 := shaCh E0 F0 G0 + shaSIGMA1 E0 + WK0 + H0 + D0
+  let F1 := E0
+  let G1 := F0
+  let H1 := G0
+  -- i = 1
+  let A2 := shaCh E1 F1 G1 + shaSIGMA1 E1 + WK1 + H1 + shaMaj A1 B1 C1 + shaSIGMA0 A1
+  let B2 := A1
+  let E2 := shaCh E1 F1 G1 + shaSIGMA1 E1 + WK1 + H1 + D1
+  let F2 := E1
+  A2 ++ B2 ++ E2 ++ F2
+
+/-- `SHA256MSG1 xmm1, xmm2/m128` with `SRC1 = xmm1`, `SRC2 = xmm2`:
+```
+W4 := SRC2[31:0]; W3 := SRC1[127:96]; W2 := SRC1[95:64]; W1 := SRC1[63:32]; W0 := SRC1[31:0];
+DEST[127:96] := W3 + σ0(W4); DEST[95:64] := W2 + σ0(W3);
+DEST[63:32] := W1 + σ0(W2);  DEST[31:0] := W0 + σ0(W1);
+```
+-/
+def sha256msg1 (src1 src2 : BitVec 128) : BitVec 128 :=
+  let W4 := src2.extractLsb' 0 32
+  let W3 := src1.extractLsb' 96 32
+  let W2 := src1.extractLsb' 64 32
+  let W1 := src1.extractLsb' 32 32
+  let W0 := src1.extractLsb' 0 32
+  (W3 + shaSigma0 W4) ++ (W2 + shaSigma0 W3) ++ (W1 + shaSigma0 W2) ++ (W0 + shaSigma0 W1)
+
+/-- `SHA256MSG2 xmm1, xmm2/m128` with `SRC1 = xmm1`, `SRC2 = xmm2`:
+```
+W14 := SRC2[95:64]; W15 := SRC2[127:96];
+W16 := SRC1[31:0] + σ1(W14);  W17 := SRC1[63:32] + σ1(W15);
+W18 := SRC1[95:64] + σ1(W16); W19 := SRC1[127:96] + σ1(W17);
+DEST[127:96] := W19; DEST[95:64] := W18; DEST[63:32] := W17; DEST[31:0] := W16;
+```
+-/
+def sha256msg2 (src1 src2 : BitVec 128) : BitVec 128 :=
+  let W14 := src2.extractLsb' 64 32
+  let W15 := src2.extractLsb' 96 32
+  let W16 := src1.extractLsb' 0 32 + shaSigma1 W14
+  let W17 := src1.extractLsb' 32 32 + shaSigma1 W15
+  let W18 := src1.extractLsb' 64 32 + shaSigma1 W16
+  let W19 := src1.extractLsb' 96 32 + shaSigma1 W17
+  W19 ++ W18 ++ W17 ++ W16
+
 def readVSrc (s : State) : VSrc → Option (BitVec 256)
   | .reg v => some (s.getV v)
   | .mem m => s.loadW 256 (s.ea m)
@@ -394,6 +538,18 @@ def execV (i : Instr) (s : State) : Option State :=
   | .vpsrlq dst src n => some (s.setV dst (vpsrlqV (s.getV src) n))
   | .vpshufd dst src imm => some (s.setV dst (vpshufdV (s.getV src) imm))
   | .vzeroupper => some { s with vec := zeroUpper s.vec }
+  | .movdquLd dst m => (s.loadW 128 (s.ea m)).map fun v => s.setX dst v
+  | .movdquSt m src => s.storeW (s.ea m) (s.getX src)
+  | .movdqa dst src => some (s.setX dst (s.getX src))
+  | .paddd dst src => some (s.setX dst (padddX (s.getX dst) (s.getX src)))
+  | .pshufb dst src => some (s.setX dst (pshufb128 (s.getX dst) (s.getX src)))
+  | .pshufd dst src imm => some (s.setX dst (pshufd128 (s.getX src) imm))
+  | .palignr dst src imm => some (s.setX dst (palignr128 (s.getX dst) (s.getX src) imm))
+  | .punpcklqdq dst src => some (s.setX dst (punpcklqdqX (s.getX dst) (s.getX src)))
+  | .punpckhqdq dst src => some (s.setX dst (punpckhqdqX (s.getX dst) (s.getX src)))
+  | .sha256rnds2 dst src => some (s.setX dst (sha256rnds2 (s.getX dst) (s.getX src) (s.getX .y0)))
+  | .sha256msg1 dst src => some (s.setX dst (sha256msg1 (s.getX dst) (s.getX src)))
+  | .sha256msg2 dst src => some (s.setX dst (sha256msg2 (s.getX dst) (s.getX src)))
   | _ => none
 
 /-- Instruction semantics at a fixed width `w ∈ {32, 64}`. -/
@@ -449,6 +605,7 @@ def addrs (i : Instr) (s : State) : List Addr :=
   | .vload128 _ m | .vload256 _ m | .vstore256 m _ | .vinserti128hi _ _ m | .vbroadcasti128 _ m =>
     [s.ea m]
   | .vpaddd _ _ (.mem m) => [s.ea m]
+  | .movdquLd _ m | .movdquSt m _ => [s.ea m]
   | _ => []
 
 def evalCond (c : Cond) (s : State) : Option Bool :=

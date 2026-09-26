@@ -21,6 +21,10 @@ fn compress(state: &mut [u32; 8], blocks: &[u8]) {
     // checked at run time.
     #[cfg(target_arch = "x86_64")]
     {
+        if crate::cpu::has_sha_ni() {
+            unsafe { asm::cc_sha256_blocks_x86_shani(state.as_mut_ptr(), blocks.as_ptr(), n) };
+            return;
+        }
         match crate::cpu::x86_level() {
             crate::cpu::X86Level::Avx2 => unsafe {
                 asm::cc_sha256_blocks_x86_avx2(state.as_mut_ptr(), blocks.as_ptr(), n)
@@ -110,14 +114,80 @@ pub fn sha256(data: &[u8]) -> [u8; 32] {
 
 #[cfg(all(test, target_arch = "x86_64"))]
 mod tests {
+    extern crate std;
+
     use super::*;
-    use crate::cpu::{x86_level, X86Level};
+    use crate::cpu::{has_sha_ni, x86_level, X86Level};
+
+    /// Runs `cc_sha256_blocks_x86_shani` once; used by `sha_ni_executes` in a
+    /// child process (which dies of SIGILL if the CPU lacks SHA-NI).
+    #[test]
+    #[ignore = "helper, run in a child process by `implementations_agree`"]
+    fn sha_ni_probe() {
+        let mut s = H0;
+        let block = [0u8; 64];
+        unsafe { asm::cc_sha256_blocks_x86_shani(s.as_mut_ptr(), block.as_ptr(), 1) };
+    }
+
+    /// Whether the SHA-NI code can be tested here: CPUID reports SHA-NI, or
+    /// the CPU executes the instructions anyway (some CPUs/VMs do not
+    /// advertise them), as checked by running `sha_ni_probe` in a child process.
+    fn sha_ni_executes() -> bool {
+        if has_sha_ni() {
+            return true;
+        }
+        let Ok(exe) = std::env::current_exe() else { return false };
+        std::process::Command::new(exe)
+            .args(["--exact", "sha256::tests::sha_ni_probe", "--ignored", "--test-threads=1"])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map_or(false, |st| st.success())
+    }
+
+    /// The SHA-NI code against the portable reference, from random hash
+    /// values and for 0 to 40 blocks.
+    #[test]
+    fn sha_ni_random() {
+        if !sha_ni_executes() {
+            std::eprintln!("note: SHA-NI not available, cc_sha256_blocks_x86_shani not tested");
+            return;
+        }
+        let mut x: u64 = 0x0123_4567_89ab_cdef;
+        let mut next = || {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x
+        };
+        let mut data = [0u8; 64 * 40];
+        for iter in 0..400 {
+            let n = iter % 41;
+            for b in data.iter_mut() {
+                *b = next() as u8;
+            }
+            let mut h = [0u32; 8];
+            for w in h.iter_mut() {
+                *w = next() as u32;
+            }
+            let blocks = &data[..64 * n];
+            let mut reference = h;
+            crate::portable::compress(&mut reference, blocks);
+            let mut s = h;
+            unsafe { asm::cc_sha256_blocks_x86_shani(s.as_mut_ptr(), blocks.as_ptr(), n) };
+            assert_eq!(s, reference, "sha-ni, {n} blocks");
+        }
+    }
 
     /// All implementations available on this CPU agree (the dispatcher only
     /// ever picks one of them).
     #[test]
     fn implementations_agree() {
         let level = x86_level();
+        let sha_ni = sha_ni_executes();
+        if !sha_ni {
+            std::eprintln!("note: SHA-NI not available, cc_sha256_blocks_x86_shani not tested");
+        }
         let mut x: u64 = 0x9e37_79b9_7f4a_7c15;
         let mut data = [0u8; 64 * 9];
         for n in 0..=9 {
@@ -139,6 +209,11 @@ mod tests {
                 let mut s = H0;
                 unsafe { asm::cc_sha256_blocks_x86_avx2(s.as_mut_ptr(), blocks.as_ptr(), n) };
                 assert_eq!(s, reference, "avx2, {n} blocks");
+            }
+            if sha_ni {
+                let mut s = H0;
+                unsafe { asm::cc_sha256_blocks_x86_shani(s.as_mut_ptr(), blocks.as_ptr(), n) };
+                assert_eq!(s, reference, "sha-ni, {n} blocks");
             }
         }
     }

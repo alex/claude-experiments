@@ -8,6 +8,7 @@ exposes them.
 |---|---|---|---|---|
 | SHA-256 (compression function over n blocks) | x86-64 | scalar (BMI2) | ✅ `CC.X86.SHA256Scalar.correct` | ✅ `…Scalar.constant_time` |
 | | x86-64 | AVX2 (2 blocks/iteration, vectorised schedule) | ✅ `CC.X86.SHA256Avx2.correct` | ✅ `…Avx2.constant_time` |
+| | x86-64 | SHA extensions (SHA-NI) | ✅ `CC.X86.SHA256ShaNi.correct` | ✅ `…ShaNi.constant_time` |
 | | AArch64 | ARMv8 crypto extensions | ✅ `CC.Arm.SHA256Ce.correct` | ✅ `…Ce.constant_time` |
 | | ppc64le | POWER8 vector crypto | ✅ `CC.Ppc.SHA256P8.correct` | ✅ `…P8.constant_time` |
 | ECDSA P-384 signature verification | IR (below) | Montgomery field arithmetic, Fermat inversion, Shamir double-scalar ladder | ✅ `CC.P384.main_ok` | n/a (public inputs) |
@@ -37,13 +38,18 @@ To trust a result you need to review:
    memory regions, postcondition).
 3. **The trusted computing base**:
    * the ISA models (`*/Basic.lean`), which transcribe the vendor pseudocode.
-     The AArch64 and ppc64le models are differentially tested against QEMU
-     (`test/run_aarch64.sh`, `test/run_ppc64le.sh`: tens of thousands of
-     random instruction vectors); the x86-64 model against hardware is in
-     progress;
+     They are differentially tested instruction by instruction: x86-64
+     against hardware (`test/run_x86.sh`: every constructor of the model,
+     590 instruction forms, ~378k vectors including the SHA-NI instructions),
+     AArch64 and ppc64le against QEMU (`test/run_aarch64.sh`,
+     `test/run_ppc64le.sh`). The x86 test found one model bug (32-bit
+     shifts by a zero count must zero-extend), now fixed; no verified code
+     was affected;
    * the printers (`*/Print.lean`) and the assembler/linker;
    * Lean's kernel, and the axioms `propext`, `Classical.choice`, `Quot.sound`
-     (no `sorry`, `native_decide` or `bv_decide` anywhere in the proofs).
+     (no `sorry`, `native_decide` or `bv_decide` in any proof; the only
+     `native_decide` is in `Spec/SHA256Test.lean`, a known-answer sanity check
+     of the spec that no theorem depends on).
 
 Everything else — the IR, the compilers, the P-384 field/point/scalar
 programs, all intermediate lemmas — is checked by Lean and need not be read.
@@ -96,13 +102,24 @@ lifts it to whole programs).  The IR proof is layered:
 
 ## Performance
 
-Measured on the development machine (Xeon, no SHA-NI), OpenSSL 3.0.13:
+Measured on the development machine (Xeon), OpenSSL 3.0.13, without SHA-NI:
 
 | | this crate | OpenSSL |
 |---|---|---|
 | SHA-256, 16 KiB messages (AVX2) | ~400 MB/s | ~395 MB/s |
 | SHA-256, 64-byte messages | ~175 MB/s | ~82 MB/s |
 | ECDSA P-384 verify | ~1790 verify/s | ~1280 verify/s |
+
+With SHA-NI (the development machine executes the SHA extensions although
+CPUID does not report them, so this was measured with a C harness calling
+`cc_sha256_blocks_x86_shani`, padding included, against OpenSSL's
+`EVP_Digest` forced onto its SHA-NI code with `OPENSSL_ia32cap=":0x20000000"`):
+
+| SHA-256 | `cc_sha256_blocks_x86_shani` | OpenSSL (SHA-NI) |
+|---|---|---|
+| 64-byte messages | ~440 MB/s | ~120 MB/s |
+| 1 KiB messages | ~1150 MB/s | ~795 MB/s |
+| 16 KiB messages | ~1245 MB/s | ~1200 MB/s |
 
 (AArch64 and ppc64le code was tested under QEMU only.)
 
@@ -112,6 +129,7 @@ Measured on the development machine (Xeon, no SHA-NI), OpenSSL 3.0.13:
 cd lean && lake build           # checks every proof
 lake exe emit ../asm            # regenerates asm/
 cd ../rust && cargo test        # runs the Rust tests (x86-64 natively; see .cargo/config.toml for qemu targets)
+sh test/run_x86.sh              # x86 model vs this CPU + end-to-end tests
 sh test/run_aarch64.sh          # instruction-level + end-to-end tests under qemu
 sh test/run_ppc64le.sh
 ```

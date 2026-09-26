@@ -87,6 +87,18 @@ def Instr.asm : Instr → List String
   | .vzeroupper => ["vzeroupper"]
   | .mulx hi lo src => [s!"mulx {hi.name64}, {lo.name64}, {src.name64}"]
   | .movabs d v => [s!"movabs {d.name64}, {v.toNat}"]
+  | .movdquLd d m => [s!"movdqu {d.xname}, XMMWORD PTR {m.str}"]
+  | .movdquSt m v => [s!"movdqu XMMWORD PTR {m.str}, {v.xname}"]
+  | .movdqa d a => [s!"movdqa {d.xname}, {a.xname}"]
+  | .paddd d a => [s!"paddd {d.xname}, {a.xname}"]
+  | .pshufb d a => [s!"pshufb {d.xname}, {a.xname}"]
+  | .pshufd d a n => [s!"pshufd {d.xname}, {a.xname}, {n}"]
+  | .palignr d a n => [s!"palignr {d.xname}, {a.xname}, {n}"]
+  | .punpcklqdq d a => [s!"punpcklqdq {d.xname}, {a.xname}"]
+  | .punpckhqdq d a => [s!"punpckhqdq {d.xname}, {a.xname}"]
+  | .sha256rnds2 d a => [s!"sha256rnds2 {d.xname}, {a.xname}, xmm0"]
+  | .sha256msg1 d a => [s!"sha256msg1 {d.xname}, {a.xname}"]
+  | .sha256msg2 d a => [s!"sha256msg2 {d.xname}, {a.xname}"]
 
 def Cond.name : Cond → String
   | .e => "e" | .ne => "ne" | .b => "b" | .ae => "ae" | .be => "be" | .a => "a"

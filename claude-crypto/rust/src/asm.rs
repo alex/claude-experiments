@@ -17,6 +17,15 @@ extern "C" {
     /// stack.
     pub fn cc_sha256_blocks_x86_avx2(state: *mut u32, data: *const u8, nblocks: usize);
 
+    /// Compress `nblocks` 64-byte blocks from `data` into `state`.
+    ///
+    /// Verified contract (Lean: `CC.X86.SHA256ShaNi.correct`): requires the
+    /// SHA extensions (SHA-NI) and SSSE3; `data` must be readable for
+    /// `64 * nblocks` bytes and `state` readable and writable for 32 bytes.
+    /// Uses no stack and preserves all callee-saved registers (it writes only
+    /// `rsi`, `rdx`, the flags and `xmm0`–`xmm10`).
+    pub fn cc_sha256_blocks_x86_shani(state: *mut u32, data: *const u8, nblocks: usize);
+
     /// ECDSA-P384 verification: returns 1 (valid) or 0 (invalid).
     ///
     /// Generated from `CC.P384.main` (Lean: `CC.X86.P384Wrap`): requires BMI2

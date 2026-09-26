@@ -1,5 +1,6 @@
 import ClaudeCrypto.X86.SHA256.Scalar
 import ClaudeCrypto.X86.SHA256.Avx2
+import ClaudeCrypto.X86.SHA256.ShaNi
 import ClaudeCrypto.Arm.SHA256.Ce
 import ClaudeCrypto.Ppc.SHA256.P8
 import ClaudeCrypto.X86.P384Wrap
@@ -11,6 +12,7 @@ import ClaudeCrypto.Ppc.P384Wrap
 def files : List (String × String) := [
   ("x86_64/sha256_scalar.S", CC.X86.SHA256Scalar.asm),
   ("x86_64/sha256_avx2.S", CC.X86.SHA256Avx2.asm ++ CC.dataSection CC.X86.SHA256Avx2.dataTables),
+  ("x86_64/sha256_shani.S", CC.X86.SHA256ShaNi.asm ++ CC.dataSection CC.X86.SHA256ShaNi.dataTables),
   ("aarch64/sha256.S", CC.Arm.SHA256Ce.asm),
   ("ppc64le/sha256.S", CC.Ppc.SHA256P8.asm),
   ("x86_64/p384_verify.S", CC.X86.P384Wrap.asm),
