@@ -1,0 +1,28 @@
+[package]
+name = "rustlibc"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "A statically linked Linux libc written in Rust"
+publish = false
+
+[lib]
+# The archive must be called libc.a so that `-lc` finds it.
+name = "c"
+crate-type = ["staticlib", "rlib"]
+# Rust doctests cannot run for a freestanding crate.
+doctest = false
+
+[dependencies]
+# The Rust port of musl's math library, used for <math.h>.
+libm = "0.2"
+
+[lints.rust]
+# Every exported C function is `unsafe extern "C"`; we do not want the
+# `unsafe_op_in_unsafe_fn` lint hiding the actual unsafe operations inside.
+unsafe_op_in_unsafe_fn = "warn"
+missing_docs = "warn"
+
+[lints.clippy]
+undocumented_unsafe_blocks = "warn"

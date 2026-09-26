@@ -1,0 +1,4 @@
+from system
+before fork
+child says hi
+parent done
