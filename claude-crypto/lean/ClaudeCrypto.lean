@@ -10,3 +10,6 @@ import ClaudeCrypto.X86.Print
 import ClaudeCrypto.X86.Sym
 import ClaudeCrypto.X86.SHA256.Scalar
 import ClaudeCrypto.X86.SHA256.ScalarMain
+import ClaudeCrypto.X86.SHA256.ScalarCT
+import ClaudeCrypto.Framework.Taint
+import ClaudeCrypto.X86.Taint

@@ -45,13 +45,13 @@ structure Regs where
   deriving DecidableEq, Repr
 
 namespace Regs
-@[simp] def get (g : Regs) : Reg → BitVec 64
+def get (g : Regs) : Reg → BitVec 64
   | .rax => g.rax | .rcx => g.rcx | .rdx => g.rdx | .rbx => g.rbx
   | .rsp => g.rsp | .rbp => g.rbp | .rsi => g.rsi | .rdi => g.rdi
   | .r8 => g.r8 | .r9 => g.r9 | .r10 => g.r10 | .r11 => g.r11
   | .r12 => g.r12 | .r13 => g.r13 | .r14 => g.r14 | .r15 => g.r15
 
-@[simp] def set (g : Regs) (r : Reg) (v : BitVec 64) : Regs :=
+def set (g : Regs) (r : Reg) (v : BitVec 64) : Regs :=
   match r with
   | .rax => { g with rax := v } | .rcx => { g with rcx := v }
   | .rdx => { g with rdx := v } | .rbx => { g with rbx := v }
@@ -89,13 +89,13 @@ structure VRegs where
   deriving DecidableEq, Repr
 
 namespace VRegs
-@[simp] def get (g : VRegs) : VReg → BitVec 256
+def get (g : VRegs) : VReg → BitVec 256
   | .y0 => g.y0 | .y1 => g.y1 | .y2 => g.y2 | .y3 => g.y3
   | .y4 => g.y4 | .y5 => g.y5 | .y6 => g.y6 | .y7 => g.y7
   | .y8 => g.y8 | .y9 => g.y9 | .y10 => g.y10 | .y11 => g.y11
   | .y12 => g.y12 | .y13 => g.y13 | .y14 => g.y14 | .y15 => g.y15
 
-@[simp] def set (g : VRegs) (r : VReg) (v : BitVec 256) : VRegs :=
+def set (g : VRegs) (r : VReg) (v : BitVec 256) : VRegs :=
   match r with
   | .y0 => { g with y0 := v } | .y1 => { g with y1 := v }
   | .y2 => { g with y2 := v } | .y3 => { g with y3 := v }
