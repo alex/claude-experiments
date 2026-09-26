@@ -85,6 +85,8 @@ def Instr.asm : Instr → List String
   | .vpsrlq d a n => [s!"vpsrlq {d.name}, {a.name}, {n}"]
   | .vpshufd d a n => [s!"vpshufd {d.name}, {a.name}, {n}"]
   | .vzeroupper => ["vzeroupper"]
+  | .mulx hi lo src => [s!"mulx {hi.name64}, {lo.name64}, {src.name64}"]
+  | .movabs d v => [s!"movabs {d.name64}, {v.toNat}"]
 
 def Cond.name : Cond → String
   | .e => "e" | .ne => "ne" | .b => "b" | .ae => "ae" | .be => "be" | .a => "a"

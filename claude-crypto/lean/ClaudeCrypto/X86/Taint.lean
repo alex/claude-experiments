@@ -81,6 +81,10 @@ def step (i : Instr) (t : TState) : Option TState :=
   | .vpaddd _ _ (.mem m) => if t.memPub m then some t else none
   | .vpaddd _ _ (.reg _) | .vpshufb .. | .vpxor .. | .vpalignr .. | .vpsrld .. | .vpslld ..
   | .vpsrlq .. | .vpshufd .. | .vzeroupper => some t
+  | .mulx hi lo src =>
+    let p := t.pub .rdx && t.pub src
+    some ((t.setPub lo p).setPub hi p)
+  | .movabs dst _ => some (t.setPub dst true)
 
 def condOk (_ : Cond) (t : TState) : Bool := t.flags
 
@@ -387,6 +391,26 @@ theorem execW_sound (w : Nat) (bs : BitVec w → BitVec w) (i : Instr) (t t' : T
           have h2 := h1.writeW (w := 64) r false v₁ v₂ (fun h => by cases h)
           simpa [State.writeW, State.setReg] using h2
     · cases hstep
+  | mulx hi lo src =>
+    simp only [step, Option.some.injEq] at hstep; subst hstep
+    simp only [execW, Option.some.injEq] at h1 h2; subst h1; subst h2
+    have hp : (t.pub .rdx && t.pub src) = true →
+        (s₁.getReg .rdx).toNat * (s₁.getReg src).toNat = (s₂.getReg .rdx).toNat * (s₂.getReg src).toNat := by
+      intro h
+      simp only [Bool.and_eq_true] at h
+      simp only [State.getReg, hag.1 _ h.1, hag.1 _ h.2]
+    have a1 := hag.writeW (w := 64) lo (t.pub .rdx && t.pub src)
+      (BitVec.ofNat 64 ((s₁.getReg .rdx).toNat * (s₁.getReg src).toNat))
+      (BitVec.ofNat 64 ((s₂.getReg .rdx).toNat * (s₂.getReg src).toNat)) (fun h => by rw [hp h])
+    have a2 := a1.writeW (w := 64) hi (t.pub .rdx && t.pub src)
+      (BitVec.ofNat 64 ((s₁.getReg .rdx).toNat * (s₁.getReg src).toNat / 2 ^ 64))
+      (BitVec.ofNat 64 ((s₂.getReg .rdx).toNat * (s₂.getReg src).toNat / 2 ^ 64)) (fun h => by rw [hp h])
+    simpa [State.writeW, State.setReg] using a2
+  | movabs dst v =>
+    simp only [step, Option.some.injEq] at hstep; subst hstep
+    simp only [execW, Option.some.injEq] at h1 h2; subst h1; subst h2
+    have a1 := hag.writeW (w := 64) dst true v v (fun _ => rfl)
+    simpa [State.writeW, State.setReg] using a1
   | vload128 _ m | vload256 _ m | vstore256 m _ | vinserti128hi _ _ m | vbroadcasti128 _ m
   | vpshufb _ _ _ | vpxor _ _ _ | vpalignr _ _ _ _ | vpsrld _ _ _ | vpslld _ _ _ | vpsrlq _ _ _
   | vpshufd _ _ _ | vzeroupper | vpaddd _ _ _ =>

@@ -206,6 +206,11 @@ inductive Instr
   /-- `vpshufd dst, src, imm` (per 128-bit lane) -/
   | vpshufd (dst src : VReg) (imm : Nat)
   | vzeroupper
+  /-- `mulx hi, lo, src`: `hi:lo := rdx * src` (BMI2; 64-bit; flags unaffected).
+  If `hi = lo` the register receives the high half. -/
+  | mulx (hi lo src : Reg)
+  /-- `movabs dst, imm64` -/
+  | movabs (dst : Reg) (v : BitVec 64)
   deriving DecidableEq, Repr
 
 /-- Branch conditions (`jcc` suffixes). -/
@@ -419,6 +424,10 @@ def execW (w : Nat) (bswap : BitVec w → BitVec w) (i : Instr) (s : State) : Op
     (s.storeW sp (s.getReg r)).map fun s' => s'.setReg .rsp sp
   | .pop r => (s.loadW 64 (s.getReg .rsp)).map fun v =>
     (s.setReg .rsp (s.getReg .rsp + 8)).setReg r v
+  | .mulx hi lo src =>
+    let p := (s.getReg .rdx).toNat * (s.getReg src).toNat
+    some ((s.setReg lo (BitVec.ofNat 64 p)).setReg hi (BitVec.ofNat 64 (p / 2 ^ 64)))
+  | .movabs dst v => some (s.setReg dst v)
   | _ => execV i s
 
 def Instr.sz : Instr → Sz
