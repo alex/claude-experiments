@@ -1,11 +1,13 @@
 import ClaudeCrypto.X86.SHA256.Scalar
 import ClaudeCrypto.X86.SHA256.Avx2
+import ClaudeCrypto.Arm.SHA256.Ce
 
 /-! Writes the generated assembly files.  Usage: `lake exe emit <outdir>` -/
 
 def files : List (String × String) := [
   ("x86_64/sha256_scalar.S", CC.X86.SHA256Scalar.asm),
-  ("x86_64/sha256_avx2.S", CC.X86.SHA256Avx2.asm ++ CC.dataSection CC.X86.SHA256Avx2.dataTables)
+  ("x86_64/sha256_avx2.S", CC.X86.SHA256Avx2.asm ++ CC.dataSection CC.X86.SHA256Avx2.dataTables),
+  ("aarch64/sha256.S", CC.Arm.SHA256Ce.asm)
 ]
 
 def header : String :=

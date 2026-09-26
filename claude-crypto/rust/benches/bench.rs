@@ -19,7 +19,10 @@ fn main() {
         let data = vec![0x5au8; size];
         let iters = 200_000_000 / size.max(1) / 10;
         let ours = time(|| { std::hint::black_box(claude_crypto::sha256(std::hint::black_box(&data))); }, iters);
+        #[cfg(target_arch = "x86_64")]
         let ossl = time(|| { std::hint::black_box(openssl::sha::sha256(std::hint::black_box(&data))); }, iters);
+        #[cfg(not(target_arch = "x86_64"))]
+        let ossl = f64::NAN;
         let mb = |t: f64| (size * iters) as f64 / t / 1e6;
         println!("sha256 {size:>6} bytes: claude-crypto {:8.1} MB/s   openssl {:8.1} MB/s", mb(ours), mb(ossl));
     }
