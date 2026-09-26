@@ -83,3 +83,10 @@ import ClaudeCrypto.P384.MainSpec
 import ClaudeCrypto.P384.Setup
 import ClaudeCrypto.P384.Main
 import ClaudeCrypto.Limb.Test
+import ClaudeCrypto.P384.Consts
+import ClaudeCrypto.P384.MachineLemmas
+import ClaudeCrypto.X86.P384Wrap
+import ClaudeCrypto.X86.P384Main
+import ClaudeCrypto.Arm.P384Wrap
+import ClaudeCrypto.Arm.P384Main
+import ClaudeCrypto.P384.Machine

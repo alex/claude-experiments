@@ -1,5 +1,6 @@
 import ClaudeCrypto.P384.Final
 import ClaudeCrypto.P384.MainSpec
+import ClaudeCrypto.P384.Consts
 
 /-!
 # Loading the inputs and the constants into the frame
@@ -43,11 +44,6 @@ theorem Within.offset {rs : List Region} {a : Addr} {len : Nat} (h : Within rs a
     BitVec.toNat_add, BitVec.toNat_ofNat, Nat.mod_eq_of_lt (a := k) (by omega), Nat.mod_eq_of_lt (by omega)]
   omega
 
-/-- Placeholder for the constants lemma (to be replaced by `Consts.constVals_of_table`). -/
-theorem constVals_of_table' (s : State)
-    (h : ∀ j < constSize, s.mem (s.r 13 + BitVec.ofNat 64 j) = constTable[j]!) : ConstVals s := by
-  sorry
-
 /-- The frame slots after `setup`. -/
 structure Loaded (s q : State) : Prop where
   qx : sv q sQx = bytesToNat (inBytes s.mem (s.r 5) 48)
@@ -78,7 +74,7 @@ theorem Out.frm {s q u : State} (h : Out s q) (hf : Frm q u) : Out s u :=
   ⟨hf.r14.trans h.r14, hf.rd.trans h.rd, hf.wr.trans h.wr, hf.labels.trans h.labels,
     h.agree.trans (by have := hf.agree; rwa [h.r14] at this)⟩
 
-theorem inBytes_congr {m m' : Mem} {fr a : Addr} {len : Nat} (hag : Mem.Agree m m' ⟨fr, frameSize⟩)
+theorem inBytes_congr_frame {m m' : Mem} {fr a : Addr} {len : Nat} (hag : Mem.Agree m m' ⟨fr, frameSize⟩)
     (hsep : Mem.Sep fr frameSize a len) : inBytes m' a len = inBytes m a len := by
   unfold inBytes
   apply List.map_congr_left
@@ -93,7 +89,7 @@ theorem setup_ok (s : State) (h : MainPre s) :
   have e13 : s1.r 13 = s.labels constLabel := by simp [hs1, State.set]
   have er : ∀ v, v ≠ 13 → s1.r v = s.r v := fun v hv => by simp [hs1, State.set, Function.update_of_ne hv]
   have hI1 : Inv s1 := by
-    refine ⟨?_, ?_, ?_, constVals_of_table' s1 (by rw [e13]; exact h.tab)⟩
+    refine ⟨?_, ?_, ?_, constVals_of_table s1 (by rw [e13]; exact h.tab)⟩
     · rw [er 14 (by decide)]; exact h.fr
     · rw [e13]; exact h.cs
     · rw [e13, er 14 (by decide)]; exact h.sepC
@@ -105,7 +101,7 @@ theorem setup_ok (s : State) (h : MainPre s) :
     intro q hF hR b off len hb9 hb13 hsep
     rw [hR b (by simpa using hb9), er b hb13]
     have := hF.agree; rw [er 14 (by decide)] at this
-    exact inBytes_congr this hsep
+    exact inBytes_congr_frame this hsep
   have z0 : ∀ a : Addr, a + BitVec.ofNat 64 0 = a := fun a => by simp
   let steps : List (List Instr × Nat × Nat) :=
     [ (loadBE sQx 5 0, sQx, bytesToNat (inBytes s.mem (s.r 5) 48)),
