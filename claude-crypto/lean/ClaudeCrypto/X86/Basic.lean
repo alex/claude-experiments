@@ -1,4 +1,5 @@
 import ClaudeCrypto.Framework.Code
+import ClaudeCrypto.Common.Lanes
 
 /-!
 # x86-64 machine model
@@ -119,23 +120,33 @@ structure State where
   rd : List Region
   /-- Regions the code may read and write. -/
   wr : List Region
+  /-- Load addresses of the data labels (constant tables) of the module. -/
+  labels : String → Addr
 
 /-- Operand size. -/
 inductive Sz | d | q
   deriving DecidableEq, Repr
 
-/-- A memory operand `[base + index*scale + disp]`. -/
+/-- A memory operand `[base + index*scale + disp]`, or `[rip + label + disp]`
+when `rip = some label` (then `base`/`index` are ignored). -/
 structure MemOp where
-  base : Reg
+  base : Reg := .rsp
   index : Option Reg := none
   scale : Nat := 1
   disp : Int := 0
+  rip : Option String := none
   deriving DecidableEq, Repr
 
 inductive Src
   | reg (r : Reg)
   /-- A 32-bit immediate (sign-extended for 64-bit operations). -/
   | imm (v : BitVec 32)
+  | mem (m : MemOp)
+  deriving DecidableEq, Repr
+
+/-- A vector source operand. -/
+inductive VSrc
+  | reg (v : VReg)
   | mem (m : MemOp)
   deriving DecidableEq, Repr
 
@@ -168,6 +179,33 @@ inductive Instr
   | pop (r : Reg)
   | inc (sz : Sz) (dst : Reg)
   | dec (sz : Sz) (dst : Reg)
+  /-- `vmovdqu xmm, m128` (VEX: zeroes bits 128–255) -/
+  | vload128 (dst : VReg) (m : MemOp)
+  /-- `vmovdqu ymm, m256` -/
+  | vload256 (dst : VReg) (m : MemOp)
+  /-- `vmovdqu m256, ymm` -/
+  | vstore256 (m : MemOp) (src : VReg)
+  /-- `vinserti128 dst, src, m128, 1` -/
+  | vinserti128hi (dst src : VReg) (m : MemOp)
+  /-- `vbroadcasti128 dst, m128` -/
+  | vbroadcasti128 (dst : VReg) (m : MemOp)
+  /-- `vpshufb dst, src, ctl` (per 128-bit lane) -/
+  | vpshufb (dst src ctl : VReg)
+  /-- `vpaddd dst, src1, src2` (8 × 32-bit) -/
+  | vpaddd (dst src1 : VReg) (src2 : VSrc)
+  /-- `vpxor dst, src1, src2` -/
+  | vpxor (dst src1 src2 : VReg)
+  /-- `vpalignr dst, src1, src2, imm` (per 128-bit lane) -/
+  | vpalignr (dst src1 src2 : VReg) (imm : Nat)
+  /-- `vpsrld dst, src, imm` (8 × 32-bit logical right shift) -/
+  | vpsrld (dst src : VReg) (imm : Nat)
+  /-- `vpslld dst, src, imm` -/
+  | vpslld (dst src : VReg) (imm : Nat)
+  /-- `vpsrlq dst, src, imm` (4 × 64-bit logical right shift) -/
+  | vpsrlq (dst src : VReg) (imm : Nat)
+  /-- `vpshufd dst, src, imm` (per 128-bit lane) -/
+  | vpshufd (dst src : VReg) (imm : Nat)
+  | vzeroupper
   deriving DecidableEq, Repr
 
 /-- Branch conditions (`jcc` suffixes). -/
@@ -188,9 +226,15 @@ def readW (s : State) (w : Nat) (r : Reg) : BitVec w := (s.gpr.get r).setWidth w
 def writeW (s : State) {w : Nat} (r : Reg) (v : BitVec w) : State := s.setReg r (v.setWidth 64)
 
 def ea (s : State) (m : MemOp) : Addr :=
-  match m.index with
-  | none => s.getReg m.base + BitVec.ofInt 64 m.disp
-  | some i => s.getReg m.base + s.getReg i * BitVec.ofNat 64 m.scale + BitVec.ofInt 64 m.disp
+  match m.rip with
+  | some l => s.labels l + BitVec.ofInt 64 m.disp
+  | none =>
+    match m.index with
+    | none => s.getReg m.base + BitVec.ofInt 64 m.disp
+    | some i => s.getReg m.base + s.getReg i * BitVec.ofNat 64 m.scale + BitVec.ofInt 64 m.disp
+
+@[simp] def getV (s : State) (v : VReg) : BitVec 256 := s.vec.get v
+@[simp] def setV (s : State) (v : VReg) (x : BitVec 256) : State := { s with vec := s.vec.set v x }
 
 /-- Load `n` bytes, faulting if not permitted. -/
 def load (s : State) (a : Addr) (n : Nat) : Option (BitVec (8 * n)) :=
@@ -281,6 +325,72 @@ def bswap64 (x : BitVec 64) : BitVec 64 :=
   x.extractLsb' 0 8 ++ x.extractLsb' 8 8 ++ x.extractLsb' 16 8 ++ x.extractLsb' 24 8 ++
   x.extractLsb' 32 8 ++ x.extractLsb' 40 8 ++ x.extractLsb' 48 8 ++ x.extractLsb' 56 8
 
+/-! ### SIMD helpers (AVX2, VEX.256 forms) -/
+
+/-- The byte shuffle of `vpshufb` on one 128-bit lane. -/
+def pshufb128 (x c : BitVec 128) : BitVec 128 :=
+  BitVec.lanes 16 fun i =>
+    let ci := BitVec.lane 8 c i
+    if ci.msb then 0 else BitVec.lane 8 x (ci.toNat % 16)
+
+def vpshufbV (x c : BitVec 256) : BitVec 256 :=
+  BitVec.lanes 2 fun L => pshufb128 (BitVec.lane 128 x L) (BitVec.lane 128 c L)
+
+def vpadddV (x y : BitVec 256) : BitVec 256 :=
+  BitVec.lanes 8 fun i => BitVec.lane 32 x i + BitVec.lane 32 y i
+
+/-- `vpalignr` on one 128-bit lane: bytes `imm … imm+15` of `hi:lo`. -/
+def palignr128 (hi lo : BitVec 128) (imm : Nat) : BitVec 128 :=
+  ((hi ++ lo) >>> (8 * imm)).setWidth 128
+
+def vpalignrV (x y : BitVec 256) (imm : Nat) : BitVec 256 :=
+  BitVec.lanes 2 fun L => palignr128 (BitVec.lane 128 x L) (BitVec.lane 128 y L) imm
+
+def vpsrldV (x : BitVec 256) (n : Nat) : BitVec 256 :=
+  BitVec.lanes 8 fun i => if n > 31 then 0 else BitVec.lane 32 x i >>> n
+
+def vpslldV (x : BitVec 256) (n : Nat) : BitVec 256 :=
+  BitVec.lanes 8 fun i => if n > 31 then 0 else BitVec.lane 32 x i <<< n
+
+def vpsrlqV (x : BitVec 256) (n : Nat) : BitVec 256 :=
+  BitVec.lanes 4 fun i => if n > 63 then 0 else BitVec.lane 64 x i >>> n
+
+def pshufd128 (x : BitVec 128) (imm : Nat) : BitVec 128 :=
+  BitVec.lanes 4 fun j => BitVec.lane 32 x ((imm / 4 ^ j) % 4)
+
+def vpshufdV (x : BitVec 256) (imm : Nat) : BitVec 256 :=
+  BitVec.lanes 2 fun L => pshufd128 (BitVec.lane 128 x L) imm
+
+/-- Clear bits 128–255 of every ymm register. -/
+def zeroUpper (v : VRegs) : VRegs :=
+  let z : BitVec 256 → BitVec 256 := fun x => (x.setWidth 128).setWidth 256
+  ⟨z v.y0, z v.y1, z v.y2, z v.y3, z v.y4, z v.y5, z v.y6, z v.y7,
+   z v.y8, z v.y9, z v.y10, z v.y11, z v.y12, z v.y13, z v.y14, z v.y15⟩
+
+def readVSrc (s : State) : VSrc → Option (BitVec 256)
+  | .reg v => some (s.getV v)
+  | .mem m => s.loadW 256 (s.ea m)
+
+/-- Semantics of the SIMD instructions (independent of the operand size). -/
+def execV (i : Instr) (s : State) : Option State :=
+  match i with
+  | .vload128 dst m => (s.loadW 128 (s.ea m)).map fun v => s.setV dst (v.setWidth 256)
+  | .vload256 dst m => (s.loadW 256 (s.ea m)).map fun v => s.setV dst v
+  | .vstore256 m src => s.storeW (s.ea m) (s.getV src)
+  | .vinserti128hi dst src m => (s.loadW 128 (s.ea m)).map fun v =>
+      s.setV dst (v ++ (s.getV src).setWidth 128)
+  | .vbroadcasti128 dst m => (s.loadW 128 (s.ea m)).map fun v => s.setV dst (v ++ v)
+  | .vpshufb dst src ctl => some (s.setV dst (vpshufbV (s.getV src) (s.getV ctl)))
+  | .vpaddd dst src1 src2 => (readVSrc s src2).map fun y => s.setV dst (vpadddV (s.getV src1) y)
+  | .vpxor dst src1 src2 => some (s.setV dst (s.getV src1 ^^^ s.getV src2))
+  | .vpalignr dst src1 src2 imm => some (s.setV dst (vpalignrV (s.getV src1) (s.getV src2) imm))
+  | .vpsrld dst src n => some (s.setV dst (vpsrldV (s.getV src) n))
+  | .vpslld dst src n => some (s.setV dst (vpslldV (s.getV src) n))
+  | .vpsrlq dst src n => some (s.setV dst (vpsrlqV (s.getV src) n))
+  | .vpshufd dst src imm => some (s.setV dst (vpshufdV (s.getV src) imm))
+  | .vzeroupper => some { s with vec := zeroUpper s.vec }
+  | _ => none
+
 /-- Instruction semantics at a fixed width `w ∈ {32, 64}`. -/
 def execW (w : Nat) (bswap : BitVec w → BitVec w) (i : Instr) (s : State) : Option State :=
   match i with
@@ -309,11 +419,12 @@ def execW (w : Nat) (bswap : BitVec w → BitVec w) (i : Instr) (s : State) : Op
     (s.storeW sp (s.getReg r)).map fun s' => s'.setReg .rsp sp
   | .pop r => (s.loadW 64 (s.getReg .rsp)).map fun v =>
     (s.setReg .rsp (s.getReg .rsp + 8)).setReg r v
+  | _ => execV i s
 
 def Instr.sz : Instr → Sz
   | .mov sz .. | .store sz .. | .alu _ sz .. | .lea sz .. | .rorx sz .. | .andn sz ..
   | .shift _ sz .. | .not sz .. | .movbe sz .. | .bswap sz .. | .inc sz .. | .dec sz .. => sz
-  | .push _ | .pop _ => .q
+  | _ => .q
 
 def exec (i : Instr) (s : State) : Option State :=
   match i.sz with
@@ -326,6 +437,9 @@ def addrs (i : Instr) (s : State) : List Addr :=
   | .store _ m _ | .movbe _ _ m => [s.ea m]
   | .push _ => [s.getReg .rsp - 8]
   | .pop _ => [s.getReg .rsp]
+  | .vload128 _ m | .vload256 _ m | .vstore256 m _ | .vinserti128hi _ _ m | .vbroadcasti128 _ m =>
+    [s.ea m]
+  | .vpaddd _ _ (.mem m) => [s.ea m]
   | _ => []
 
 def evalCond (c : Cond) (s : State) : Option Bool :=

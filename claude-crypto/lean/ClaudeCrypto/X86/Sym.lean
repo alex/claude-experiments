@@ -35,7 +35,7 @@ macro_rules
     simp only [CC.execBlock, CC.X86.isa, CC.X86.exec, CC.X86.Instr.sz, CC.X86.execW, CC.X86.execAlu,
       CC.X86.execShift, CC.X86.readSrc, CC.X86.State.readW, CC.X86.State.writeW, CC.X86.State.loadW,
       CC.X86.State.storeW, CC.X86.State.ea, CC.X86.State.setReg, CC.X86.State.getReg, CC.X86.Regs.get,
-      CC.X86.Regs.set, CC.X86.arithFlags, CC.X86.setFlags, CC.X86.addrs, CC.X86.srcAddrs,
+      CC.X86.Regs.set, CC.X86.VRegs.get, CC.X86.VRegs.set, CC.X86.State.getV, CC.X86.State.setV, CC.X86.execV, CC.X86.readVSrc, CC.X86.arithFlags, CC.X86.setFlags, CC.X86.addrs, CC.X86.srcAddrs,
       Option.map_some, Option.bind_some, Option.map, ite_true, ite_false,
       Nat.reduceDiv, Nat.reduceMod, Nat.reduceAdd, Nat.reduceMul, Nat.reduceSub, Nat.reduceLeDiff,
       Nat.reduceLT, Nat.reduceGT, Nat.reduceEqDiff, reduceIte,

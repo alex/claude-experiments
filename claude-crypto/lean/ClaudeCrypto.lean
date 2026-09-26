@@ -13,3 +13,9 @@ import ClaudeCrypto.X86.SHA256.ScalarMain
 import ClaudeCrypto.X86.SHA256.ScalarCT
 import ClaudeCrypto.Framework.Taint
 import ClaudeCrypto.X86.Taint
+import ClaudeCrypto.Common.Lanes
+import ClaudeCrypto.X86.VecLemmas
+import ClaudeCrypto.X86.SHA256.Avx2
+import ClaudeCrypto.X86.SHA256.Avx2Vec
+import ClaudeCrypto.X86.SHA256.Avx2Round
+import ClaudeCrypto.X86.SHA256.Avx2Sched

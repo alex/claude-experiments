@@ -41,7 +41,9 @@ def setPub (t : TState) (r : Reg) (b : Bool) : TState :=
   { t with mask := if b then t.mask ||| (1 <<< r.idx) else t.mask &&& (65535 ^^^ (1 <<< r.idx)) }
 
 def memPub (t : TState) (m : MemOp) : Bool :=
-  t.pub m.base && (match m.index with | none => true | some i => t.pub i)
+  match m.rip with
+  | some _ => true
+  | none => t.pub m.base && (match m.index with | none => true | some i => t.pub i)
 
 /-- Taint of a source operand; `none` if it is a memory operand with a secret address. -/
 def srcPub (t : TState) : Src → Option Bool
@@ -74,6 +76,11 @@ def step (i : Instr) (t : TState) : Option TState :=
   | .inc _ dst | .dec _ dst =>
     let p := t.pub dst
     some (({ t with flags := p && t.flags }).setPub dst p)
+  -- SIMD: vector registers are not tracked (always secret); only addresses matter
+  | .vload128 _ m | .vload256 _ m | .vstore256 m _ | .vinserti128hi _ _ m | .vbroadcasti128 _ m
+  | .vpaddd _ _ (.mem m) => if t.memPub m then some t else none
+  | .vpaddd _ _ (.reg _) | .vpshufb .. | .vpxor .. | .vpalignr .. | .vpsrld .. | .vpslld ..
+  | .vpsrlq .. | .vpshufd .. | .vzeroupper => some t
 
 def condOk (_ : Cond) (t : TState) : Bool := t.flags
 
@@ -87,7 +94,8 @@ theorem join_pub (a b : TState) (r : Reg) : (a.join b).pub r = (a.pub r && b.pub
 /-- `s₁` and `s₂` agree on all public registers and (if public) the flags. -/
 def Agree (t : TState) (s₁ s₂ : State) : Prop :=
   (∀ r, t.pub r = true → s₁.gpr.get r = s₂.gpr.get r) ∧
-  (t.flags = true → s₁.cf = s₂.cf ∧ s₁.zf = s₂.zf ∧ s₁.sf = s₂.sf ∧ s₁.of = s₂.of)
+  (t.flags = true → s₁.cf = s₂.cf ∧ s₁.zf = s₂.zf ∧ s₁.sf = s₂.sf ∧ s₁.of = s₂.of) ∧
+  s₁.labels = s₂.labels
 
 /-! ### Lemmas -/
 
@@ -118,11 +126,15 @@ theorem setPub_pub (t : TState) (r r' : Reg) (b : Bool) :
 theorem Agree.ea {t : TState} {s₁ s₂ : State} (h : t.Agree s₁ s₂) (m : MemOp)
     (hm : t.memPub m = true) : s₁.ea m = s₂.ea m := by
   unfold memPub at hm
-  simp only [Bool.and_eq_true] at hm
   unfold State.ea State.getReg
-  cases hi : m.index with
-  | none => simp only [hi]; rw [h.1 _ hm.1]
-  | some i => simp only [hi] at hm ⊢; rw [h.1 _ hm.1, h.1 _ hm.2]
+  cases hr : m.rip with
+  | some l => simp only [h.2.2]
+  | none =>
+    simp only [hr, Bool.and_eq_true] at hm
+    simp only
+    cases hi : m.index with
+    | none => simp only; rw [h.1 _ hm.1]
+    | some i => simp only [hi] at hm ⊢; rw [h.1 _ hm.1, h.1 _ hm.2]
 
 theorem Agree.readW {t : TState} {s₁ s₂ : State} (h : t.Agree s₁ s₂) (w : Nat) (r : Reg)
     (hr : t.pub r = true) : s₁.readW w r = s₂.readW w r := by
@@ -131,7 +143,7 @@ theorem Agree.readW {t : TState} {s₁ s₂ : State} (h : t.Agree s₁ s₂) (w 
 theorem Agree.writeW {t : TState} {s₁ s₂ : State} (h : t.Agree s₁ s₂) {w : Nat} (r : Reg) (b : Bool)
     (v₁ v₂ : BitVec w) (hv : b = true → v₁ = v₂) :
     (t.setPub r b).Agree (s₁.writeW r v₁) (s₂.writeW r v₂) := by
-  refine ⟨fun r' hr' => ?_, fun hf => h.2 hf⟩
+  refine ⟨fun r' hr' => ?_, fun hf => h.2.1 hf, h.2.2⟩
   simp only [State.writeW, State.setReg, Regs.get_set]
   rw [setPub_pub] at hr'
   split_ifs at hr' ⊢ with he
@@ -142,14 +154,14 @@ theorem Agree.setFlags {t : TState} {s₁ s₂ : State} (h : t.Agree s₁ s₂) 
     (c₁ o₁ z₁ f₁ c₂ o₂ z₂ f₂ : Option Bool)
     (hf : p = true → c₁ = c₂ ∧ z₁ = z₂ ∧ f₁ = f₂ ∧ o₁ = o₂) :
     ({ t with flags := p } : TState).Agree (X86.setFlags s₁ c₁ o₁ z₁ f₁) (X86.setFlags s₂ c₂ o₂ z₂ f₂) :=
-  ⟨fun r hr => h.1 r hr, fun hp => by simpa [X86.setFlags] using hf hp⟩
+  ⟨fun r hr => h.1 r hr, fun hp => by simpa [X86.setFlags] using hf hp, h.2.2⟩
 
 theorem Agree.mem {t : TState} {s₁ s₂ : State} (h : t.Agree s₁ s₂) (m₁ m₂ : Mem) :
-    t.Agree { s₁ with mem := m₁ } { s₂ with mem := m₂ } := ⟨h.1, h.2⟩
+    t.Agree { s₁ with mem := m₁ } { s₂ with mem := m₂ } := ⟨h.1, h.2.1, h.2.2⟩
 
 theorem Agree.weaken_flags {t : TState} {s₁ s₂ : State} (h : t.Agree s₁ s₂) (p : Bool)
     (hp : p = true → t.flags = true) : ({ t with flags := p } : TState).Agree s₁ s₂ :=
-  ⟨h.1, fun hf => h.2 (hp hf)⟩
+  ⟨h.1, fun hf => h.2.1 (hp hf), h.2.2⟩
 
 theorem readSrc_agree {t : TState} {s₁ s₂ : State} (h : t.Agree s₁ s₂) (w : Nat) (src : Src) (b : Bool)
     (hb : t.srcPub src = some b) (v₁ v₂ : BitVec w) (h1 : readSrc s₁ w src = some v₁)
@@ -219,8 +231,14 @@ theorem execAlu_sound (w : Nat) (op : AluOp) (dst : Reg) (src : Src) (t t' : TSt
               · intro hp
                 simp only [Bool.and_eq_true] at hp
                 have hc : c₁ = c₂ := by
-                  have := (hag.2 hp.2).1; rw [hc1, hc2] at this; exact Option.some.inj this
+                  have := (hag.2.1 hp.2).1; rw [hc1, hc2] at this; exact Option.some.inj this
                 rw [hv hp.1.1, ha hp.1.2, hc]; try simp
+
+theorem execV_frame (i : Instr) (s s' : State) (h : execV i s = some s') :
+    s'.gpr = s.gpr ∧ s'.cf = s.cf ∧ s'.zf = s.zf ∧ s'.sf = s.sf ∧ s'.of = s.of ∧ s'.labels = s.labels := by
+  cases i <;> simp only [execV, State.setV, State.storeW, readVSrc, Option.map] at h <;>
+    (try split at h) <;> (try split at h) <;> (try simp only [Option.some.injEq, reduceCtorEq] at h) <;>
+    (try subst h) <;> (try exact ⟨rfl, rfl, rfl, rfl, rfl, rfl⟩) <;> (try cases h)
 
 open TState in
 theorem execW_sound (w : Nat) (bs : BitVec w → BitVec w) (i : Instr) (t t' : TState)
@@ -291,7 +309,7 @@ theorem execW_sound (w : Nat) (bs : BitVec w → BitVec w) (i : Instr) (t t' : T
       rename_i hz
       rw [if_pos hz] at h2
       cases h1; cases h2
-      refine ⟨fun r hr => ?_, fun hf => hag.2 (by simp only [setPub, Bool.and_eq_true] at hf; exact hf.2)⟩
+      refine ⟨fun r hr => ?_, fun hf => hag.2.1 (by simp only [setPub, Bool.and_eq_true] at hf; exact hf.2), hag.2.2⟩
       rw [setPub_pub] at hr
       split_ifs at hr with he
       · subst he; exact hag.1 _ hr
@@ -302,10 +320,10 @@ theorem execW_sound (w : Nat) (bs : BitVec w → BitVec w) (i : Instr) (t t' : T
       cases op <;> simp only [Option.some.injEq] at h1 h2 <;> subst h1 <;> subst h2
       all_goals
         refine Agree.writeW (t := { t with flags := t.pub dst && t.flags }) ?_ _ _ _ _ ?_
-        · refine ⟨fun r hr => hag.1 r hr, fun hf => ?_⟩
+        · refine ⟨fun r hr => hag.1 r hr, fun hf => ?_, hag.2.2⟩
           simp only [Bool.and_eq_true] at hf
           obtain ⟨hp, hfl⟩ := hf
-          obtain ⟨hc, hz, hs, ho⟩ := hag.2 hfl
+          obtain ⟨hc, hz, hs, ho⟩ := hag.2.1 hfl
           simp only [X86.setFlags]
           rw [hd hp]
           simp_all
@@ -343,7 +361,7 @@ theorem execW_sound (w : Nat) (bs : BitVec w → BitVec w) (i : Instr) (t t' : T
       split at h1 <;> split at h2 <;> simp only [Option.map_some, Option.map_none, reduceCtorEq,
         Option.some.injEq] at h1 h2
       subst h1; subst h2
-      refine ⟨fun r' hr' => ?_, hag.2⟩
+      refine ⟨fun r' hr' => ?_, hag.2.1, hag.2.2⟩
       simp only [State.setReg, Regs.get_set]
       split_ifs with he
       · subst he; simp only [State.getReg]; rw [hag.1 _ hsp]
@@ -369,15 +387,27 @@ theorem execW_sound (w : Nat) (bs : BitVec w → BitVec w) (i : Instr) (t t' : T
           have h2 := h1.writeW (w := 64) r false v₁ v₂ (fun h => by cases h)
           simpa [State.writeW, State.setReg] using h2
     · cases hstep
+  | vload128 _ m | vload256 _ m | vstore256 m _ | vinserti128hi _ _ m | vbroadcasti128 _ m
+  | vpshufb _ _ _ | vpxor _ _ _ | vpalignr _ _ _ _ | vpsrld _ _ _ | vpslld _ _ _ | vpsrlq _ _ _
+  | vpshufd _ _ _ | vzeroupper | vpaddd _ _ _ =>
+    have ht : t' = t := by
+      simp only [step] at hstep
+      (try split at hstep) <;> simp_all
+    subst ht
+    simp only [execW] at h1 h2
+    obtain ⟨g1, c1, z1, f1, o1, l1⟩ := execV_frame _ _ _ h1
+    obtain ⟨g2, c2, z2, f2, o2, l2⟩ := execV_frame _ _ _ h2
+    refine ⟨fun r hr => by rw [g1, g2]; exact hag.1 r hr, fun hf => ?_, by rw [l1, l2]; exact hag.2.2⟩
+    rw [c1, c2, z1, z2, f1, f2, o1, o2]; exact hag.2.1 hf
   | inc sz dst | dec sz dst =>
     simp only [step, Option.some.injEq] at hstep; subst hstep
     simp only [execW, Option.some.injEq] at h1 h2; subst h1; subst h2
     have hd : t.pub dst = true → s₁.readW w dst = s₂.readW w dst := hag.readW w dst
     refine Agree.writeW (t := { t with flags := t.pub dst && t.flags }) ?_ _ _ _ _ ?_
-    · refine ⟨fun r hr => hag.1 r hr, fun hf => ?_⟩
+    · refine ⟨fun r hr => hag.1 r hr, fun hf => ?_, hag.2.2⟩
       simp only [Bool.and_eq_true] at hf
       obtain ⟨hp, hfl⟩ := hf
-      obtain ⟨hc, hz, hs, ho⟩ := hag.2 hfl
+      obtain ⟨hc, hz, hs, ho⟩ := hag.2.1 hfl
       rw [hd hp]
       simp_all
     · intro hp; rw [hd hp]
@@ -420,6 +450,19 @@ theorem addrs_sound (i : Instr) (t t' : TState) (s₁ s₂ : State) (hstep : t.s
     split at hstep
     · rename_i hsp; simp only [addrs, State.getReg, hag.1 _ hsp]
     · cases hstep
+  | vload128 _ m | vload256 _ m | vstore256 m _ | vinserti128hi _ _ m | vbroadcasti128 _ m =>
+    simp only [step] at hstep
+    split at hstep
+    · rename_i hm; simp only [addrs, hag.ea m hm]
+    · cases hstep
+  | vpaddd _ _ src =>
+    cases src with
+    | mem m =>
+      simp only [step] at hstep
+      split at hstep
+      · rename_i hm; simp only [addrs, hag.ea m hm]
+      · cases hstep
+    | reg _ => rfl
   | _ => rfl
 
 namespace TState
@@ -427,7 +470,7 @@ namespace TState
 theorem le_sound (a b : TState) (s₁ s₂ : State) (h : a.le b = true) (hag : a.Agree s₁ s₂) :
     b.Agree s₁ s₂ := by
   simp only [le, Bool.and_eq_true, List.all_eq_true, Bool.or_eq_true, Bool.not_eq_true'] at h
-  refine ⟨fun r hr => hag.1 r ?_, fun hf => hag.2 ?_⟩
+  refine ⟨fun r hr => hag.1 r ?_, fun hf => hag.2.1 ?_, hag.2.2⟩
   · rcases h.1 r (mem_allRegs r) with h' | h'
     · rw [hr] at h'; cases h'
     · exact h'
@@ -451,7 +494,7 @@ theorem le_join_right (a b : TState) : b.le (a.join b) = true := by
 
 theorem cond_sound (c : Cond) (t : TState) (s₁ s₂ : State) (hc : t.condOk c = true)
     (hag : t.Agree s₁ s₂) : evalCond c s₁ = evalCond c s₂ := by
-  obtain ⟨hcf, hzf, hsf, hof⟩ := hag.2 hc
+  obtain ⟨hcf, hzf, hsf, hof⟩ := hag.2.1 hc
   cases c <;> simp [evalCond, hcf, hzf]
 
 end TState

@@ -57,4 +57,13 @@ def Printer.function (name : String) (body : Code M.Instr M.Cond) : String :=
     (P.header name ++ [s!"\t.globl {name}", s!"{name}:"] ++ lines ++ P.ret.map ("\t" ++ ·) ++
       P.footer name) ++ "\n"
 
+/-- A read-only data section: each table is emitted as `label: .byte …`,
+64-byte aligned. -/
+def dataSection (tables : List (String × List (BitVec 8))) : String :=
+  let one (t : String × List (BitVec 8)) : List String :=
+    ["\t.p2align 6", t.1 ++ ":"] ++
+      ((t.2.map (·.toNat)).toChunks 16).map fun c =>
+        "\t.byte " ++ String.intercalate "," (c.map toString)
+  String.intercalate "\n" (["\t.section .rodata"] ++ (tables.map one).flatten) ++ "\n\t.text\n"
+
 end CC

@@ -22,13 +22,21 @@ def Reg.nameSz (r : Reg) : Sz → String
   | .q => r.name64
 
 def VReg.name (v : VReg) : String := "ymm" ++ toString v.ctorIdx
+def VReg.xname (v : VReg) : String := "xmm" ++ toString v.ctorIdx
 
 def MemOp.str (m : MemOp) : String :=
-  let idx := match m.index with
-    | none => ""
-    | some i => s!"+{i.name64}*{m.scale}"
   let d := if m.disp = 0 then "" else if m.disp > 0 then s!"+{m.disp}" else s!"{m.disp}"
-  s!"[{m.base.name64}{idx}{d}]"
+  match m.rip with
+  | some l => s!"[rip+{l}{d}]"
+  | none =>
+    let idx := match m.index with
+      | none => ""
+      | some i => s!"+{i.name64}*{m.scale}"
+    s!"[{m.base.name64}{idx}{d}]"
+
+def VSrc.str : VSrc → String
+  | .reg v => v.name
+  | .mem m => "YMMWORD PTR " ++ m.str
 
 def Sz.ptr : Sz → String
   | .d => "DWORD PTR "
@@ -63,6 +71,20 @@ def Instr.asm : Instr → List String
   | .pop r => [s!"pop {r.name64}"]
   | .inc sz d => [s!"inc {d.nameSz sz}"]
   | .dec sz d => [s!"dec {d.nameSz sz}"]
+  | .vload128 d m => [s!"vmovdqu {d.xname}, XMMWORD PTR {m.str}"]
+  | .vload256 d m => [s!"vmovdqu {d.name}, YMMWORD PTR {m.str}"]
+  | .vstore256 m v => [s!"vmovdqu YMMWORD PTR {m.str}, {v.name}"]
+  | .vinserti128hi d v m => [s!"vinserti128 {d.name}, {v.name}, XMMWORD PTR {m.str}, 1"]
+  | .vbroadcasti128 d m => [s!"vbroadcasti128 {d.name}, XMMWORD PTR {m.str}"]
+  | .vpshufb d a c => [s!"vpshufb {d.name}, {a.name}, {c.name}"]
+  | .vpaddd d a b => [s!"vpaddd {d.name}, {a.name}, {b.str}"]
+  | .vpxor d a b => [s!"vpxor {d.name}, {a.name}, {b.name}"]
+  | .vpalignr d a b n => [s!"vpalignr {d.name}, {a.name}, {b.name}, {n}"]
+  | .vpsrld d a n => [s!"vpsrld {d.name}, {a.name}, {n}"]
+  | .vpslld d a n => [s!"vpslld {d.name}, {a.name}, {n}"]
+  | .vpsrlq d a n => [s!"vpsrlq {d.name}, {a.name}, {n}"]
+  | .vpshufd d a n => [s!"vpshufd {d.name}, {a.name}, {n}"]
+  | .vzeroupper => ["vzeroupper"]
 
 def Cond.name : Cond → String
   | .e => "e" | .ne => "ne" | .b => "b" | .ae => "ae" | .be => "be" | .a => "a"
