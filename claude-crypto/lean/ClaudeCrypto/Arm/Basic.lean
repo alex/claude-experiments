@@ -20,7 +20,8 @@ Modelling choices:
 * Each flag is an `Option Bool`; `none` means "unknown/undefined".  Reading an
   undefined flag faults, so verified code never depends on one.
 * Register number 31 (`XZR`/`SP`) is not available as an operand of the
-  modelled instructions: all operands are `X0`–`X30`.
+  modelled instructions (all operands are `X0`–`X30`), except for the three
+  instructions `subsp`, `addsp`, `movsp`, which adjust `SP` and read it.
 * Memory accesses must lie within the state's permitted regions: loads
   within `rd ++ wr`, stores within `wr`; otherwise the instruction faults.
   (Each 16-byte register transfer of a multi-register `ld1`/`st1` is checked
@@ -405,6 +406,13 @@ inductive Instr
   | str (t n : XReg) (off : Nat)
   /-- `STR Xt, [Xn, Xm]` (64-bit, register offset, `LSL #0`) -/
   | strr (t n m : XReg)
+  -- The stack pointer (for allocating a stack frame).
+  /-- `SUB SP, SP, #imm` -/
+  | subsp (imm : Nat)
+  /-- `ADD SP, SP, #imm` -/
+  | addsp (imm : Nat)
+  /-- `MOV Xd, SP` (alias of `ADD Xd, SP, #0`) -/
+  | movsp (d : XReg)
   deriving DecidableEq, Repr
 
 namespace State
@@ -558,6 +566,11 @@ def exec (i : Instr) (s : State) : Option State :=
   -- `STR`: `address = X[n] + offset; Mem[address, 8] = X[t]`
   | .str t n off => s.storeW (s.getX n + BitVec.ofNat 64 off) (s.getX t)
   | .strr t n m => s.storeW (s.getX n + s.getX m) (s.getX t)
+  -- `ADD`/`SUB` (immediate) with `d = n = 31` (SP; no flags): `SP[] = result`
+  | .subsp imm => some { s with sp := s.sp - BitVec.ofNat 64 imm }
+  | .addsp imm => some { s with sp := s.sp + BitVec.ofNat 64 imm }
+  -- `ADD Xd, SP, #0`: `X[d] = SP[]`
+  | .movsp d => some (s.setX d s.sp)
 
 /-- The memory addresses accessed by an instruction. -/
 def addrs (i : Instr) (s : State) : List Addr :=

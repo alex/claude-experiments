@@ -149,6 +149,19 @@ int main(void) {
     __asm__ volatile("str %2, [%0, %1]" : : "r"(buf2), "r"(off), "r"(y) : "memory");
     printf("strr"); pbuf(buf); printf(" %d %016llx", (int)off, (unsigned long long)y);
     pbuf(buf2); printf("\n");
+    // SP: mov x, sp; sub sp, sp, #imm; mov x, sp; add sp, sp, #imm; mov x, sp
+#define SPOPS(IMM)                                                             \
+    do {                                                                       \
+      uint64_t a, b, c;                                                        \
+      __asm__ volatile("mov %0, sp\n\tsub sp, sp, #" #IMM "\n\tmov %1, sp\n\t"   \
+                       "add sp, sp, #" #IMM "\n\tmov %2, sp"                   \
+                       : "=&r"(a), "=&r"(b), "=&r"(c) : : "memory");            \
+      printf("spops %d %016llx %016llx %016llx\n", IMM, (unsigned long long)a,   \
+             (unsigned long long)b, (unsigned long long)c);                    \
+    } while (0)
+    if (i % 3 == 0) SPOPS(16);
+    else if (i % 3 == 1) SPOPS(1792);
+    else SPOPS(4080);
   }
   return 0;
 }

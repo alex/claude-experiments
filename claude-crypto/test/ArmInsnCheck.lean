@@ -126,6 +126,12 @@ def check (line : String) : Bool :=
           (BitVec.ofNat 64 off.toNat!)).setX .x3 (x64 y)) with
     | some s => memIs s.mem buf2
     | none => false
+  | ["spops", imm, a, b, c] =>
+    let st : State := { s0 with sp := x64 a }
+    match (exec (.movsp .x0) st).bind (exec (.subsp imm.toNat!)) |>.bind (exec (.movsp .x1))
+        |>.bind (exec (.addsp imm.toNat!)) |>.bind (exec (.movsp .x2)) with
+    | some s => s.getX .x0 == x64 a && s.getX .x1 == x64 b && s.getX .x2 == x64 c && s.sp == x64 c
+    | none => false
   | _ => false
 
 def main (args : List String) : IO UInt32 := do

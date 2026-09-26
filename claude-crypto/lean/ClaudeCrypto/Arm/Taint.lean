@@ -12,7 +12,8 @@ register, the flags, or an address, so they can never influence the leakage.
 Every address computation must only use public registers.
 
 The addresses of the program's data labels are public (they are fixed when
-the program is loaded), so `Agree` requires them to be equal.
+the program is loaded), and so is the stack pointer, so `Agree` requires them
+to be equal.
 -/
 
 namespace CC.Arm
@@ -69,6 +70,8 @@ def step (i : Instr) (t : TState) : Option TState :=
   | .ldrr d n m => if t.pub n && t.pub m then some (t.setPub d false) else none
   | .str _ n _ => if t.pub n then some t else none
   | .strr _ n m => if t.pub n && t.pub m then some t else none
+  | .subsp _ | .addsp _ => some t
+  | .movsp d => some (t.setPub d true)
 
 def condOk (c : Cond) (t : TState) : Bool :=
   match c with
@@ -82,12 +85,12 @@ def le (a b : TState) : Bool := allXRegs.all (fun r => !b.pub r || a.pub r) && (
 theorem join_pub (a b : TState) (r : XReg) : (a.join b).pub r = (a.pub r && b.pub r) := by
   simp [join, pub, Nat.testBit_and]
 
-/-- `s₁` and `s₂` agree on all public registers, (if public) the flags, and the
-addresses of the data labels. -/
+/-- `s₁` and `s₂` agree on all public registers, (if public) the flags, the
+addresses of the data labels and the stack pointer. -/
 def Agree (t : TState) (s₁ s₂ : State) : Prop :=
   (∀ r, t.pub r = true → s₁.getX r = s₂.getX r) ∧
   (t.flags = true → s₁.nf = s₂.nf ∧ s₁.zf = s₂.zf ∧ s₁.cf = s₂.cf ∧ s₁.vf = s₂.vf) ∧
-  s₁.labels = s₂.labels
+  s₁.labels = s₂.labels ∧ s₁.sp = s₂.sp
 
 /-! ### Lemmas -/
 
@@ -268,7 +271,7 @@ theorem exec_sound (i : Instr) (t t' : TState) (s₁ s₂ s₁' s₂' : State) (
   | adr d l =>
     simp only [step, Option.some.injEq] at hstep; subst hstep
     simp only [exec, Option.some.injEq] at h1 h2; subst h1; subst h2
-    exact hag.setX _ _ _ _ (fun _ => by rw [hag.2.2])
+    exact hag.setX _ _ _ _ (fun _ => by rw [hag.2.2.1])
   | addi d n imm | subi d n imm | mov d n =>
     simp only [step, Option.some.injEq] at hstep; subst hstep
     simp only [exec, Option.some.injEq] at h1 h2; subst h1; subst h2
@@ -372,6 +375,15 @@ theorem exec_sound (i : Instr) (t t' : TState) (s₁ s₂ s₁' s₂' : State) (
       split at h1 <;> split at h2 <;> simp only [reduceCtorEq, Option.some.injEq] at h1 h2
       subst h1; subst h2; exact hag.mem _ _
     · cases hstep
+
+  | subsp imm | addsp imm =>
+    simp only [step, Option.some.injEq] at hstep; subst hstep
+    simp only [exec, Option.some.injEq] at h1 h2; subst h1; subst h2
+    exact ⟨hag.1, hag.2.1, hag.2.2.1, by simp only [hag.2.2.2]⟩
+  | movsp d =>
+    simp only [step, Option.some.injEq] at hstep; subst hstep
+    simp only [exec, Option.some.injEq] at h1 h2; subst h1; subst h2
+    exact hag.setX _ _ _ _ (fun _ => by rw [hag.2.2.2])
 
 open TState in
 theorem addrs_sound (i : Instr) (t t' : TState) (s₁ s₂ : State) (hstep : t.step i = some t')

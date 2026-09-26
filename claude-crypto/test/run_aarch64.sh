@@ -3,7 +3,9 @@
 #  1. instruction-level differential test of the Lean model (arm_insn_test.c
 #     produces vectors on "hardware", ArmInsnCheck.lean checks them against
 #     CC.Arm.exec);
-#  2. the generated SHA-256 block function against a portable reference.
+#  2. the generated SHA-256 block function against a portable reference;
+#  3. the generated P-384 ECDSA verifier against the OpenSSL-generated test
+#     vectors of p384_vectors.txt (see p384_gen.c).
 # Requires aarch64-linux-gnu-gcc, qemu-aarch64 and the Lean toolchain.
 set -e
 cd "$(dirname "$0")"
@@ -16,3 +18,6 @@ $QEMU "$out/arm_insn_test" > "$out/vectors.txt"
 aarch64-linux-gnu-gcc -O2 -static -DNO_OPENSSL -DSHA_BLOCKS=cc_sha256_blocks_arm \
   sha256_test.c ../asm/aarch64/sha256.S -o "$out/sha256_test"
 $QEMU "$out/sha256_test"
+aarch64-linux-gnu-gcc -O2 -static -DNO_OPENSSL -DP384_VERIFY=cc_p384_verify_aarch64 \
+  p384_test.c ../asm/aarch64/p384_verify.S -o "$out/p384_test"
+$QEMU "$out/p384_test" p384_vectors.txt 20

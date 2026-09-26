@@ -69,6 +69,9 @@ def Instr.asm : Instr → List String
   | .ldrr t n m => [s!"ldr {t.name}, [{n.name}, {m.name}]"]
   | .str t n off => [s!"str {t.name}, [{n.name}, #{off}]"]
   | .strr t n m => [s!"str {t.name}, [{n.name}, {m.name}]"]
+  | .subsp imm => [s!"sub sp, sp, #{imm}"]
+  | .addsp imm => [s!"add sp, sp, #{imm}"]
+  | .movsp d => [s!"mov {d.name}, sp"]
 
 def Cond.branch (c : Cond) (l : String) : String :=
   match c with

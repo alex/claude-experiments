@@ -5,7 +5,7 @@
 //! `claude-crypto/lean`.  The proofs establish, for the assembly itself:
 //!
 //! * **functional correctness** against a readable transcription of the
-//!   relevant standard (FIPS 180-4 for SHA-256),
+//!   relevant standard (FIPS 180-4 for SHA-256, FIPS 186-5 for ECDSA-P384),
 //! * **memory safety**: the code only reads its inputs and only writes its
 //!   outputs and its own stack frame, and
 //! * **constant time** (where relevant): control flow and memory addresses do
@@ -22,6 +22,7 @@ mod asm;
 mod cpu;
 #[cfg(target_arch = "x86_64")]
 mod portable;
+pub mod p384;
 pub mod sha256;
 
 pub use sha256::{sha256, Sha256};

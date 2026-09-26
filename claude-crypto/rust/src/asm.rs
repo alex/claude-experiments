@@ -16,6 +16,13 @@ extern "C" {
     /// writable for 32 bytes, and the two must not overlap.  Uses 560 bytes of
     /// stack.
     pub fn cc_sha256_blocks_x86_avx2(state: *mut u32, data: *const u8, nblocks: usize);
+
+    /// ECDSA-P384 verification: returns 1 (valid) or 0 (invalid).
+    ///
+    /// Generated from `CC.P384.main` (Lean: `CC.X86.P384Wrap`): requires BMI2
+    /// and MOVBE; `pubkey`, `digest` and `sig` must be readable for 96, 48
+    /// and 96 bytes.  System V ABI; uses 1840 bytes of stack.
+    pub fn cc_p384_verify_x86_bmi2(pubkey: *const u8, digest: *const u8, sig: *const u8) -> u64;
 }
 
 #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
@@ -27,6 +34,13 @@ extern "C" {
     /// `64 * nblocks` bytes and `state` readable and writable for 32 bytes.
     /// Preserves all AAPCS64 callee-saved registers and uses no stack.
     pub fn cc_sha256_blocks_arm(state: *mut u32, data: *const u8, nblocks: usize);
+
+    /// ECDSA-P384 verification: returns 1 (valid) or 0 (invalid).
+    ///
+    /// Generated from `CC.P384.main` (Lean: `CC.Arm.P384Wrap`): `pubkey`,
+    /// `digest` and `sig` must be readable for 96, 48 and 96 bytes.  AAPCS64;
+    /// uses only caller-saved registers and 1792 bytes of stack.
+    pub fn cc_p384_verify_aarch64(pubkey: *const u8, digest: *const u8, sig: *const u8) -> u64;
 }
 
 #[cfg(all(target_arch = "powerpc64", target_endian = "little"))]
