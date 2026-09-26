@@ -69,3 +69,17 @@ import ClaudeCrypto.Ppc.SHA256.P8
 import ClaudeCrypto.Ppc.SHA256.P8Main
 import ClaudeCrypto.Ppc.SHA256.P8CT
 import ClaudeCrypto.Limb.Ppc
+import ClaudeCrypto.P384.Point
+import ClaudeCrypto.P384.Prog
+import ClaudeCrypto.P384.Frame
+import ClaudeCrypto.P384.PrimLemmas
+import ClaudeCrypto.P384.Prims
+import ClaudeCrypto.P384.Steps
+import ClaudeCrypto.P384.PointOps
+import ClaudeCrypto.P384.Scalar
+import ClaudeCrypto.P384.Ladder
+import ClaudeCrypto.P384.Final
+import ClaudeCrypto.P384.MainSpec
+import ClaudeCrypto.P384.Setup
+import ClaudeCrypto.P384.Main
+import ClaudeCrypto.Limb.Test
