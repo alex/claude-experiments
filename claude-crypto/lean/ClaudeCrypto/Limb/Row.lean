@@ -146,4 +146,28 @@ theorem macRow_ok (tr : Nat → Var) (base : Var) (off : Nat → Nat) (cA cB lo 
     ⟨by simp [lsum, cin, hz], fun _ _ _ _ _ => rfl, rfl, rfl, rfl, rfl⟩
   simpa [macRow] using this
 
+theorem lsum_shift (f : Nat → Nat) (n : Nat) :
+    lsum f (n + 1) = f 0 + 2 ^ 64 * lsum (fun k => f (k + 1)) n := by
+  induction n with
+  | zero => simp [lsum]
+  | succ n ih =>
+    rw [lsum_succ, ih, lsum_succ]
+    rw [show 64 * (n + 1) = 64 + 64 * n by ring, pow_add]; ring
+
+theorem lsum_lt (f : Nat → Nat) (n : Nat) (h : ∀ k < n, f k < 2 ^ 64) : lsum f n < 2 ^ (64 * n) := by
+  induction n with
+  | zero => simp [lsum]
+  | succ n ih =>
+    rw [lsum_succ, show 64 * (n + 1) = 64 * n + 64 by ring, pow_add]
+    have := ih (fun k hk => h k (by omega))
+    have := h n (by omega)
+    nlinarith [pow_pos (show (0 : ℕ) < 2 by norm_num) (64 * n)]
+
+theorem lsum_mod (f : Nat → Nat) (n x : Nat) (hf : f 0 < 2 ^ 64) :
+    (lsum f (n + 1) + 2 ^ (64 * (n + 1)) * x) % 2 ^ 64 = f 0 := by
+  rw [lsum_shift, show 64 * (n + 1) = 64 + 64 * n by ring, pow_add]
+  rw [show f 0 + 2 ^ 64 * lsum (fun k => f (k + 1)) n + 2 ^ 64 * 2 ^ (64 * n) * x =
+    f 0 + 2 ^ 64 * (lsum (fun k => f (k + 1)) n + 2 ^ (64 * n) * x) by ring]
+  rw [Nat.add_mul_mod_self_left, Nat.mod_eq_of_lt hf]
+
 end CC.Limb
